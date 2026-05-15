@@ -265,7 +265,7 @@ def get_analysis_info(db, id=-1, task=None):
                 "suri_file_cnt": 1,
                 "trid": 1,
                 "target.file.cape_yara": 1,
-                "target.file.yara.name": 1,
+                "target.file.yara": 1,
                 "target.file.file_ref": 1,
                 "_id": 0,
             },
