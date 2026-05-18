@@ -17,6 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 RUNNING_TESTS = "test" in sys.argv
 
+from django.core.exceptions import ImproperlyConfigured
 from lib.cuckoo.common.config import Config
 
 # In case we have VPNs enabled we need to initialize through the following
@@ -266,6 +267,39 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
 ]
+
+
+# OpenID Connect (Okta / Azure AD / Auth0 / Google Workspace / Keycloak /
+# any OIDC-compliant IdP) is wired through django-allauth's generic
+# `openid_connect` provider — registered conditionally so the dependency
+# stays inert when SSO is disabled. Configure via [oauth_oidc] in web.conf.
+OIDC_CFG = getattr(web_cfg, "oauth_oidc", None)
+if OIDC_CFG is not None and OIDC_CFG.get("enabled", False):
+    _missing = [k for k in ("client_id", "client_secret", "server_url")
+                if not (OIDC_CFG.get(k) or "").strip()]
+    if _missing:
+        raise ImproperlyConfigured(
+            f"[oauth_oidc] enabled = yes but required fields are blank: "
+            f"{', '.join(_missing)}. Check conf/web.conf."
+        )
+    INSTALLED_APPS.append("allauth.socialaccount.providers.openid_connect")
+    SOCIALACCOUNT_PROVIDERS = {
+        "openid_connect": {
+            # Use our subclass for process-level discovery-doc / JWKS caching.
+            "provider_class": "web.allauth_adapters.CachedOpenIDConnectProvider",
+            "APPS": [
+                {
+                    "provider_id": OIDC_CFG.get("provider_id", "oidc"),
+                    "name": OIDC_CFG.get("name", "OIDC"),
+                    "client_id": OIDC_CFG.get("client_id", ""),
+                    "secret": OIDC_CFG.get("client_secret", ""),
+                    "settings": {
+                        "server_url": OIDC_CFG.get("server_url", ""),
+                    },
+                }
+            ]
+        }
+    }
 
 if api_cfg.api.token_auth_enabled:
     REST_FRAMEWORK = {

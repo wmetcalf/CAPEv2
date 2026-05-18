@@ -147,6 +147,37 @@ github = no
 gitlab = no
 twitter = no
 
+# OpenID Connect SSO. Generic — works with Okta / Azure AD / Auth0 / Google Workspace /
+# Keycloak or any OIDC-compliant IdP via django-allauth openid_connect provider.
+# Set enabled = yes and fill in the fields below to activate.
+[oauth_oidc]
+enabled = no
+# Arbitrary identifier; becomes part of the callback URL:
+#   /accounts/oidc/<provider_id>/login/callback/
+# Must match the redirect URI registered in your IdP app.
+provider_id = oidc
+# Display name shown on the login button
+name = SSO
+# OAuth2 client credentials from your IdP app
+client_id =
+client_secret =
+# IdP discovery URL — the /.well-known/openid-configuration root.
+# Examples:
+#   Okta:    https://<domain>/oauth2/default
+#   Azure:   https://login.microsoftonline.com/<tenant>/v2.0
+#   Auth0:   https://<domain>
+#   Keycloak: https://<host>/realms/<realm>
+server_url =
+# Group-claim -> Django role mapping. The IdP must be configured to include
+# group names in the ID token under `groups_claim` (default: "groups").
+# Leave a key empty to skip that role mapping (promotion stays manual).
+# required_groups: if set, only users in at least one of these groups get a
+# CAPE account provisioned. Leave blank to allow any IdP-authenticated user.
+required_groups =
+admin_groups =
+superadmin_groups =
+groups_claim = groups
+
 [display_browser_martians]
 enabled = no
 

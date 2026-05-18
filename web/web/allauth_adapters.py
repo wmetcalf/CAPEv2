@@ -1,58 +1,102 @@
+import logging
 import requests
 import threading
 import time
 
 from allauth.account.adapter import DefaultAccountAdapter
+from allauth.core.exceptions import ImmediateHttpResponse
 from allauth.socialaccount.adapter import DefaultSocialAccountAdapter
 from allauth.account.signals import email_confirmed, user_signed_up
 from django import forms
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.dispatch import receiver
+from django.shortcuts import render
 
 
-# ── OIDC discovery-document cache ────────────────────────────────────────────
-# allauth caches the discovery doc per adapter instance (i.e. per request), so
-# every login initiation and every callback makes a blocking outbound HTTP call
-# with no timeout. This process-level cache adds:
-#   • a 1-hour TTL shared across all requests in the process
-#   • 5 s connect / 10 s read timeouts so a slow IdP can't hang the server
-#   • issuer validation per RFC 8414 §3
-#   • double-checked locking to minimise redundant cold-start fetches
-
-_OIDC_DISCOVERY_CACHE: dict = {}
-_OIDC_DISCOVERY_LOCK = threading.Lock()
-_OIDC_DISCOVERY_TTL = 3600  # seconds
+log = logging.getLogger(__name__)
 
 
-def _get_cached_openid_config(server_url: str) -> dict:
+# ── OIDC IdP-response cache ──────────────────────────────────────────────────
+# allauth fetches the OIDC discovery document and the JWKS on every login
+# (cached only per-adapter, i.e. per-request) with no timeouts. A transient
+# IdP hiccup or slow response then surfaces as a 500 to the user.
+#
+# This cache makes both fetches:
+#   • process-wide with a 1-hour TTL (5 minutes for JWKS so key rotation is
+#     picked up quickly)
+#   • bounded by 5 s connect / 10 s read timeouts
+#   • served from a stale entry on transient fetch errors instead of crashing
+#   • issuer-validated per RFC 8414 §3 (discovery only)
+#   • double-checked-locked so concurrent cold-start requests still see fresh data
+
+_OIDC_CACHE: dict = {}
+_OIDC_CACHE_LOCK = threading.Lock()
+_DISCOVERY_TTL = 3600
+_JWKS_TTL = 300
+
+
+def _cached_fetch(cache_key: str, url: str, ttl: int, validate=None) -> dict:
+    """Fetch `url` as JSON with a process-wide TTL cache and stale-on-error.
+
+    `validate(doc)` runs once on a freshly-fetched doc and may raise to reject
+    it; on rejection we fall back to the previously cached doc if any.
+    """
     now = time.monotonic()
-    with _OIDC_DISCOVERY_LOCK:
-        entry = _OIDC_DISCOVERY_CACHE.get(server_url)
-        if entry and (now - entry["ts"]) < _OIDC_DISCOVERY_TTL:
+    with _OIDC_CACHE_LOCK:
+        entry = _OIDC_CACHE.get(cache_key)
+        if entry and (now - entry["ts"]) < ttl:
             return entry["doc"]
 
-    resp = requests.get(server_url, timeout=(5, 10))
-    resp.raise_for_status()
-    doc = resp.json()
+    try:
+        resp = requests.get(url, timeout=(5, 10))
+        resp.raise_for_status()
+        doc = resp.json()
+        if validate is not None:
+            validate(doc)
+    except (requests.RequestException, ValueError) as e:
+        if entry is not None:
+            log.warning(
+                "OIDC fetch failed for %s (%s); serving stale cached value",
+                url, e,
+            )
+            return entry["doc"]
+        log.error("OIDC fetch failed for %s with no cached fallback: %s", url, e)
+        raise
 
-    # OIDC spec: issuer in the discovery doc MUST equal the URL it was fetched
-    # from (minus the /.well-known/openid-configuration suffix).
-    expected = server_url.replace("/.well-known/openid-configuration", "").rstrip("/")
-    actual = (doc.get("issuer") or "").rstrip("/")
-    if actual and actual != expected:
-        raise ValueError(
-            f"OIDC discovery issuer mismatch: expected {expected!r}, got {actual!r}"
-        )
-
-    with _OIDC_DISCOVERY_LOCK:
-        existing = _OIDC_DISCOVERY_CACHE.get(server_url)
-        if not existing or (time.monotonic() - existing["ts"]) >= _OIDC_DISCOVERY_TTL:
-            _OIDC_DISCOVERY_CACHE[server_url] = {"doc": doc, "ts": time.monotonic()}
+    with _OIDC_CACHE_LOCK:
+        existing = _OIDC_CACHE.get(cache_key)
+        if not existing or (time.monotonic() - existing["ts"]) >= ttl:
+            _OIDC_CACHE[cache_key] = {"doc": doc, "ts": time.monotonic()}
         else:
             doc = existing["doc"]
 
     return doc
+
+
+def _get_cached_openid_config(server_url: str) -> dict:
+    def _validate_issuer(doc):
+        expected = server_url.replace("/.well-known/openid-configuration", "").rstrip("/")
+        actual = (doc.get("issuer") or "").rstrip("/")
+        if actual and actual != expected:
+            raise ValueError(
+                f"OIDC discovery issuer mismatch: expected {expected!r}, got {actual!r}"
+            )
+
+    return _cached_fetch(
+        cache_key=f"discovery:{server_url}",
+        url=server_url,
+        ttl=_DISCOVERY_TTL,
+        validate=_validate_issuer,
+    )
+
+
+def _get_cached_jwks(jwks_url: str) -> dict:
+    return _cached_fetch(
+        cache_key=f"jwks:{jwks_url}",
+        url=jwks_url,
+        ttl=_JWKS_TTL,
+    )
 
 
 try:
@@ -62,10 +106,12 @@ try:
     from allauth.socialaccount.providers.openid_connect.provider import (
         OpenIDConnectProvider as _BaseOIDCProvider,
     )
+    from allauth.socialaccount.internal import jwtkit
 
     class CachedOpenIDConnectOAuth2Adapter(_BaseOIDCAdapter):
-        """Serves openid_config from the process-level cache instead of fetching
-        it on every request."""
+        """Serves the OIDC discovery doc and JWKS from a process-level cache,
+        with bounded timeouts and stale-on-error fallback. Without this an IdP
+        blip produces a 500 on the login flow."""
 
         @property
         def openid_config(self):
@@ -74,6 +120,44 @@ try:
                     self.get_provider().server_url
                 )
             return self._openid_config
+
+        def _decode_id_token(self, app, id_token):
+            # Mirror allauth's default but route JWKS through our cache.
+            verify_signature = not self.did_fetch_access_token
+            keys_url = self.openid_config["jwks_uri"]
+            issuer = self.openid_config["issuer"]
+            if not verify_signature:
+                return jwtkit.verify_and_decode(
+                    credential=id_token,
+                    keys_url=keys_url,
+                    issuer=issuer,
+                    audience=app.client_id,
+                    lookup_kid=jwtkit.lookup_kid_jwk,
+                    verify_signature=verify_signature,
+                )
+
+            import jwt as _jwt
+            header = _jwt.get_unverified_header(id_token)
+            kid = header["kid"]
+            alg = header["alg"]
+            keys_data = _get_cached_jwks(keys_url)
+            key = jwtkit.lookup_kid_jwk(keys_data, kid)
+            if key is None:
+                # cache miss on a freshly-rotated kid — force a refresh
+                with _OIDC_CACHE_LOCK:
+                    _OIDC_CACHE.pop(f"jwks:{keys_url}", None)
+                keys_data = _get_cached_jwks(keys_url)
+                key = jwtkit.lookup_kid_jwk(keys_data, kid)
+            if key is None:
+                from allauth.socialaccount.providers.oauth2.client import OAuth2Error
+                raise OAuth2Error(f"Invalid 'kid': '{kid}'")
+            data = _jwt.decode(
+                id_token, key=key, algorithms=[alg],
+                issuer=issuer, audience=app.client_id,
+                leeway=30,
+            )
+            jwtkit.verify_jti(data)
+            return data
 
     class CachedOpenIDConnectProvider(_BaseOIDCProvider):
         """OpenID Connect provider using the cached adapter.
@@ -153,13 +237,24 @@ class MySocialAccountAdapter(DefaultSocialAccountAdapter):
 
     def pre_social_login(self, request, sociallogin):
         """Reject IdP accounts whose email domain doesn't match the configured
-        allowlist. Silently skipped when social_auth_email_domain is blank."""
+        allowlist. Silently skipped when social_auth_email_domain is blank.
+
+        Raises ImmediateHttpResponse — caught by allauth's complete_login
+        wrapper and rendered as a user-facing error page (a bare
+        ValidationError here would bubble up as a 500)."""
         user_email = sociallogin.account.extra_data.get("email") or ""
         if user_email and settings.SOCIAL_AUTH_EMAIL_DOMAIN:
             domain = user_email.rsplit("@", 1)[-1]
             if domain != settings.SOCIAL_AUTH_EMAIL_DOMAIN:
-                raise forms.ValidationError(
-                    f"Please use an email with domain: {settings.SOCIAL_AUTH_EMAIL_DOMAIN}"
+                raise ImmediateHttpResponse(
+                    render(
+                        request,
+                        "socialaccount/authentication_error.html",
+                        {"reason": (
+                            f"Please use an email with domain: "
+                            f"{settings.SOCIAL_AUTH_EMAIL_DOMAIN}"
+                        )},
+                    )
                 )
 
     def is_open_for_signup(self, request, sociallogin):
