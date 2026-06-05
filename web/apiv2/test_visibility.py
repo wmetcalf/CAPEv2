@@ -1,5 +1,57 @@
+import inspect
+
 import pytest
 from django.contrib.auth.models import User
+
+# Every per-task READ endpoint must route through _deny_if_hidden (or a list
+# call with visible_to=). Update this set deliberately when adding a new
+# task-reading endpoint — it's the anti-cross-tenant-leak gate.
+TASK_READ_VIEWS = [
+    "tasks_view",
+    "tasks_report",
+    "tasks_iocs",
+    "tasks_screenshot",
+    "tasks_pcap",
+    "tasks_tlspcap",
+    "tasks_evtx",
+    "tasks_dropped",
+    "tasks_surifile",
+    "tasks_procmemory",
+    "tasks_fullmemory",
+    "tasks_payloadfiles",
+    "tasks_procdumpfiles",
+    "tasks_config",
+    "tasks_mitmdump",
+    "tasks_selfextracted",
+]
+
+# A view enforces visibility if it calls _deny_if_hidden directly, or routes
+# through the _resolve_task_id artifact preamble (which calls _deny_if_hidden).
+GUARD_MARKERS = ("_deny_if_hidden", "_resolve_task_id")
+
+
+def _func_source(name):
+    """Source of a top-level function by name, read from the views.py FILE.
+    (inspect.getsource on an @api_view-decorated view returns the DRF wrapper,
+    not the handler — so read the file and pull the def out with ast.)"""
+    import ast
+    import apiv2.views as views
+
+    text = open(views.__file__).read()
+    tree = ast.parse(text)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(text, node)
+    return None
+
+
+@pytest.mark.parametrize("name", TASK_READ_VIEWS)
+def test_read_view_enforces_visibility(name):
+    src = _func_source(name)
+    if src is None:
+        pytest.skip(f"{name} not present in this build")
+    assert any(m in src for m in GUARD_MARKERS), \
+        f"{name} enforces no visibility guard ({GUARD_MARKERS}) — cross-tenant leak risk"
 
 
 class FakeTask:

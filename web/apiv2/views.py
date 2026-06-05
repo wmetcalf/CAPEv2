@@ -1248,6 +1248,9 @@ def tasks_report(request, task_id, report_format="json", make_zip=False):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1432,6 +1435,9 @@ def tasks_iocs(request, task_id, detail=None):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1666,6 +1672,9 @@ def tasks_screenshot(request, task_id, screenshot="all"):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1719,6 +1728,9 @@ def tasks_pcap(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1743,20 +1755,24 @@ def tasks_pcap(request, task_id):
         return Response(resp)
 
 
-def _resolve_task_id(task_id, enabled_key, check_tlp=True):
+def _resolve_task_id(request, task_id, enabled_key, check_tlp=True):
     """Shared preamble for artifact-download endpoints.
 
     Returns ((task_id, None)) on success or ((None, Response(error))) on failure.
     `enabled_key` names the apiconf section that gates the endpoint; callers
     that want to share a gate (e.g. all pcap variants under [taskpcap]) reuse
     the same key. TLP:RED checks are skipped only for endpoints that need
-    to serve regardless (none at present)."""
+    to serve regardless (none at present). Enforces job visibility via
+    _deny_if_hidden so all artifact endpoints honor tenant boundaries."""
     section = getattr(apiconf, enabled_key, None)
     if section is not None and not section.get("enabled"):
         return None, Response({"error": True, "error_value": "%s download API is disabled" % enabled_key})
     check = validate_task(task_id)
     if check["error"]:
         return None, Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return None, _denied
     if check_tlp and (check.get("tlp") or "").lower() == "red":
         return None, Response({"error": True, "error_value": "Task has a TLP of RED"})
     rtid = check.get("rtid", 0)
@@ -1829,7 +1845,7 @@ def tasks_tlspcap(request, task_id):
     """Back-compat endpoint: originally served PolarProxy's tls.pcap. We've
     since moved to SSLproxy + GoGoRoboCap which produces dump_decrypted.pcap;
     prefer that, but fall back to the legacy path for old analyses."""
-    task_id, err = _resolve_task_id(task_id, "tasktlspcap", check_tlp=False)
+    task_id, err = _resolve_task_id(request, task_id, "tasktlspcap", check_tlp=False)
     if err:
         return err
 
@@ -1935,7 +1951,7 @@ def tasks_pcap_variant(request, task_id, variant):
     """Alternate PCAP artifacts for <task_id>. variant ∈
     {decrypted, mixed, sslproxy, zip, pcapng}. The bare tasks/get/pcap/<id>/
     remains for back-compat with existing callers (serves dump.pcap)."""
-    task_id, err = _resolve_task_id(task_id, "taskpcap")
+    task_id, err = _resolve_task_id(request, task_id, "taskpcap")
     if err:
         return err
     v = (variant or "").lower()
@@ -1956,7 +1972,7 @@ def tasks_keys(request, task_id, kind):
     different hook source (tls: MockSSL → tlsdump.log; ssl: bcrypt/NCrypt →
     aux/sslkeylogfile/sslkeys.log; master: SSLproxy → master_keys.log).
     All three are NSS-format keylogs."""
-    task_id, err = _resolve_task_id(task_id, "tasktlskeys")
+    task_id, err = _resolve_task_id(request, task_id, "tasktlskeys")
     if err:
         return err
     k = (kind or "").lower()
@@ -1971,7 +1987,7 @@ def tasks_keys(request, task_id, kind):
 def tasks_etw(request, task_id, kind):
     """ETW telemetry downloads. kind ∈ {dns, network, wmi} each map to an
     NDJSON stream; kind == amsi zips the per-buffer AMSI script captures."""
-    task_id, err = _resolve_task_id(task_id, "tasketw")
+    task_id, err = _resolve_task_id(request, task_id, "tasketw")
     if err:
         return err
     k = (kind or "").lower()
@@ -1990,7 +2006,7 @@ def tasks_bulkzip(request, task_id, folder):
     to {logs, network, memory, selfextracted}. Archive is AES-encrypted
     with ZIP_PWD for parity with tasks_dropped / tasks_payloadfiles /
     tasks_procdumpfiles."""
-    task_id, err = _resolve_task_id(task_id, "taskbulkzip")
+    task_id, err = _resolve_task_id(request, task_id, "taskbulkzip")
     if err:
         return err
     f = (folder or "").lower()
@@ -2009,6 +2025,9 @@ def tasks_evtx(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2042,6 +2061,9 @@ def tasks_mitmdump(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
     rtid = check.get("rtid", 0)
     if rtid:
         task_id = rtid
@@ -2069,6 +2091,9 @@ def tasks_dropped(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2120,6 +2145,9 @@ def tasks_selfextracted(request, task_id, tool="all"):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2218,6 +2246,9 @@ def tasks_surifile(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2283,6 +2314,9 @@ def tasks_procmemory(request, task_id, pid="all"):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2361,6 +2395,9 @@ def tasks_fullmemory(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2609,6 +2646,9 @@ def tasks_payloadfiles(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2646,6 +2686,9 @@ def tasks_procdumpfiles(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2683,6 +2726,9 @@ def tasks_config(request, task_id, cape_name=False):
 
     if check["error"]:
         return Response(check)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})

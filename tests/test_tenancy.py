@@ -30,3 +30,15 @@ def test_default_visibility_per_mode():
                               local_admins_manage_all_tenants=True)
     assert tenancy.default_visibility(shared) == "public"
     assert tenancy.default_visibility(locked) == "tenant"
+
+
+def test_disabled_is_legacy_open():
+    """With multitenancy disabled, default visibility is public and a legacy
+    NULL-tenant public task is visible to anyone (current single-tenant behavior)."""
+    from lib.cuckoo.common import tenancy
+    cfg = tenancy.MTConfig(enabled=False, mode="shared", default_visibility="",
+                           local_admins_manage_all_tenants=True)
+    assert tenancy.default_visibility(cfg) == "public"
+    v = tenancy.Viewer(user_id=None, tenant_id=None)
+    j = tenancy.Job(owner_id=1, tenant_id=None, visibility="public")
+    assert tenancy.can_read(v, j) is True
