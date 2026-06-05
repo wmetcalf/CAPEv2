@@ -30,7 +30,8 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from users.tenancy import submission_scope, can_view_task, viewer_for
+from users.tenancy import submission_scope, can_view_task, can_toggle_task, viewer_for
+from lib.cuckoo.common.tenancy import VISIBILITIES
 
 
 def _deny_if_hidden(request, task):
@@ -42,6 +43,22 @@ def _deny_if_hidden(request, task):
     if not can_view_task(request.user, task):
         return Response({"error": True, "error_value": "Access denied"}, status=403)
     return None
+
+
+@api_view(["PATCH"])
+def tasks_set_visibility(request, task_id):
+    """Owner (or tenant-admin for public/tenant jobs, or superuser) re-toggles a
+    task's visibility. Mirrors the can_toggle predicate."""
+    task = db.view_task(task_id)
+    if task is None:
+        return Response({"error": True, "error_value": "Task not found"})
+    vis = request.data.get("visibility")
+    if vis not in VISIBILITIES:
+        return Response({"error": True, "error_value": "invalid visibility"})
+    if not can_toggle_task(request.user, task):
+        return Response({"error": True, "error_value": "Access denied"}, status=403)
+    db.set_task_visibility(task_id, vis)
+    return Response({"error": False, "data": {"task_id": int(task_id), "visibility": vis}})
 from rest_framework.response import Response
 
 sys.path.append(settings.CUCKOO_PATH)

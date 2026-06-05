@@ -809,6 +809,19 @@ class TasksMixIn:
 
         return self.set_task_status(task, status)
 
+    def set_task_visibility(self, task_id: int, visibility: str) -> Optional[Task]:
+        """Set a task's visibility (public/tenant/private).
+        @param task_id: task identifier
+        @param visibility: one of public|tenant|private
+        @return: the Task, or None if not found
+        """
+        task = self.session.get(Task, task_id)
+        if not task:
+            return None
+        task.visibility = visibility
+        self.session.commit()
+        return task
+
     def fetch_task(self, categories: list = None):
         """Fetches a task waiting to be processed and locks it for running.
         @return: None or task
