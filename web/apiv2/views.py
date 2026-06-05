@@ -29,6 +29,8 @@ try:
     from apikey.authentication import ApiKeyAuthentication
 except ImportError:
     ApiKeyAuthentication = None
+
+from users.tenancy import submission_scope
 from rest_framework.response import Response
 
 sys.path.append(settings.CUCKOO_PATH)
@@ -234,6 +236,10 @@ def tasks_create_static(request):
     priority = force_int(request.data.get("priority"))
 
     resp["error"] = []
+    try:
+        _tenant_id, _visibility = submission_scope(request)
+    except ValueError:
+        return Response({"error": True, "error_value": "invalid visibility"})
     files = request.FILES.getlist("file")
     extra_details = {}
     task_ids = []
@@ -248,6 +254,8 @@ def tasks_create_static(request):
                     static=1,
                     only_extraction=True,
                     user_id=request.user.id or 0,
+                    tenant_id=_tenant_id,
+                    visibility=_visibility,
                 )
                 task_ids.extend(task_id)
                 if extra_details.get("erros"):
@@ -296,6 +304,10 @@ def tasks_create_file(request):
             resp = {"error": True, "error_value": "No file was submitted"}
             return Response(resp)
         resp["error"] = []
+        try:
+            _tenant_id, _visibility = submission_scope(request)
+        except ValueError:
+            return Response({"error": True, "error_value": "invalid visibility"})
         # Parse potential POST options (see submission/views.py)
         pcap = request.data.get("pcap", "")
 
@@ -332,6 +344,8 @@ def tasks_create_file(request):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "tenant_id": _tenant_id,
+            "visibility": _visibility,
         }
 
         task_machines = []
@@ -382,7 +396,7 @@ def tasks_create_file(request):
                 details["task_ids"].append(task_id)
                 continue
             if static:
-                task_id = db.add_static(file_path=tmp_path, priority=priority, user_id=request.user.id or 0)
+                task_id = db.add_static(file_path=tmp_path, priority=priority, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
                 details["task_ids"].append(task_id)
                 continue
             if tmp_path:
@@ -434,6 +448,10 @@ def tasks_create_url(request):
     resp = {}
     if request.method == "POST":
         resp["error"] = []
+        try:
+            _tenant_id, _visibility = submission_scope(request)
+        except ValueError:
+            return Response({"error": True, "error_value": "invalid visibility"})
 
         url = request.data.get("url")
         (
@@ -507,6 +525,8 @@ def tasks_create_url(request):
                 tlp=tlp,
                 tags_tasks=tags_tasks,
                 user_id=request.user.id or 0,
+                tenant_id=_tenant_id,
+                visibility=_visibility,
             )
             if task_id:
                 task_ids.append(task_id)
@@ -535,6 +555,10 @@ def tasks_create_dlnexec(request):
             return Response(resp)
 
         resp["error"] = []
+        try:
+            _tenant_id, _visibility = submission_scope(request)
+        except ValueError:
+            return Response({"error": True, "error_value": "invalid visibility"})
         url = request.data.get("dlnexec")
         if not url:
             resp = {"error": True, "error_value": "URL value is empty"}
@@ -601,6 +625,8 @@ def tasks_create_dlnexec(request):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "tenant_id": _tenant_id,
+            "visibility": _visibility,
         }
 
         status, tasks_details = download_file(**details)
@@ -2741,6 +2767,10 @@ def tasks_download_services(request):
     if not hashes:
         return Response({"error": True, "error_value": "hashes value is empty"})
     resp["error"] = []
+    try:
+        _tenant_id, _visibility = submission_scope(request)
+    except ValueError:
+        return Response({"error": True, "error_value": "invalid visibility"})
     # Parse potential POST options (see submission/views.py)
     options = request.POST.get("options", "")
     custom = request.POST.get("custom", "")
@@ -2788,6 +2818,8 @@ def tasks_download_services(request):
         "options": options,
         "only_extraction": False,
         "service": "",
+        "tenant_id": _tenant_id,
+        "visibility": _visibility,
         "user_id": request.user.id or 0,
     }
 

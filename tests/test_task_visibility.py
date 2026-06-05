@@ -59,3 +59,19 @@ def test_list_tasks_visible_filter(db):
     allv = Viewer(user_id=9, tenant_id=None, is_superuser=True, is_local_admin=True)
     allids = {t.id for t in db.list_tasks(visible_to=allv)}
     assert {pub, ten, priv, other} <= allids
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_add_url_stamps_tenant_and_visibility(db):
+    from lib.cuckoo.core.data.task import Task
+    tid = db.add_url("http://example.com", tenant_id=10, visibility="tenant")
+    t = db.session.get(Task, tid)
+    assert t.tenant_id == 10
+    assert t.visibility == "tenant"
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_add_url_defaults_private(db):
+    from lib.cuckoo.core.data.task import Task
+    tid = db.add_url("http://example.com")
+    assert db.session.get(Task, tid).visibility == "private"
