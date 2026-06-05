@@ -56,3 +56,45 @@ def can_toggle(v: Viewer, j: Job) -> bool:
     if v.is_tenant_admin and _same_tenant(v, j) and j.visibility in (PUBLIC, TENANT):
         return True
     return False
+
+
+@dataclass(frozen=True)
+class MTConfig:
+    enabled: bool
+    mode: str
+    default_visibility: str
+    local_admins_manage_all_tenants: bool
+
+
+def _as_bool(v, default: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("yes", "true", "1", "on")
+    if v is None:
+        return default
+    return bool(v)
+
+
+def multitenancy_config() -> MTConfig:
+    """Read the [multitenancy] section of cuckoo.conf (server-side policy)."""
+    from lib.cuckoo.common.config import Config
+
+    try:
+        sec = Config("cuckoo").get("multitenancy")
+    except Exception:
+        sec = {}
+    get = sec.get if hasattr(sec, "get") else (lambda k, d=None: d)
+    return MTConfig(
+        enabled=_as_bool(get("enabled", False), False),
+        mode=str(get("mode", "shared") or "shared"),
+        default_visibility=str(get("default_visibility", "") or ""),
+        local_admins_manage_all_tenants=_as_bool(get("local_admins_manage_all_tenants", True), True),
+    )
+
+
+def default_visibility(cfg: MTConfig) -> str:
+    """The submit-time default visibility for the configured mode."""
+    if cfg.default_visibility in VISIBILITIES:
+        return cfg.default_visibility
+    return PUBLIC if cfg.mode == "shared" else TENANT
