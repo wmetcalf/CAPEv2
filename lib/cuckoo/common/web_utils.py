@@ -955,6 +955,8 @@ def download_file(**kwargs):
             route=route,
             cape=cape,
             user_id=kwargs.get("user_id"),
+            tenant_id=kwargs.get("tenant_id"),
+            visibility=kwargs.get("visibility", "private"),
             source_url=kwargs.get("source_url", False),
         )
 

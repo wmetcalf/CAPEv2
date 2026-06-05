@@ -52,3 +52,26 @@ def can_view_task(user, task) -> bool:
 
 def can_toggle_task(user, task) -> bool:
     return can_toggle(viewer_for(user), _job_for(task))
+
+
+def submission_scope(request):
+    """Resolve (tenant_id, visibility) for a new submission from the request.
+
+    Tenant comes from the submitting user; visibility is the explicit
+    ``visibility`` param when valid, else the per-mode default. Raises
+    ValueError on an invalid explicit visibility so the view can 400.
+    """
+    from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, VISIBILITIES
+
+    v = viewer_for(request.user)
+    data = getattr(request, "data", None)
+    if data is None:
+        data = getattr(request, "POST", None) or {}
+    requested = data.get("visibility") if hasattr(data, "get") else None
+    if requested:
+        if requested not in VISIBILITIES:
+            raise ValueError("invalid visibility")
+        visibility = requested
+    else:
+        visibility = default_visibility(multitenancy_config())
+    return v.tenant_id, visibility

@@ -97,3 +97,41 @@ def test_viewer_for_local_admin_gate(monkeypatch):
     # anonymous -> empty viewer
     from django.contrib.auth.models import AnonymousUser
     assert ut.viewer_for(AnonymousUser()).user_id is None
+
+
+@pytest.mark.django_db
+def test_submission_scope(monkeypatch):
+    import pytest as _pytest
+    from lib.cuckoo.common.tenancy import MTConfig
+    from users.models import Tenant, UserProfile
+    import users.tenancy as ut
+
+    t = Tenant.objects.create(slug="acme", name="Acme")
+    u = User.objects.create_user("a", "a@x.com", "x")
+    p = UserProfile.objects.get(user=u)
+    p.tenant = t
+    p.save()
+    u = User.objects.get(pk=u.pk)
+
+    class Req:
+        pass
+
+    # explicit visibility honoured + tenant from user
+    r = Req()
+    r.user = u
+    r.data = {"visibility": "tenant"}
+    assert ut.submission_scope(r) == (t.id, "tenant")
+
+    # omitted -> per-mode default (shared -> public)
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(True, "shared", "", True))
+    r2 = Req()
+    r2.user = u
+    r2.data = {}
+    assert ut.submission_scope(r2)[1] == "public"
+
+    # invalid -> ValueError (view turns this into a 400)
+    r3 = Req()
+    r3.user = u
+    r3.data = {"visibility": "bogus"}
+    with _pytest.raises(ValueError):
+        ut.submission_scope(r3)
