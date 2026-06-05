@@ -54,3 +54,46 @@ def test_resolve_tenant_multi_match_fails_closed():
     reconcile_tenant(u, {"shared-grp"})
     p = UserProfile.objects.get(user=u)
     assert p.tenant_id is None  # ambiguous -> fail closed
+
+
+@pytest.mark.django_db
+def test_viewer_for_maps_user():
+    from users.models import Tenant, UserProfile
+    from users.tenancy import viewer_for
+
+    t = Tenant.objects.create(slug="acme", name="Acme")
+    u = User.objects.create_user("a", "a@acme.com", "x")
+    p = UserProfile.objects.get(user=u)
+    p.tenant = t
+    p.is_tenant_admin = True
+    p.save()
+
+    # re-fetch so the user's cached userprofile reflects the saved tenant
+    # (a real request loads request.user.userprofile fresh)
+    fresh = User.objects.get(pk=u.pk)
+    v = viewer_for(fresh)
+    assert v.user_id == u.id
+    assert v.tenant_id == t.id
+    assert v.is_tenant_admin is True
+
+
+@pytest.mark.django_db
+def test_viewer_for_local_admin_gate(monkeypatch):
+    from lib.cuckoo.common.tenancy import MTConfig
+    import users.tenancy as ut
+
+    u = User.objects.create_superuser("root", "root@x.com", "x")  # local superuser, no SocialAccount
+
+    # flag ON -> local superuser is break-glass
+    monkeypatch.setattr(ut, "multitenancy_config",
+                        lambda: MTConfig(True, "locked", "", True))
+    assert ut.viewer_for(u).is_local_admin is True
+
+    # flag OFF -> local (non-IdP) superuser is NOT break-glass
+    monkeypatch.setattr(ut, "multitenancy_config",
+                        lambda: MTConfig(True, "locked", "", False))
+    assert ut.viewer_for(u).is_local_admin is False
+
+    # anonymous -> empty viewer
+    from django.contrib.auth.models import AnonymousUser
+    assert ut.viewer_for(AnonymousUser()).user_id is None
