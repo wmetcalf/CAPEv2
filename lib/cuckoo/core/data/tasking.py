@@ -26,9 +26,11 @@ from sflock.ident import identify as sflock_identify
 try:
     from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy import (
+        and_,
         delete,
         func,
         not_,
+        or_,
         select,
         update,
     )
@@ -957,6 +959,7 @@ class TasksMixIn:
         task_ids=False,
         include_hashes=False,
         user_id=None,
+        visible_to=None,
         for_update=False,
     ) -> List[Task]:
         """Retrieve list of task.
@@ -1017,6 +1020,17 @@ class TasksMixIn:
             stmt = stmt.where(Task.id.in_(task_ids))
         if user_id is not None:
             stmt = stmt.where(Task.user_id == user_id)
+        if visible_to is not None and not visible_to.is_local_admin:
+            # Visibility filter — mirrors lib.cuckoo.common.tenancy.can_read.
+            # Break-glass (is_local_admin) skips the filter entirely (sees all).
+            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+            conds = [Task.visibility == PUBLIC]
+            if visible_to.user_id is not None:
+                conds.append(Task.user_id == visible_to.user_id)  # owner
+            if visible_to.tenant_id is not None:
+                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
+            stmt = stmt.where(or_(*conds))
 
         # 3. Chaining for ordering, pagination, and locking remains the same
         if order_by is not None and isinstance(order_by, tuple):
