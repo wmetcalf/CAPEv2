@@ -30,7 +30,18 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from users.tenancy import submission_scope
+from users.tenancy import submission_scope, can_view_task, viewer_for
+
+
+def _deny_if_hidden(request, task):
+    """Return a Response (to be returned by the caller) if request.user may not
+    see `task`, else None. Every per-task READ endpoint must route through this
+    (enforced by the endpoint-coverage test) to prevent cross-tenant leaks."""
+    if task is None:
+        return Response({"error": True, "error_value": "Task not found"})
+    if not can_view_task(request.user, task):
+        return Response({"error": True, "error_value": "Access denied"}, status=403)
+    return None
 from rest_framework.response import Response
 
 sys.path.append(settings.CUCKOO_PATH)
@@ -886,6 +897,7 @@ def tasks_list(request, offset=None, limit=None, window=None):
         options_like=option,
         order_by=Task.completed_on.desc(),
         include_hashes=True,
+        visible_to=viewer_for(request.user),
     )
 
     if not tasks:
@@ -929,6 +941,9 @@ def tasks_view(request, task_id):
     if not task:
         resp = {"error": True, "error_value": "Task not found in database"}
         return Response(resp)
+    _denied = _deny_if_hidden(request, task)
+    if _denied is not None:
+        return _denied
 
     resp = {"error": False}
     entry = task.to_dict()
@@ -1171,6 +1186,9 @@ def tasks_status(request, task_id):
     if not task:
         resp = {"error": True, "error_value": "Task does not exist"}
         return Response(resp)
+    _denied = _deny_if_hidden(request, task)
+    if _denied is not None:
+        return _denied
     if request.method == "GET":
         status = task.to_dict()["status"]
         resp = {"error": False, "data": status}
