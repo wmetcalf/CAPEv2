@@ -246,3 +246,19 @@ analysis = 0
 mongo = no
 # Clean orphan files in mongodb
 unused_files_in_mongodb = no
+
+[multitenancy]
+# Multi-tenant identity & job-visibility (off = current single-tenant behavior).
+enabled = no
+# shared = tenant-less collaborative pool (submit default public);
+# locked = per-tenant isolation (submit default tenant).
+mode = shared
+# Which OIDC claim drives tenant membership (reuses the groups claim from SSO).
+tenant_claim_source = groups
+# Blank = per-mode default (shared->public, locked->tenant). Override with one
+# of: public | tenant | private.
+default_visibility =
+# Operator break-glass: local Django superusers manage ALL tenants (cross-tenant
+# read + management) when yes. Set no to force admin access through the IdP.
+# Server-side only — a tenant/user cannot grant themselves this.
+local_admins_manage_all_tenants = yes
