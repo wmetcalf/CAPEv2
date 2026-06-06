@@ -30,18 +30,36 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from users.tenancy import submission_scope, can_view_task, can_toggle_task, viewer_for
+from users.tenancy import submission_scope, can_view_task, can_toggle_task, can_manage_task, viewer_for
 from lib.cuckoo.common.tenancy import VISIBILITIES
 
 
 def _deny_if_hidden(request, task):
     """Return a Response (to be returned by the caller) if request.user may not
     see `task`, else None. Every per-task READ endpoint must route through this
-    (enforced by the endpoint-coverage test) to prevent cross-tenant leaks."""
-    if task is None:
-        return Response({"error": True, "error_value": "Task not found"})
-    if not can_view_task(request.user, task):
-        return Response({"error": True, "error_value": "Access denied"}, status=403)
+    (enforced by the endpoint-coverage test) to prevent cross-tenant leaks.
+
+    A non-existent task and a hidden task return the SAME generic 404 response so
+    an attacker cannot enumerate which task IDs / states exist in other tenants.
+    Callers must invoke this BEFORE validate_task()/status/TLP checks so those
+    don't leak existence either."""
+    if task is None or not can_view_task(request.user, task):
+        return Response({"error": True, "error_value": "Task not found"}, status=404)
+    return None
+
+
+def _deny_task(request, task_id):
+    """Convenience: load the task and apply _deny_if_hidden. Used by endpoints
+    that don't otherwise hold the Task object."""
+    return _deny_if_hidden(request, db.view_task(task_id))
+
+
+def _deny_manage(request, task_id):
+    """Like _deny_task but for MUTATIONS — requires can_manage (owner/tenant-admin/
+    break-glass). Returns a generic 404 Response if not allowed, else None."""
+    task = db.view_task(task_id)
+    if task is None or not can_manage_task(request.user, task):
+        return Response({"error": True, "error_value": "Task not found"}, status=404)
     return None
 
 
@@ -50,11 +68,15 @@ def tasks_set_visibility(request, task_id):
     """Owner (or tenant-admin for public/tenant jobs, or superuser) re-toggles a
     task's visibility. Mirrors the can_toggle predicate."""
     task = db.view_task(task_id)
-    if task is None:
-        return Response({"error": True, "error_value": "Task not found"})
+    # Indistinguishable response (H3): a caller who can't even SEE the task gets
+    # the SAME generic 404 as a missing one, so this endpoint can't be used to
+    # enumerate other tenants' task IDs. A 403 below is only reachable once the
+    # caller can read the task (so it leaks nothing they don't already see).
+    if task is None or not can_view_task(request.user, task):
+        return Response({"error": True, "error_value": "Task not found"}, status=404)
     vis = request.data.get("visibility")
     if vis not in VISIBILITIES:
-        return Response({"error": True, "error_value": "invalid visibility"})
+        return Response({"error": True, "error_value": "invalid visibility"}, status=400)
     if not can_toggle_task(request.user, task):
         return Response({"error": True, "error_value": "Access denied"}, status=403)
     db.set_task_visibility(task_id, vis)
@@ -775,7 +797,7 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
                 sids = [sample.to_dict()["id"]]
             resp["data"] = []
             for sid in sids:
-                tasks = db.list_tasks(sample_id=sid, include_hashes=True)
+                tasks = db.list_tasks(sample_id=sid, include_hashes=True, visible_to=viewer_for(request.user))
                 for task in tasks:
                     buf = task.to_dict()
                     # Remove path information, just grab the file name
@@ -812,10 +834,10 @@ def ext_tasks_search(request):
             return Response(resp)
 
         if term == "tags_tasks":
-            value = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=int(search_limit))]
+            value = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=int(search_limit), visible_to=viewer_for(request.user))]
             term = "ids"
         elif term == "options":
-            value = [int(v.id) for v in db.list_tasks(options_like=value, limit=search_limit)]
+            value = [int(v.id) for v in db.list_tasks(options_like=value, limit=search_limit, visible_to=viewer_for(request.user))]
             term = "ids"
         elif term == "ids":
             if all([v.strip().isdigit() for v in value.split(",")]):
@@ -823,7 +845,7 @@ def ext_tasks_search(request):
             else:
                 return Response({"error": True, "error_value": "Not all values are integers"})
             tmp_value = []
-            for task in db.list_tasks(task_ids=value) or []:
+            for task in db.list_tasks(task_ids=value, visible_to=viewer_for(request.user)) or []:
                 if task.status == "reported":
                     tmp_value.append(task.id)
                 else:
@@ -843,6 +865,13 @@ def ext_tasks_search(request):
 
         if records:
             for results in records:
+                # Visibility filter: the mongo/ES report rows don't carry tenant
+                # info, so resolve each task and drop ones the viewer can't see.
+                _doc = results.get("_source", results) if es_as_db else results
+                _tid = (_doc.get("info") or {}).get("id") if isinstance(_doc, dict) else None
+                _t = db.view_task(_tid) if _tid is not None else None
+                if _t is None or not can_view_task(request.user, _t):
+                    continue
                 if repconf.mongodb.enabled:
                     return_data.append(results)
                 if es_as_db:
@@ -955,9 +984,6 @@ def tasks_view(request, task_id):
         return Response(resp)
 
     task = db.view_task(task_id, details=True)
-    if not task:
-        resp = {"error": True, "error_value": "Task not found in database"}
-        return Response(resp)
     _denied = _deny_if_hidden(request, task)
     if _denied is not None:
         return _denied
@@ -1101,9 +1127,9 @@ def tasks_reschedule(request, task_id):
         resp = {"error": True, "error_value": "Task Reschedule API is Disabled"}
         return Response(resp)
 
-    if not db.view_task(task_id):
-        resp = {"error": True, "error_value": "Task ID does not exist in the database"}
-        return Response(resp)
+    _denied = _deny_manage(request, task_id)
+    if _denied is not None:
+        return _denied
 
     resp = {}
     new_task_id = db.reschedule(task_id)
@@ -1129,6 +1155,10 @@ def tasks_reprocess(request, task_id):
         resp["error"] = True
         resp["error_value"] = "Task Reprocess API is Disabled"
         return Response(resp)
+
+    _denied = _deny_manage(request, task_id)
+    if _denied is not None:
+        return _denied
 
     error, msg, task_status = db.tasks_reprocess(task_id)
     if error:
@@ -1169,6 +1199,10 @@ def tasks_delete(request, task_id, status=False):
         if check["error"]:
             f_deleted.append(str(task))
             continue
+        # tenant isolation: only delete tasks the caller may manage
+        if not can_manage_task(request.user, db.view_task(task)):
+            f_deleted.append(str(task))
+            continue
 
         if db.delete_task(task):
             delete_folder(os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task))
@@ -1200,9 +1234,6 @@ def tasks_status(request, task_id):
 
     resp = {}
     task = db.view_task(task_id)
-    if not task:
-        resp = {"error": True, "error_value": "Task does not exist"}
-        return Response(resp)
     _denied = _deny_if_hidden(request, task)
     if _denied is not None:
         return _denied
@@ -1245,12 +1276,12 @@ def tasks_report(request, task_id, report_format="json", make_zip=False):
             {"error": "You don't have permissions to download reports. Ask admin to enable it for you in user profile."},
         )
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1432,12 +1463,12 @@ def tasks_iocs(request, task_id, detail=None):
         resp = {"error": True, "error_value": "IOC download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1669,12 +1700,12 @@ def tasks_screenshot(request, task_id, screenshot="all"):
         resp = {"error": True, "error_value": "Screenshot download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1725,12 +1756,12 @@ def tasks_pcap(request, task_id):
         resp = {"error": True, "error_value": "PCAP download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -1767,12 +1798,12 @@ def _resolve_task_id(request, task_id, enabled_key, check_tlp=True):
     section = getattr(apiconf, enabled_key, None)
     if section is not None and not section.get("enabled"):
         return None, Response({"error": True, "error_value": "%s download API is disabled" % enabled_key})
-    check = validate_task(task_id)
-    if check["error"]:
-        return None, Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return None, _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return None, Response(check)
     if check_tlp and (check.get("tlp") or "").lower() == "red":
         return None, Response({"error": True, "error_value": "Task has a TLP of RED"})
     rtid = check.get("rtid", 0)
@@ -2022,12 +2053,12 @@ def tasks_evtx(request, task_id):
         resp = {"error": True, "error_value": "EVTX download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2058,12 +2089,12 @@ def tasks_mitmdump(request, task_id):
     if not apiconf.mitmdump.get("enabled"):
         resp = {"error": True, "error_value": "Mitmdump HAR download API is disabled"}
         return Response(resp)
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
     rtid = check.get("rtid", 0)
     if rtid:
         task_id = rtid
@@ -2088,12 +2119,12 @@ def tasks_dropped(request, task_id):
         resp = {"error": True, "error_value": "Dropped File download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2142,12 +2173,12 @@ def tasks_selfextracted(request, task_id, tool="all"):
         resp = {"error": True, "error_value": "Self Extracted File download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2243,12 +2274,12 @@ def tasks_surifile(request, task_id):
         resp = {"error": True, "error_value": "Suricata File download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2295,10 +2326,30 @@ def tasks_rollingsuri(request, window=60):
             {"suricata.alerts": 1, "info.id": 1},
         )
     )
+
+    # Tenant isolation: this is an aggregate feed across ALL recent analyses, so
+    # it must drop alerts (and task ids) for tasks the caller may not see — the
+    # task_id coverage gate can't catch this endpoint (no task_id in its route).
+    # When multitenancy is disabled, viewer.is_local_admin short-circuits to
+    # see-all, so this is a no-op and behavior is unchanged.
+    viewer = viewer_for(request.user)
+    _seen = {}
+
+    def _can_see(tid):
+        if viewer.is_local_admin:
+            return True
+        if tid not in _seen:
+            t = db.view_task(tid)
+            _seen[tid] = bool(t) and can_view_task(request.user, t)
+        return _seen[tid]
+
     resp = []
     for e in result:
+        tid = e["info"]["id"]
+        if not _can_see(tid):
+            continue
         for alert in e["suricata"]["alerts"]:
-            alert["id"] = e["info"]["id"]
+            alert["id"] = tid
             resp.append(alert)
 
     return Response(resp)
@@ -2311,12 +2362,12 @@ def tasks_procmemory(request, task_id, pid="all"):
         resp = {"error": True, "error_value": "Process memory download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2392,12 +2443,12 @@ def tasks_fullmemory(request, task_id):
         resp = {"error": True, "error_value": "Full memory download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2631,7 +2682,7 @@ def tasks_latest(request, hours):
     resp = {}
     resp["error"] = []
     timestamp = datetime.now() - timedelta(hours=int(hours))
-    ids = db.list_tasks(completed_after=timestamp)
+    ids = db.list_tasks(completed_after=timestamp, visible_to=viewer_for(request.user))
     resp["ids"] = [id.to_dict() for id in ids]
     return Response(resp)
 
@@ -2643,12 +2694,12 @@ def tasks_payloadfiles(request, task_id):
         resp = {"error": True, "error_value": "CAPE payload file download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2683,12 +2734,12 @@ def tasks_procdumpfiles(request, task_id):
         resp = {"error": True, "error_value": "Procdump file download API is disabled"}
         return Response(resp)
 
-    check = validate_task(task_id)
-    if check["error"]:
-        return Response(check)
     _denied = _deny_if_hidden(request, db.view_task(task_id))
     if _denied is not None:
         return _denied
+    check = validate_task(task_id)
+    if check["error"]:
+        return Response(check)
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2722,13 +2773,13 @@ def tasks_config(request, task_id, cape_name=False):
     if not apiconf.capeconfig.get("enabled"):
         resp = {"error": True, "error_value": "Config download API is disabled"}
         return Response(resp)
+    _denied = _deny_if_hidden(request, db.view_task(task_id))
+    if _denied is not None:
+        return _denied
     check = validate_task(task_id)
 
     if check["error"]:
         return Response(check)
-    _denied = _deny_if_hidden(request, db.view_task(task_id))
-    if _denied is not None:
-        return _denied
 
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
@@ -2954,9 +3005,9 @@ def tasks_file_stream(request, task_id):
         return Response(resp)
     resp = {}
     task = db.view_task(task_id)
-    if not task:
-        resp = {"error": True, "error_value": "Task does not exist"}
-        return Response(resp)
+    _denied = _deny_if_hidden(request, task)
+    if _denied is not None:
+        return _denied
     machine = db.view_machine(task.guest.name)
     if machine.status != "running":
         resp = {"error": True, "error_value": "Machine is not running", "errors": machine.status}

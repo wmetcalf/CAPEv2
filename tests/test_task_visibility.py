@@ -75,3 +75,20 @@ def test_add_url_defaults_private(db):
     from lib.cuckoo.core.data.task import Task
     tid = db.add_url("http://example.com")
     assert db.session.get(Task, tid).visibility == "private"
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_set_task_visibility_validates_enum(db):
+    """Defense-in-depth (M1): the DB setter rejects unknown levels so a bogus
+    value can never be persisted even if a caller skips the view-layer check."""
+    from lib.cuckoo.core.data.task import Task
+    tid = db.add_url("http://example.com", tenant_id=10, visibility="tenant")
+
+    with pytest.raises(ValueError):
+        db.set_task_visibility(tid, "bogus")
+    # unchanged after the rejected write
+    assert db.session.get(Task, tid).visibility == "tenant"
+
+    # a valid level still works
+    assert db.set_task_visibility(tid, "public") is not None
+    assert db.session.get(Task, tid).visibility == "public"
