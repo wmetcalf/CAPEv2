@@ -100,7 +100,7 @@ def test_deny_if_hidden_public_allowed():
 
 
 @pytest.mark.django_db
-def test_toggle_visibility_owner_allowed_other_denied(monkeypatch):
+def test_toggle_visibility_owner_allowed_other_denied(cape_db, monkeypatch):
     from rest_framework.test import APIClient
     import apiv2.views as views
 

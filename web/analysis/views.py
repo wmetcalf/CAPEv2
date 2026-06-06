@@ -23,7 +23,7 @@ from wsgiref.util import FileWrapper
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import BadRequest, PermissionDenied
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
+from django.http import HttpResponse, HttpResponseForbidden, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
 from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST, require_safe
@@ -191,6 +191,8 @@ if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
     DISABLED_WEB = False
 
 db: TasksMixIn = Database()
+
+from users.tenancy import can_view_task, can_toggle_task, viewer_for
 
 anon_not_viewable_func_list = (
     "file",
@@ -436,12 +438,13 @@ def index(request, page=1):
     analyses_pcaps = []
     analyses_static = []
 
+    _visible = viewer_for(request.user)
     tasks_files = db.list_tasks(
-        limit=TASK_LIMIT, offset=off, category="file", not_status=TASK_PENDING, tags_tasks_not_like="audit", include_hashes=True
+        limit=TASK_LIMIT, offset=off, category="file", not_status=TASK_PENDING, tags_tasks_not_like="audit", include_hashes=True, visible_to=_visible
     )
-    tasks_static = db.list_tasks(limit=TASK_LIMIT, offset=off, category="static", not_status=TASK_PENDING, include_hashes=True)
-    tasks_urls = db.list_tasks(limit=TASK_LIMIT, offset=off, category="url", not_status=TASK_PENDING, include_hashes=True)
-    tasks_pcaps = db.list_tasks(limit=TASK_LIMIT, offset=off, category="pcap", not_status=TASK_PENDING, include_hashes=True)
+    tasks_static = db.list_tasks(limit=TASK_LIMIT, offset=off, category="static", not_status=TASK_PENDING, include_hashes=True, visible_to=_visible)
+    tasks_urls = db.list_tasks(limit=TASK_LIMIT, offset=off, category="url", not_status=TASK_PENDING, include_hashes=True, visible_to=_visible)
+    tasks_pcaps = db.list_tasks(limit=TASK_LIMIT, offset=off, category="pcap", not_status=TASK_PENDING, include_hashes=True, visible_to=_visible)
 
     mongo_map = {}
     if enabledconf["mongodb"]:
@@ -2657,6 +2660,14 @@ def split_signature_calls(report):
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def report(request, task_id):
+    # Tenant/visibility enforcement — parallel to the apiv2 read guard. Deny
+    # before any (expensive) report loading.
+    _task = db.view_task(task_id)
+    if _task is None:
+        return HttpResponseForbidden("Task not found")
+    if not can_view_task(request.user, _task):
+        return HttpResponseForbidden("Access denied")
+    can_toggle_visibility = can_toggle_task(request.user, _task)
     network_report = {}
     report = {}
     if enabledconf["mongodb"]:
@@ -3034,6 +3045,8 @@ def report(request, task_id):
         "analysis/report.html",
         {
             "title": "Analysis Report",
+            "can_toggle_visibility": can_toggle_visibility,
+            "task_visibility": getattr(_task, "visibility", "private"),
             "analysis": report,
             # ToDo test
             "file": report.get("target", {}).get("file", {}),
