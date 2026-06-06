@@ -14,6 +14,9 @@ from base64 import urlsafe_b64encode
 from contextlib import suppress
 
 from django.conf import settings
+
+from users.tenancy import submission_scope
+from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render
 
@@ -268,6 +271,10 @@ def force_int(value):
 def index(request, task_id=None, resubmit_hash=None):
     remote_console = False
     if request.method == "POST":
+        try:
+            _tenant_id, _visibility = submission_scope(request)
+        except ValueError:
+            return render(request, "error.html", {"error": "Invalid visibility value"})
         (
             static,
             package,
@@ -387,6 +394,8 @@ def index(request, task_id=None, resubmit_hash=None):
             "options": options,
             "only_extraction": False,
             "user_id": request.user.id or 0,
+            "tenant_id": _tenant_id,
+            "visibility": _visibility,
             "package": package,
         }
         if opt_apikey:
@@ -552,7 +561,7 @@ def index(request, task_id=None, resubmit_hash=None):
 
         elif task_category == "static":
             for content, path, sha256 in list_of_tasks:
-                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0)
+                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
                 if not task_id:
                     return render(request, "error.html", {"error": "We don't have static extractor for this"})
                 details["task_ids"] += task_id
@@ -607,6 +616,8 @@ def index(request, task_id=None, resubmit_hash=None):
                         cape=cape,
                         tags_tasks=tags_tasks,
                         user_id=request.user.id or 0,
+                        tenant_id=_tenant_id,
+                        visibility=_visibility,
                     )
                     details["task_ids"].append(task_id)
 
@@ -747,6 +758,10 @@ def index(request, task_id=None, resubmit_hash=None):
             "submission/index.html",
             {
                 "title": "Submit",
+                "visibility_levels": (
+                    [PUBLIC, PRIVATE] if multitenancy_config().mode == "shared" else [PUBLIC, TENANT, PRIVATE]
+                ),
+                "default_visibility": default_visibility(multitenancy_config()),
                 "packages": sorted(packages, key=lambda i: i["name"].lower()),
                 "machines": machines,
                 "vpns": vpns_data,
