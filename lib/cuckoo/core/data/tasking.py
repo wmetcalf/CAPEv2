@@ -814,7 +814,14 @@ class TasksMixIn:
         @param task_id: task identifier
         @param visibility: one of public|tenant|private
         @return: the Task, or None if not found
+        @raise ValueError: if visibility is not a known level — defense in depth
+            so no caller (web, broker, or future) can persist a bogus value even
+            if it skips the view-layer check.
         """
+        from lib.cuckoo.common.tenancy import VISIBILITIES
+
+        if visibility not in VISIBILITIES:
+            raise ValueError(f"invalid visibility: {visibility!r}")
         task = self.session.get(Task, task_id)
         if not task:
             return None

@@ -192,7 +192,47 @@ if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
 
 db: TasksMixIn = Database()
 
-from users.tenancy import can_view_task, can_toggle_task, viewer_for
+from users.tenancy import can_view_task, can_toggle_task, can_manage_task, viewer_for
+
+
+def require_task_manage(view):
+    """Decorator for task-scoped MUTATION views (remove/comment/reprocess/etc.):
+    403 (generic) unless the user may MANAGE the task (owner / tenant-admin for
+    public+tenant jobs / break-glass). Stricter than require_task_visibility."""
+    from functools import wraps
+
+    @wraps(view)
+    def _wrapped(request, *args, **kwargs):
+        tid = kwargs.get("task_id")
+        if tid is None and args:
+            tid = args[0]
+        task = db.view_task(tid)
+        if task is None or not can_manage_task(request.user, task):
+            return HttpResponseForbidden("Not found")
+        return view(request, *args, **kwargs)
+
+    return _wrapped
+
+
+def require_task_visibility(view):
+    """Decorator for task-scoped analysis views: 403 (generic) unless the
+    requesting user may see the task. task_id comes from the URL named-group
+    (passed as a kwarg), or the first positional arg as a fallback. A hidden
+    and a non-existent task are indistinguishable (no cross-tenant enumeration).
+    """
+    from functools import wraps
+
+    @wraps(view)
+    def _wrapped(request, *args, **kwargs):
+        tid = kwargs.get("task_id")
+        if tid is None and args:
+            tid = args[0]
+        task = db.view_task(tid)
+        if task is None or not can_view_task(request.user, task):
+            return HttpResponseForbidden("Not found")
+        return view(request, *args, **kwargs)
+
+    return _wrapped
 
 anon_not_viewable_func_list = (
     "file",
@@ -1724,6 +1764,7 @@ def _load_evtx_channel_page(zip_path, member, page, page_size=EVTX_PAGE_SIZE, se
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 # @ratelimit(key="ip", rate=my_rate_seconds, block=rateblock)
 # @ratelimit(key="ip", rate=my_rate_minutes, block=rateblock)
+@require_task_visibility
 def load_files(request, task_id, category):
     """Filters calls for call category.
     @param task_id: cuckoo task id
@@ -2021,6 +2062,7 @@ def fetch_signature_call_data(task_id, requested_calls):
 @csrf_exempt
 @require_POST
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def signature_calls(request, task_id):
     try:
         requested_calls = json.loads(request.body)
@@ -2043,6 +2085,7 @@ def signature_calls(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def chunk(request, task_id, pid, pagenum):
     try:
         pid, pagenum = int(pid), int(pagenum) - 1
@@ -2103,6 +2146,7 @@ def chunk(request, task_id, pid, pagenum):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def filtered_chunk(request, task_id, pid, category, apilist, caller, tid):
     """Filters calls for call category.
     @param task_id: cuckoo task id
@@ -2375,6 +2419,7 @@ def gen_moloch_from_antivirus(virustotal):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def antivirus(request, task_id):
     if enabledconf["mongodb"]:
         rtmp = mongo_find_one(
@@ -2417,6 +2462,7 @@ def antivirus(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def surialert(request, task_id):
     if enabledconf["mongodb"]:
         report = mongo_find_one("analysis", {"info.id": int(task_id)}, {"suricata.alerts": 1, "_id": 0}, sort=[("_id", -1)])
@@ -2445,6 +2491,7 @@ def surialert(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def surihttp(request, task_id):
     if enabledconf["mongodb"]:
         report = mongo_find_one("analysis", {"info.id": int(task_id)}, {"suricata.http": 1, "_id": 0}, sort=[("_id", -1)])
@@ -2475,6 +2522,7 @@ def surihttp(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def suritls(request, task_id):
     if enabledconf["mongodb"]:
         report = mongo_find_one("analysis", {"info.id": int(task_id)}, {"suricata.tls": 1, "_id": 0}, sort=[("_id", -1)])
@@ -2505,6 +2553,7 @@ def suritls(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def surifiles(request, task_id):
     if enabledconf["mongodb"]:
         report = mongo_find_one(
@@ -2537,6 +2586,7 @@ def surifiles(request, task_id):
 
 @csrf_exempt
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def search_behavior(request, task_id):
     if request.method == "POST":
         query = request.POST.get("search")
@@ -3072,6 +3122,7 @@ def report(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def load_evtx_channel(request, task_id):
     if request.headers.get("x-requested-with") != "XMLHttpRequest":
         raise PermissionDenied
@@ -3097,6 +3148,7 @@ def load_evtx_channel(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def load_evtx_channel_count(request, task_id):
     if request.headers.get("x-requested-with") != "XMLHttpRequest":
         raise PermissionDenied
@@ -3126,6 +3178,7 @@ def load_evtx_channel_count(request, task_id):
 # session-cookie auth here so the global API-key-only DRF chain (used
 # under SSO deployments) doesn't 401 the in-browser fetches.
 @authentication_classes([SessionAuthentication])
+@require_task_visibility
 def file_nl(request, category, task_id, dlfile):
     base_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id))
     path = False
@@ -3439,6 +3492,7 @@ def file(request, category, task_id, dlfile):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def procdump(request, task_id, process_id, start, end, zipped=False):
     origname = process_id + ".dmp"
     tmpdir = None
@@ -3706,6 +3760,7 @@ def search(request, searched=""):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_manage
 def remove(request, task_id):
     """Remove an analysis."""
     if not enabledconf["delete"] and not request.user.is_staff:
@@ -3767,6 +3822,7 @@ def remove(request, task_id):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def pcapstream(request, task_id, conntuple):
     src, sport, dst, dport, proto = conntuple.split(",")
     sport, dport = int(sport), int(dport)
@@ -3815,6 +3871,7 @@ def pcapstream(request, task_id, conntuple):
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_manage
 def comments(request, task_id):
     if request.method == "POST" and settings.COMMENTS:
         comment = request.POST.get("commentbox", "")
@@ -3924,6 +3981,7 @@ on_demand_config_mapper = {
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 @ratelimit(key="ip", rate=my_rate_seconds, block=rateblock)
 @ratelimit(key="ip", rate=my_rate_minutes, block=rateblock)
+@require_task_manage
 def on_demand(request, service: str, task_id: str, category: str, sha256):
     """
     This aux function allows to generate some details on demand, this is specially useful for long running libraries and we don't need them in many cases due to scripted submissions
@@ -4116,6 +4174,7 @@ def ban_user(request, user_id: int):
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_manage
 def reprocess_tasks(request, task_id: int):
     if not settings.REPROCESS_TASKS:
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
@@ -4129,6 +4188,7 @@ def reprocess_tasks(request, task_id: int):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def failed_processing(request, task_id):
     task = db.view_task(task_id)
     if not task:

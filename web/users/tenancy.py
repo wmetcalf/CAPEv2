@@ -18,6 +18,12 @@ def viewer_for(user) -> Viewer:
     prof = getattr(user, "userprofile", None)
     cfg = multitenancy_config()
     is_super = bool(getattr(user, "is_superuser", False))
+    if not cfg.enabled:
+        # Multitenancy off => legacy single-tenant behavior: an authenticated
+        # user sees and manages everything (is_local_admin short-circuits the
+        # predicate and the list filter). Existing/legacy tasks are NOT hidden.
+        return Viewer(user_id=user.id, tenant_id=None, is_superuser=is_super,
+                      is_tenant_admin=False, is_local_admin=True)
     if not is_super:
         is_local = False
     elif cfg.local_admins_manage_all_tenants:
@@ -51,6 +57,14 @@ def can_view_task(user, task) -> bool:
 
 
 def can_toggle_task(user, task) -> bool:
+    return can_toggle(viewer_for(user), _job_for(task))
+
+
+def can_manage_task(user, task) -> bool:
+    """Authorize a mutation (delete/reschedule/reprocess/comment/remove) on a
+    task. Same policy as toggling visibility: owner, tenant-admin for the
+    tenant's public/tenant jobs, or break-glass superuser — never another
+    member's private job."""
     return can_toggle(viewer_for(user), _job_for(task))
 
 

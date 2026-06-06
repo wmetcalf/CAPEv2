@@ -10,7 +10,7 @@ class ForeignTask:
 
 
 @pytest.mark.django_db
-def test_report_denies_cross_tenant_private(cape_db, monkeypatch, client):
+def test_report_denies_cross_tenant_private(cape_db, mt_enabled, monkeypatch, client):
     import analysis.views as av
 
     monkeypatch.setattr(av.db, "view_task", lambda *a, **k: ForeignTask())

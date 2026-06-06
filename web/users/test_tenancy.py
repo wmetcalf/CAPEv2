@@ -57,7 +57,7 @@ def test_resolve_tenant_multi_match_fails_closed():
 
 
 @pytest.mark.django_db
-def test_viewer_for_maps_user():
+def test_viewer_for_maps_user(mt_enabled):
     from users.models import Tenant, UserProfile
     from users.tenancy import viewer_for
 
@@ -75,6 +75,31 @@ def test_viewer_for_maps_user():
     assert v.user_id == u.id
     assert v.tenant_id == t.id
     assert v.is_tenant_admin is True
+
+
+@pytest.mark.django_db
+def test_disabled_is_backcompat_see_all(monkeypatch):
+    """H1 back-compat: with multitenancy OFF (the default / existing `sb`
+    deployment), any authenticated user sees every task — including a legacy
+    private job owned by someone else — exactly like today. The feature must be
+    fully opt-in and must not retroactively hide existing rows."""
+    from lib.cuckoo.common.tenancy import MTConfig
+    from users.tenancy import can_view_task, viewer_for
+    import users.tenancy as ut
+
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+
+    nonowner = User.objects.create_user("n", "n@x.com", "x")
+
+    class LegacyTask:  # owned by a different user, marked private
+        user_id = 999
+        tenant_id = None
+        visibility = "private"
+
+    v = viewer_for(nonowner)
+    assert v.is_local_admin is True          # short-circuit to legacy see-all
+    assert v.tenant_id is None
+    assert can_view_task(nonowner, LegacyTask()) is True  # not hidden
 
 
 @pytest.mark.django_db
@@ -100,7 +125,7 @@ def test_viewer_for_local_admin_gate(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_submission_scope(monkeypatch):
+def test_submission_scope(mt_enabled, monkeypatch):
     import pytest as _pytest
     from lib.cuckoo.common.tenancy import MTConfig
     from users.models import Tenant, UserProfile
