@@ -63,6 +63,24 @@ def _deny_manage(request, task_id):
     return None
 
 
+def _deny_by_hash(request, *, sha256=None, sha1=None, md5=None, sample_id=None):
+    """Indistinguishable 404 unless the caller has >=1 VISIBLE task referencing the
+    sample identified by the hash/id. A sample can be shared across tenants, so access
+    follows the union of the caller's visible tasks."""
+    viewer = viewer_for(request.user)
+    if sample_id is not None:
+        sample = db.view_sample(sample_id)
+    elif sha256 or sha1 or md5:
+        sample = db.find_sample(sha256=sha256, sha1=sha1, md5=md5)
+    else:
+        sample = None
+    if sample is None:
+        return Response({"error": True, "error_value": "Sample not found"}, status=404)
+    if db.list_tasks(sample_id=sample.id, visible_to=viewer, limit=1):
+        return None
+    return Response({"error": True, "error_value": "Sample not found"}, status=404)
+
+
 @api_view(["PATCH"])
 def tasks_set_visibility(request, task_id):
     """Owner (or tenant-admin for public/tenant jobs, or superuser) re-toggles a
@@ -716,6 +734,10 @@ def files_view(request, md5=None, sha1=None, sha256=None, sample_id=None):
     if not apiconf.fileview.get("enabled"):
         resp = {"error": True, "error_value": "File View API is Disabled"}
         return Response(resp)
+
+    _denied = _deny_by_hash(request, md5=md5, sha1=sha1, sha256=sha256, sample_id=sample_id)
+    if _denied is not None:
+        return _denied
 
     resp = {}
     if md5 or sha1 or sha256 or sample_id:
@@ -2486,6 +2508,13 @@ def file(request, stype, value):
     if not apiconf.sampledl.get("enabled", False):
         resp = {"error": True, "error_value": "Sample download API is disabled"}
         return Response(resp)
+
+    if stype in ("md5", "sha1", "sha256"):
+        _denied = _deny_by_hash(request, **{stype: value})
+    else:  # stype == "task"
+        _denied = _deny_task(request, value)
+    if _denied is not None:
+        return _denied
 
     # This Func is not Synced with views.py "def file()"
 
