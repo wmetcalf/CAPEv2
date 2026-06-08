@@ -2879,8 +2879,14 @@ def post_processing(request, category, task_id):
 def statistics_data(requests, days):
     resp = {}
     if days.isdigit():
-        details = statistics(int(days))
-        resp = {"Error": False, "data": details}
+        from dashboard.views import entitled_scopes
+
+        v = viewer_for(requests.user)
+        data = {
+            scope: statistics(int(days), scope=scope, viewer=v)
+            for scope in entitled_scopes(requests.user)
+        }
+        resp = {"Error": False, "data": data}
     else:
         resp = {"Error": True, "error_value": "Provide days as number"}
     return Response(resp)

@@ -3953,8 +3953,18 @@ def vtupload(request, category, task_id, filename, dlfile):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def statistics_data(request, days=7):
     if days.isdigit():
+        from dashboard.views import entitled_scopes, _SCOPE_LABEL
+
+        v = viewer_for(request.user)
         try:
-            details = statistics(int(days))
+            panels = [
+                {
+                    "scope": scope,
+                    "label": _SCOPE_LABEL[scope],
+                    "statistics": statistics(int(days), scope=scope, viewer=v),
+                }
+                for scope in entitled_scopes(request.user)
+            ]
         except Exception as e:
             # psycopg2.OperationalError
             print(e)
@@ -3963,7 +3973,7 @@ def statistics_data(request, days=7):
                 "error.html",
                 {"title": "Statistics", "error": "Please restart your database. Probably it had an update or it just down"},
             )
-        return render(request, "statistics.html", {"title": "Statistics", "statistics": details, "days": days})
+        return render(request, "statistics.html", {"title": "Statistics", "panels": panels, "days": days})
     return render(request, "error.html", {"title": "Statistics", "error": "Provide days as number"})
 
 
