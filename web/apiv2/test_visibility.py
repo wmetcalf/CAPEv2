@@ -204,3 +204,21 @@ def test_toggle_visibility_authz_and_indistinguishability(cape_db, mt_enabled, m
     r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "public"}, format="json")
     assert r.status_code == 404
     assert state["vis"] == "tenant"  # unchanged
+
+
+# Views that resolve/serve a sample or file by hash or sample_id (NOT routed by
+# task_id, so the routed-task_id gate above can't see them). Each must reference
+# _deny_by_hash (or _deny_task for a task-id variant) or it leaks samples/metadata
+# across tenants.
+HASH_SERVING_VIEWS = ("file", "files_view")
+
+
+@pytest.mark.parametrize("name", HASH_SERVING_VIEWS)
+def test_hash_addressed_view_enforces_visibility(name):
+    """SECURITY GATE: hash-addressed sample/file/metadata views must reference a
+    visibility guard (_deny_by_hash / _deny_task), or they leak across tenants."""
+    import apiv2.views as views
+    src = _func_source(views, name)
+    assert src is not None, f"{name} not found in apiv2.views"
+    assert ("_deny_by_hash" in src) or ("_deny_task" in src), \
+        f"apiv2.{name} serves by hash/sample but references no _deny_by_hash/_deny_task guard"
