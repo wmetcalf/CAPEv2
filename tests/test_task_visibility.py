@@ -92,3 +92,31 @@ def test_set_task_visibility_validates_enum(db):
     # a valid level still works
     assert db.set_task_visibility(tid, "public") is not None
     assert db.session.get(Task, tid).visibility == "public"
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_count_matching_tasks_visible_filter(db):
+    """Pagination counts must apply the SAME visibility filter as the listing,
+    or the page totals leak other tenants' submission volumes (and produce
+    empty pages). count_matching_tasks(visible_to=) must agree with list_tasks."""
+    from lib.cuckoo.common.tenancy import Viewer
+
+    def mk(owner, tenant, vis):
+        t = _mk_task()
+        t.user_id, t.tenant_id, t.visibility = owner, tenant, vis
+        db.session.add(t)
+        db.session.commit()
+
+    mk(1, 10, "public")
+    mk(1, 10, "tenant")
+    mk(1, 10, "private")
+    mk(3, 20, "tenant")
+
+    v = Viewer(user_id=2, tenant_id=10)  # tenant-10 member, not owner of the private one
+    # the page count must equal the number of rows actually listed for that viewer
+    assert db.count_matching_tasks(visible_to=v) == len(db.list_tasks(visible_to=v, limit=100000))
+    # and it must be strictly fewer than the unfiltered total (private + other-tenant hidden)
+    assert db.count_matching_tasks(visible_to=v) < db.count_matching_tasks()
+    # break-glass counts everything, same as no filter
+    allv = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
+    assert db.count_matching_tasks(visible_to=allv) == db.count_matching_tasks()

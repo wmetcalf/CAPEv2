@@ -531,10 +531,10 @@ def index(request, page=1):
     pages_urls_num = 0
     pages_pcaps_num = 0
     pages_static_num = 0
-    tasks_files_number = db.count_matching_tasks(category="file", not_status=TASK_PENDING) or 0
-    tasks_static_number = db.count_matching_tasks(category="static", not_status=TASK_PENDING) or 0
-    tasks_urls_number = db.count_matching_tasks(category="url", not_status=TASK_PENDING) or 0
-    tasks_pcaps_number = db.count_matching_tasks(category="pcap", not_status=TASK_PENDING) or 0
+    tasks_files_number = db.count_matching_tasks(category="file", not_status=TASK_PENDING, visible_to=_visible) or 0
+    tasks_static_number = db.count_matching_tasks(category="static", not_status=TASK_PENDING, visible_to=_visible) or 0
+    tasks_urls_number = db.count_matching_tasks(category="url", not_status=TASK_PENDING, visible_to=_visible) or 0
+    tasks_pcaps_number = db.count_matching_tasks(category="pcap", not_status=TASK_PENDING, visible_to=_visible) or 0
     if tasks_files_number:
         pages_files_num = int(tasks_files_number / TASK_LIMIT + 1)
     if tasks_static_number:
@@ -689,7 +689,7 @@ def index(request, page=1):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def pending(request):
     # db = Database()
-    tasks = db.list_tasks(status=TASK_PENDING, include_hashes=True)
+    tasks = db.list_tasks(status=TASK_PENDING, include_hashes=True, visible_to=viewer_for(request.user))
 
     pending = []
     for task in tasks:

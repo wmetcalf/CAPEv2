@@ -953,11 +953,15 @@ class TasksMixIn:
 
         return new_task_id
 
-    def count_matching_tasks(self, category=None, status=None, not_status=None):
+    def count_matching_tasks(self, category=None, status=None, not_status=None, visible_to=None):
         """Retrieve list of task.
         @param category: filter by category
         @param status: filter by task status
         @param not_status: exclude this task status from filter
+        @param visible_to: a tenancy Viewer; when set (and not a break-glass
+            admin), restrict the count to tasks the viewer may read — mirrors
+            list_tasks / can_read so pagination counts don't leak the volume of
+            other tenants' submissions.
         @return: number of tasks.
         """
         stmt = select(func.count(Task.id))
@@ -968,6 +972,16 @@ class TasksMixIn:
             stmt = stmt.where(Task.status != not_status)
         if category:
             stmt = stmt.where(Task.category == category)
+        if visible_to is not None and not visible_to.is_local_admin:
+            # Same visibility predicate as list_tasks (lib.cuckoo.common.tenancy.can_read).
+            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+            conds = [Task.visibility == PUBLIC]
+            if visible_to.user_id is not None:
+                conds.append(Task.user_id == visible_to.user_id)  # owner
+            if visible_to.tenant_id is not None:
+                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
+            stmt = stmt.where(or_(*conds))
 
         # 2. Execute the statement and return the single integer result.
         return self.session.scalar(stmt)
