@@ -42,3 +42,23 @@ def test_disabled_is_legacy_open():
     v = tenancy.Viewer(user_id=None, tenant_id=None)
     j = tenancy.Job(owner_id=1, tenant_id=None, visibility="public")
     assert tenancy.can_read(v, j) is True
+
+
+def test_scope_match_membership():
+    from lib.cuckoo.common.tenancy import scope_match
+    from tests.tenancy_vectors import SCOPE_VECTORS
+
+    def doc_matches(match, job):
+        if match is None:
+            return True  # global
+        for k, v in match.items():
+            if k == "info.id":  # impossible-sentinel -> matches nothing
+                return False
+            field = {"info.visibility": job.visibility, "info.tenant_id": job.tenant_id,
+                     "info.user_id": job.owner_id}.get(k)
+            if field != v:
+                return False
+        return True
+
+    for viewer, job, scope, expected in SCOPE_VECTORS:
+        assert doc_matches(scope_match(scope, viewer), job) is expected, (scope, viewer, job)

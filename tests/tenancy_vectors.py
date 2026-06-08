@@ -5,6 +5,8 @@ reimplementation. Each case: a viewer + a job + expected read/toggle outcome.
 Viewer/job tenants are small ints; None means "no tenant".
 """
 
+from lib.cuckoo.common.tenancy import Viewer, Job
+
 # Visibility levels
 PUBLIC, TENANT, PRIVATE = "public", "tenant", "private"
 
@@ -46,4 +48,24 @@ VECTORS = [
                          dict(owner_id=1, tenant_id=10, visibility=PRIVATE), True,  True),
     ("breakglass/off",   dict(user_id=9, tenant_id=None, is_superuser=True, is_tenant_admin=False, is_local_admin=False),
                          dict(owner_id=1, tenant_id=10, visibility=PRIVATE), False, False),  # flag off => no cross-owner reach
+]
+
+# Scope membership vectors: does a job appear in a given stat scope for a viewer?
+# (viewer, job, scope) -> bool. Viewer/Job reuse the dataclasses already imported here.
+SCOPE_VECTORS = [
+    # public scope: every public job, regardless of viewer
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=10, visibility="public"), "public", True),
+    (Viewer(user_id=2, tenant_id=99), Job(owner_id=1, tenant_id=10, visibility="public"), "public", True),
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=10, visibility="tenant"), "public", False),
+    # tenant scope: tenant-visibility jobs of the viewer's own tenant
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=10, visibility="tenant"), "tenant", True),
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=99, visibility="tenant"), "tenant", False),
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=10, visibility="public"), "tenant", False),
+    (Viewer(user_id=2, tenant_id=None), Job(owner_id=1, tenant_id=10, visibility="tenant"), "tenant", False),
+    # mine scope: jobs the viewer owns, any visibility
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=2, tenant_id=10, visibility="private"), "mine", True),
+    (Viewer(user_id=2, tenant_id=10), Job(owner_id=1, tenant_id=10, visibility="public"), "mine", False),
+    (Viewer(user_id=None, tenant_id=10), Job(owner_id=2, tenant_id=10, visibility="private"), "mine", False),  # user-less sentinel
+    # global: everything (break-glass / shared)
+    (Viewer(user_id=2, tenant_id=10, is_local_admin=True), Job(owner_id=1, tenant_id=99, visibility="private"), "global", True),
 ]

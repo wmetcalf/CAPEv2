@@ -10,6 +10,9 @@ from typing import Optional
 PUBLIC, TENANT, PRIVATE = "public", "tenant", "private"
 VISIBILITIES = (PUBLIC, TENANT, PRIVATE)
 
+MINE, GLOBAL = "mine", "global"
+SCOPES = (PUBLIC, TENANT, MINE, GLOBAL)
+
 
 @dataclass(frozen=True)
 class Viewer:
@@ -56,6 +59,25 @@ def can_toggle(v: Viewer, j: Job) -> bool:
     if v.is_tenant_admin and _same_tenant(v, j) and j.visibility in (PUBLIC, TENANT):
         return True
     return False
+
+
+def scope_match(scope: str, v: "Viewer"):
+    """Mongo $match (dict) selecting the analysis docs in a stat SCOPE for viewer v.
+    Mirrors the can_read branches. Returns None for 'global' (no filter). Keys target
+    the report's info.* (stamped at report time)."""
+    if scope == GLOBAL:
+        return None
+    if scope == PUBLIC:
+        return {"info.visibility": PUBLIC}
+    if scope == TENANT:
+        if v.tenant_id is None:
+            return {"info.id": -1}  # tenant-less viewer has no tenant scope -> empty
+        return {"info.tenant_id": v.tenant_id, "info.visibility": TENANT}
+    if scope == MINE:
+        if v.user_id is None:
+            return {"info.id": -1}
+        return {"info.user_id": v.user_id}
+    raise ValueError(f"unknown scope {scope!r}")
 
 
 @dataclass(frozen=True)
