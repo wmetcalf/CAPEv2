@@ -1279,11 +1279,30 @@ class TasksMixIn:
 
 
 
-    def get_tasks_status_count(self, scope=None, viewer=None) -> Dict[str, int]:
-        """Counts tasks, grouped by status."""
+    def get_tasks_status_count(self, scope=None, viewer=None, visible_to=None) -> Dict[str, int]:
+        """Counts tasks, grouped by status.
+
+        When `visible_to` is set (and the viewer is not a break-glass admin),
+        applies the SAME can_read union filter as count_matching_tasks so the
+        status counts reflect only tasks the caller may see — preventing global
+        submission-volume leaks in multi-tenant deployments.  When both `scope`
+        and `visible_to` are given, `visible_to` takes precedence.
+        When MT is disabled / break-glass (is_local_admin=True), no extra filter
+        is applied (public-install behavior unchanged)."""
         stmt = select(Task.status, func.count(Task.status)).group_by(Task.status)
-        for cond in self._scope_where(scope, viewer):
-            stmt = stmt.where(cond)
+        if visible_to is not None and not visible_to.is_local_admin:
+            # Same visibility predicate as list_tasks / count_matching_tasks.
+            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+            conds = [Task.visibility == PUBLIC]
+            if visible_to.user_id is not None:
+                conds.append(Task.user_id == visible_to.user_id)  # owner
+            if visible_to.tenant_id is not None:
+                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
+            stmt = stmt.where(or_(*conds))
+        else:
+            for cond in self._scope_where(scope, viewer):
+                stmt = stmt.where(cond)
         # .execute() returns rows, which can be directly converted to a dict.
         return dict(self.session.execute(stmt).all())
 

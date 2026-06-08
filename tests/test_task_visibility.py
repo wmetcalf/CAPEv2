@@ -145,6 +145,34 @@ def test_count_matching_tasks_visible_filter(db):
 
 
 @pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_get_tasks_status_count_scoped_to_visible(db):
+    """get_tasks_status_count(visible_to=) must sum to the same count as
+    count_matching_tasks(visible_to=) over a mixed dataset, and be strictly
+    less than the unfiltered total (cross-tenant counts must not leak)."""
+    from lib.cuckoo.common.tenancy import Viewer
+
+    def mk(owner, tenant, vis):
+        t = _mk_task()
+        t.user_id, t.tenant_id, t.visibility = owner, tenant, vis
+        db.session.add(t)
+        db.session.commit()
+
+    mk(1, 10, "public")    # visible to tenant-10 member
+    mk(1, 10, "tenant")    # visible to tenant-10 member
+    mk(1, 10, "private")   # not visible (owner=1, not viewer)
+    mk(3, 20, "tenant")    # other tenant, not visible
+
+    v = Viewer(user_id=2, tenant_id=10)
+
+    # sum of the scoped status dict must equal count_matching_tasks with the same filter
+    scoped_sum = sum(db.get_tasks_status_count(visible_to=v).values())
+    assert scoped_sum == db.count_matching_tasks(visible_to=v)
+
+    # and it must be strictly less than the global unfiltered total
+    assert scoped_sum < sum(db.get_tasks_status_count().values())
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
 def test_set_task_visibility_syncs_mongo(db, monkeypatch):
     calls = []
     import lib.cuckoo.core.data.tasking as tk

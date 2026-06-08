@@ -2652,7 +2652,7 @@ def cuckoo_status(request):
         resp["error_value"] = "Cuckoo Status API is disabled"
     else:
         resp["error"] = []
-        tasks_dict_with_counts = db.get_tasks_status_count()
+        tasks_dict_with_counts = db.get_tasks_status_count(visible_to=viewer_for(request.user))
         total_sum = 0
         if isinstance(tasks_dict_with_counts, dict):
             total_sum = sum(tasks_dict_with_counts.values())
