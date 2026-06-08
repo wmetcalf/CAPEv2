@@ -251,7 +251,7 @@ def load_vms_tags(force: bool = False):
         return _all_vms_tags or []
 
 
-def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
+def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> dict:
     """
     Retrieves the top Autonomous System Numbers (ASNs) based on the number of occurrences in the database.
 
@@ -295,6 +295,9 @@ def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
     if date_since:
         aggregation_command[0]["$match"].setdefault("info.started", {"$gte": date_since.isoformat()})
 
+    if scope_match:
+        aggregation_command[0].setdefault("$match", {}).update(scope_match)
+
     if repconf.mongodb.enabled:
         data = mongo_aggregate("analysis", aggregation_command)
     else:
@@ -309,7 +312,7 @@ def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
     return data
 
 
-def top_detections(date_since: datetime = False, results_limit: int = 20) -> dict:
+def top_detections(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> dict:
     """
     Retrieves the top detections from the database, either from MongoDB or Elasticsearch,
     and caches the results for 10 minutes.
@@ -351,6 +354,9 @@ def top_detections(date_since: datetime = False, results_limit: int = 20) -> dic
     if date_since:
         aggregation_command[0]["$match"].setdefault("info.started", {"$gte": date_since.isoformat()})
 
+    if scope_match:
+        aggregation_command[0].setdefault("$match", {}).update(scope_match)
+
     if repconf.mongodb.enabled:
         data = mongo_aggregate("analysis", aggregation_command)
     elif repconf.elasticsearchdb.enabled:
@@ -379,7 +385,7 @@ def top_detections(date_since: datetime = False, results_limit: int = 20) -> dic
 
 
 # ToDo extend this to directly extract per day
-def get_stats_per_category(category: str, date_since: datetime) -> List[Dict[str, int]]:
+def get_stats_per_category(category: str, date_since: datetime, scope_match: dict = None) -> List[Dict[str, int]]:
     """
     Retrieves statistical data for a given category from the MongoDB collection "analysis"
     starting from a specified date.
@@ -430,10 +436,12 @@ def get_stats_per_category(category: str, date_since: datetime) -> List[Dict[str
         },
         {"$limit": 20},
     ]
+    if scope_match:
+        aggregation_command[0].setdefault("$match", {}).update(scope_match)
     return mongo_aggregate("analysis", aggregation_command)
 
 
-def statistics(s_days: int) -> dict:
+def statistics(s_days: int, scope_match: dict = None) -> dict:
     """
     Generate statistics for the given number of days.
 
@@ -489,7 +497,7 @@ def statistics(s_days: int) -> dict:
         return details
 
     for module_name in ("statistics.signatures", "statistics.processing", "statistics.reporting", "custom_statistics"):
-        module_data = get_stats_per_category(module_name, date_since)
+        module_data = get_stats_per_category(module_name, date_since, scope_match=scope_match)
         for entry in module_data or []:
             name = entry["name"]
             details[module_name.split(".")[-1]].setdefault(name, entry)
@@ -568,8 +576,8 @@ def statistics(s_days: int) -> dict:
         sorted(details["top_samples"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    details["detections"] = top_detections(date_since=date_since)
-    details["asns"] = top_asn(date_since=date_since)
+    details["detections"] = top_detections(date_since=date_since, scope_match=scope_match)
+    details["asns"] = top_asn(date_since=date_since, scope_match=scope_match)
 
     return details
 
