@@ -270,8 +270,9 @@ def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: 
 
     t = int(time.time())
 
-    # caches results for 10 minutes
-    if hasattr(top_asn, "cache"):
+    # caches results for 10 minutes; scoped calls bypass the cache entirely to
+    # prevent cross-tenant leaks (cache is shared across all callers).
+    if not scope_match and hasattr(top_asn, "cache"):
         ct, data = top_asn.cache
         if t - ct < 600:
             return data
@@ -306,8 +307,9 @@ def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: 
     if data:
         data = list(data)
 
-    # save to cache
-    top_asn.cache = (t, data)
+    # save to cache only for unscoped (global) calls
+    if not scope_match:
+        top_asn.cache = (t, data)
 
     return data
 
@@ -329,8 +331,9 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
 
     t = int(time.time())
 
-    # caches results for 10 minutes
-    if hasattr(top_detections, "cache"):
+    # caches results for 10 minutes; scoped calls bypass the cache entirely to
+    # prevent cross-tenant leaks (cache is shared across all callers).
+    if not scope_match and hasattr(top_detections, "cache"):
         ct, data = top_detections.cache
         if t - ct < 600:
             return data
@@ -360,6 +363,7 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     if repconf.mongodb.enabled:
         data = mongo_aggregate("analysis", aggregation_command)
     elif repconf.elasticsearchdb.enabled:
+        # TODO(tenancy): ES stat scoping is a documented follow-up (spec out-of-scope); mongo path is scoped
         # ToDo update to new format
         q = {
             "query": {"bool": {"must": [{"exists": {"field": "detections.family"}}]}},
@@ -378,8 +382,9 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     if data:
         data = list(data)
 
-    # save to cache
-    top_detections.cache = (t, data)
+    # save to cache only for unscoped (global) calls
+    if not scope_match:
+        top_detections.cache = (t, data)
 
     return data
 
@@ -441,12 +446,16 @@ def get_stats_per_category(category: str, date_since: datetime, scope_match: dic
     return mongo_aggregate("analysis", aggregation_command)
 
 
-def statistics(s_days: int, scope_match: dict = None) -> dict:
+def statistics(s_days: int, scope=None, viewer=None) -> dict:
     """
     Generate statistics for the given number of days.
 
     Args:
         s_days (int): The number of days to generate statistics for.
+        scope (str, optional): Tenancy scope string (e.g. 'global', 'public', 'tenant', 'mine').
+            When None or 'global', all tasks are included (backward-compatible default).
+        viewer: Viewer object for per-tenant/per-user scoping. Required when scope is
+            'tenant' or 'mine'; ignored when scope is None/'global'.
 
     Returns:
         dict: A dictionary containing various statistics including:
@@ -462,6 +471,11 @@ def statistics(s_days: int, scope_match: dict = None) -> dict:
             - distributed_tasks: Statistics related to distributed tasks (if applicable).
             - asns: Top Autonomous System Numbers (ASNs).
     """
+    from lib.cuckoo.common.tenancy import scope_match as _scope_match_fn
+
+    # Derive the mongo $match dict from scope+viewer; None → no filter (global, backward-compat).
+    sm = _scope_match_fn(scope, viewer) if scope and scope != "global" else None
+
     date_since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=s_days)
     date_till = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -497,21 +511,26 @@ def statistics(s_days: int, scope_match: dict = None) -> dict:
         return details
 
     for module_name in ("statistics.signatures", "statistics.processing", "statistics.reporting", "custom_statistics"):
-        module_data = get_stats_per_category(module_name, date_since, scope_match=scope_match)
+        module_data = get_stats_per_category(module_name, date_since, scope_match=sm)
         for entry in module_data or []:
             name = entry["name"]
             details[module_name.split(".")[-1]].setdefault(name, entry)
 
     top_samples = {}
-    added_tasks = (
-        db.session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.added_on.between(date_since, date_till)).all()
+    added_tasks_q = (
+        db.session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.added_on.between(date_since, date_till))
     )
-    tasks = (
+    tasks_q = (
         db.session.query(Task)
         .join(Sample, Task.sample_id == Sample.id)
         .filter(Task.completed_on.between(date_since, date_till))
-        .all()
     )
+    # Apply SQL scope filter when scope/viewer are provided; empty list = no-op (global path unchanged).
+    for cond in db._scope_where(scope, viewer):
+        added_tasks_q = added_tasks_q.filter(cond)
+        tasks_q = tasks_q.filter(cond)
+    added_tasks = added_tasks_q.all()
+    tasks = tasks_q.all()
     details["total"] = len(tasks)
     details["average"] = f"{round(details['total'] / s_days, 2):.2f}"
     details["tasks"] = {}
@@ -547,6 +566,7 @@ def statistics(s_days: int, scope_match: dict = None) -> dict:
         details["distributed_tasks"] = {}
         dist_db = dist_session()
         dist_tasks = dist_db.query(DTask).filter(DTask.clock.between(date_since, date_till)).all()
+        # distributed_tasks: separate distributed DB, no tenant column — not scoped (follow-up)
         id2name = {}
         # load node names
         for node in dist_db.query(Node).all() or []:
@@ -576,8 +596,8 @@ def statistics(s_days: int, scope_match: dict = None) -> dict:
         sorted(details["top_samples"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    details["detections"] = top_detections(date_since=date_since, scope_match=scope_match)
-    details["asns"] = top_asn(date_since=date_since, scope_match=scope_match)
+    details["detections"] = top_detections(date_since=date_since, scope_match=sm)
+    details["asns"] = top_asn(date_since=date_since, scope_match=sm)
 
     return details
 
