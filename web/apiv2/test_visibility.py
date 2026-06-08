@@ -75,24 +75,25 @@ def test_routed_task_view_enforces_visibility(modname, views_mod, name):
         f"{modname}.{name} takes task_id but references no guard {GUARD_MARKERS} — cross-tenant leak risk"
 
 
-# Aggregate/feed endpoints that return per-task data WITHOUT a task_id in their
+# Aggregate/feed views that return per-task data WITHOUT a task_id in their
 # route, so the routed-task_id gate above can't see them. Each must still filter
-# its output by the caller's visibility. Add any new cross-task feed here.
-AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri",)
+# its output by the caller's visibility. Add any new cross-task feed here — they
+# may live in EITHER apiv2.views or analysis.views (e.g. `pending`).
+AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri", "pending")
 
 
 @pytest.mark.parametrize("name", AGGREGATE_TASK_FEEDS)
 def test_aggregate_feed_filters_by_viewer(name):
     """SECURITY GATE (aggregate): a feed that emits data for many tasks at once
     must reference a visibility guard, or it leaks cross-tenant task data/ids
-    (the routed-task_id gate cannot catch these — no task_id in the route)."""
-    import apiv2.views as views
+    (the routed-task_id gate cannot catch these — no task_id in the route).
+    Scans BOTH apiv2.views and analysis.views since feeds live in either."""
+    import apiv2.views, analysis.views
 
-    src = _func_source(views, name)
-    if src is None:
-        pytest.skip(f"{name} not found")
+    src = _func_source(apiv2.views, name) or _func_source(analysis.views, name)
+    assert src is not None, f"{name} not found in apiv2.views or analysis.views"
     assert any(m in src for m in GUARD_MARKERS), \
-        f"apiv2.{name} returns cross-task data but references no guard {GUARD_MARKERS} — cross-tenant leak"
+        f"{name} returns cross-task data but references no guard {GUARD_MARKERS} — cross-tenant leak"
 
 
 class FakeTask:
