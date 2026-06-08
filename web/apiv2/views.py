@@ -2518,7 +2518,12 @@ def file(request, stype, value):
 
     if stype in ("md5", "sha1", "sha256"):
         _denied = _deny_by_hash(request, **{stype: value})
-    else:  # stype == "task"
+    else:  # stype == "task" — value is a string from the URL; coerce so the
+        # int task_id column comparison doesn't error on PostgreSQL.
+        try:
+            value = int(value)
+        except (ValueError, TypeError):
+            return Response({"error": True, "error_value": "Invalid task ID"}, status=400)
         _denied = _deny_task(request, value)
     if _denied is not None:
         return _denied

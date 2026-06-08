@@ -51,7 +51,8 @@ def entitled_scopes(user):
     scopes = ["public"]
     if v.tenant_id is not None:
         scopes.append("tenant")
-    scopes.append("mine")
+    if v.user_id is not None:   # anonymous/unauth has no "mine" — skip the empty panel
+        scopes.append("mine")
     return scopes
 
 

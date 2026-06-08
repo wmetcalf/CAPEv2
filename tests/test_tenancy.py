@@ -62,3 +62,13 @@ def test_scope_match_membership():
 
     for viewer, job, scope, expected in SCOPE_VECTORS:
         assert doc_matches(scope_match(scope, viewer), job) is expected, (scope, viewer, job)
+
+
+def test_scope_match_none_viewer():
+    """Defensive (PR#2 review): scope_match must not AttributeError when called
+    with a scope but no viewer (statistics(viewer=None) path)."""
+    from lib.cuckoo.common.tenancy import scope_match
+    assert scope_match("tenant", None) == {"info.id": -1}
+    assert scope_match("mine", None) == {"info.id": -1}
+    assert scope_match("public", None) == {"info.visibility": "public"}
+    assert scope_match("global", None) is None

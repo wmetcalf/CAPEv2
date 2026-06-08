@@ -70,11 +70,11 @@ def scope_match(scope: str, v: "Viewer"):
     if scope == PUBLIC:
         return {"info.visibility": PUBLIC}
     if scope == TENANT:
-        if v.tenant_id is None:
-            return {"info.id": -1}  # tenant-less viewer has no tenant scope -> empty
+        if v is None or v.tenant_id is None:
+            return {"info.id": -1}  # no viewer / tenant-less -> empty
         return {"info.tenant_id": v.tenant_id, "info.visibility": TENANT}
     if scope == MINE:
-        if v.user_id is None:
+        if v is None or v.user_id is None:
             return {"info.id": -1}
         return {"info.user_id": v.user_id}
     raise ValueError(f"unknown scope {scope!r}")
