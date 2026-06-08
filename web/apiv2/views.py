@@ -66,8 +66,15 @@ def _deny_manage(request, task_id):
 def _deny_by_hash(request, *, sha256=None, sha1=None, md5=None, sample_id=None):
     """Indistinguishable 404 unless the caller has >=1 VISIBLE task referencing the
     sample identified by the hash/id. A sample can be shared across tenants, so access
-    follows the union of the caller's visible tasks."""
+    follows the union of the caller's visible tasks.
+
+    When multitenancy is DISABLED (or for a break-glass admin), viewer_for returns
+    is_local_admin=True and this function is a no-op — it must NOT gate the public
+    install, and must NOT 404 dropped/procdump payloads that have no Sample row."""
     viewer = viewer_for(request.user)
+    if viewer.is_local_admin:
+        # Multitenancy disabled (see-all) or break-glass superuser -> no gating.
+        return None
     if sample_id is not None:
         sample = db.view_sample(sample_id)
     elif sha256 or sha1 or md5:

@@ -8,6 +8,20 @@ class _Req:
 
 
 @pytest.mark.django_db
+def test_deny_by_hash_noop_when_multitenancy_disabled(cape_db, monkeypatch):
+    # NO mt_enabled fixture -> multitenancy disabled -> viewer_for returns is_local_admin=True
+    import apiv2.views as views
+    called = {"find": False}
+    def _find(**k):
+        called["find"] = True
+        return None
+    monkeypatch.setattr(views.db, "find_sample", _find, raising=False)
+    u = User.objects.create_user("pub", "p@x.com", "x")
+    # disabled => must allow (return None) WITHOUT even needing a sample lookup result to 404
+    assert views._deny_by_hash(_Req(u), sha256="a"*64) is None
+
+
+@pytest.mark.django_db
 def test_deny_by_hash_blocks_when_no_visible_task(cape_db, mt_enabled, monkeypatch):
     import apiv2.views as views
 
