@@ -14,7 +14,7 @@ from lib.cuckoo.common.config import Config
 try:
     from pymongo.errors import InvalidDocument, OperationFailure
 
-    from dev_utils.mongodb import mongo_collection_names, mongo_delete_data, mongo_find_one, mongo_insert_one, mongo_update_one
+    from dev_utils.mongodb import mongo_collection_names, mongo_create_index, mongo_delete_data, mongo_find_one, mongo_insert_one, mongo_update_one
 
     HAVE_MONGO = True
 except ImportError:
@@ -25,6 +25,19 @@ MEGABYTE = 0x100000
 
 log = logging.getLogger(__name__)
 reporting_conf = Config("reporting")
+
+
+def stamp_tenant_info(info: dict, task) -> None:
+    """Write tenant_id/user_id/visibility into the report's info subdict so mongo
+    aggregations can be scoped. Missing task (deleted) -> public/legacy."""
+    if task is None:
+        info.setdefault("tenant_id", None)
+        info.setdefault("user_id", None)
+        info["visibility"] = "public"
+        return
+    info["tenant_id"] = getattr(task, "tenant_id", None)
+    info["user_id"] = getattr(task, "user_id", None)
+    info["visibility"] = getattr(task, "visibility", "public") or "public"
 
 
 class MongoDB(Report):
@@ -110,6 +123,16 @@ class MongoDB(Report):
                 CuckooReportError("Mongo schema version not expected, check data migration tool")
         else:
             mongo_insert_one("cuckoo_schema", {"version": self.SCHEMA_VERSION})
+            # Best-effort compound index for tenant-scoped aggregations.
+            try:
+                mongo_create_index(
+                    "analysis",
+                    [("info.tenant_id", 1), ("info.visibility", 1), ("info.user_id", 1)],
+                    background=True,
+                    name="tenant_scope_idx",
+                )
+            except Exception as idx_err:
+                log.warning("Could not create tenant_scope_idx on analysis collection: %s", idx_err)
 
         # Create a copy of the dictionary. This is done in order to not modify
         # the original dictionary and possibly compromise the following
@@ -135,6 +158,14 @@ class MongoDB(Report):
 
         if "behavior" not in report or not isinstance(report["behavior"], dict):
             report["behavior"] = {"processes": [], "processtree": [], "summary": {}}
+
+        # Stamp tenant context so mongo aggregations can be scoped.
+        try:
+            from lib.cuckoo.core.database import Database
+            stamp_tenant_info(report["info"], Database().view_task(int(report["info"]["id"])))
+        except Exception as _db_err:
+            log.warning("Failed to look up task for tenant stamping (task %s): %s", report["info"].get("id"), _db_err)
+            stamp_tenant_info(report["info"], None)
 
         # Delete old data just before inserting new one to avoid "missing report" window
         # or data loss if insertion fails during preparation (e.g. OOM)
