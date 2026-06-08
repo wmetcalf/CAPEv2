@@ -95,6 +95,28 @@ def test_set_task_visibility_validates_enum(db):
 
 
 @pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_count_tasks_scope(db):
+    from lib.cuckoo.common.tenancy import Viewer
+
+    def mk(owner, tenant, vis):
+        t = _mk_task(); t.user_id, t.tenant_id, t.visibility = owner, tenant, vis
+        db.session.add(t); db.session.commit()
+
+    mk(1, 10, "public"); mk(1, 10, "tenant"); mk(2, 10, "private"); mk(3, 20, "public")
+    v = Viewer(user_id=2, tenant_id=10)
+    assert db.count_tasks(scope="public", viewer=v) == 2     # the two public ones
+    assert db.count_tasks(scope="tenant", viewer=v) == 1     # tenant-vis in tenant 10
+    assert db.count_tasks(scope="mine", viewer=v) == 1       # owner==2
+    assert db.count_tasks(scope="global", viewer=v) == 4     # break-glass / no filter
+
+    # the other scope-aware methods apply the same filter / execute cleanly
+    assert sum(db.get_tasks_status_count(scope="public", viewer=v).values()) == 2
+    assert sum(db.get_tasks_status_count(scope="global", viewer=v).values()) == 4
+    assert db.minmax_tasks(scope="mine", viewer=v) is not None      # runs scoped, returns a tuple
+    assert isinstance(db.count_samples(scope="tenant", viewer=v), int)  # scoped distinct-sample count
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
 def test_count_matching_tasks_visible_filter(db):
     """Pagination counts must apply the SAME visibility filter as the listing,
     or the page totals leak other tenants' submission volumes (and produce

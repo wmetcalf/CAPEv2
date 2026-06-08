@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 try:
     from sqlalchemy import (
         BigInteger,
+        distinct,
         func,
         ForeignKey,
         Index,
@@ -381,9 +382,23 @@ class SamplesMixIn:
                             break
         return sample
 
-    def count_samples(self) -> int:
-        """Counts the amount of samples in the database."""
-        stmt = select(func.count(Sample.id))
+    def count_samples(self, scope=None, viewer=None) -> int:
+        """Counts the amount of samples in the database.
+
+        When scope/viewer are provided, counts distinct sample_ids referenced
+        by tasks visible in that scope — mirroring _scope_where's branch logic.
+        """
+        if scope is None and viewer is None:
+            stmt = select(func.count(Sample.id))
+            return self.session.scalar(stmt)
+
+        # Scope-aware: count distinct Task.sample_id values for tasks in scope.
+        stmt = (
+            select(func.count(distinct(Task.sample_id)))
+            .where(Task.sample_id.isnot(None))
+        )
+        for cond in self._scope_where(scope, viewer):
+            stmt = stmt.where(cond)
         return self.session.scalar(stmt)
 
     def get_source_url(self, sample_id: int = None) -> Optional[str]:

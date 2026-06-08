@@ -1228,10 +1228,31 @@ class TasksMixIn:
         if result.rowcount > 0:
             log.info("Deleted %d timed-out PENDING tasks.", result.rowcount)
 
-    def minmax_tasks(self) -> Tuple[int, int]:
+    def _scope_where(self, scope, viewer):
+        """Return a list of SQLAlchemy conditions selecting tasks in `scope` for `viewer`,
+        mirroring lib.cuckoo.common.tenancy.scope_match. Empty list => no extra filter."""
+        from lib.cuckoo.common.tenancy import PUBLIC, TENANT, MINE, GLOBAL
+
+        if scope == GLOBAL or scope is None:
+            return []
+        if scope == PUBLIC:
+            return [Task.visibility == PUBLIC]
+        if scope == TENANT:
+            if viewer is None or viewer.tenant_id is None:
+                return [Task.id == -1]
+            return [and_(Task.tenant_id == viewer.tenant_id, Task.visibility == TENANT)]
+        if scope == MINE:
+            if viewer is None or viewer.user_id is None:
+                return [Task.id == -1]
+            return [Task.user_id == viewer.user_id]
+        raise ValueError(f"unknown scope {scope!r}")
+
+    def minmax_tasks(self, scope=None, viewer=None) -> Tuple[int, int]:
         """Finds the minimum start time and maximum completion time for all tasks."""
         # A single query is more efficient than two separate ones.
         stmt = select(func.min(Task.started_on), func.max(Task.completed_on))
+        for cond in self._scope_where(scope, viewer):
+            stmt = stmt.where(cond)
         min_val, max_val = self.session.execute(stmt).one()
 
         if min_val and max_val:
@@ -1249,13 +1270,15 @@ class TasksMixIn:
 
 
 
-    def get_tasks_status_count(self) -> Dict[str, int]:
+    def get_tasks_status_count(self, scope=None, viewer=None) -> Dict[str, int]:
         """Counts tasks, grouped by status."""
         stmt = select(Task.status, func.count(Task.status)).group_by(Task.status)
+        for cond in self._scope_where(scope, viewer):
+            stmt = stmt.where(cond)
         # .execute() returns rows, which can be directly converted to a dict.
         return dict(self.session.execute(stmt).all())
 
-    def count_tasks(self, status: str = None, mid: int = None) -> int:
+    def count_tasks(self, status: str = None, mid: int = None, scope=None, viewer=None) -> int:
         """Counts tasks in the database, with optional filters."""
         # Build a `SELECT COUNT(...)` query from the start for efficiency.
         stmt = select(func.count(Task.id))
@@ -1263,6 +1286,8 @@ class TasksMixIn:
             stmt = stmt.where(Task.machine_id == mid)
         if status:
             stmt = stmt.where(Task.status == status)
+        for cond in self._scope_where(scope, viewer):
+            stmt = stmt.where(cond)
 
         # .scalar() executes the query and returns the single integer result.
         return self.session.scalar(stmt)
