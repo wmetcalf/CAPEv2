@@ -14,3 +14,4 @@ def test_stamp_missing_task_defaults_public():
     info = {"id": 42}
     stamp_tenant_info(info, None)
     assert info["visibility"] == "public" and info["tenant_id"] is None and info["user_id"] is None
+

@@ -40,6 +40,26 @@ def stamp_tenant_info(info: dict, task) -> None:
     info["visibility"] = getattr(task, "visibility", "public") or "public"
 
 
+def _task_tenant_ctx(task_id):
+    """Load a task's tenant context on an INDEPENDENT session (its own pooled
+    connection), so this never touches the processor's shared scoped session.
+    Using Database().session here left an implicit transaction open and broke
+    processing with 'A transaction is already begun on this Session'. Returns a
+    detached holder with tenant_id/user_id/visibility, or None if not found."""
+    from sqlalchemy.orm import Session
+
+    from lib.cuckoo.core.database import Database
+    from lib.cuckoo.core.data.task import Task
+
+    with Session(Database().engine) as s:
+        t = s.get(Task, task_id)
+        if t is None:
+            return None
+        return type("_TaskCtx", (), {
+            "tenant_id": t.tenant_id, "user_id": t.user_id, "visibility": t.visibility,
+        })()
+
+
 class MongoDB(Report):
     """Stores report in MongoDB."""
 
@@ -159,10 +179,11 @@ class MongoDB(Report):
         if "behavior" not in report or not isinstance(report["behavior"], dict):
             report["behavior"] = {"processes": [], "processtree": [], "summary": {}}
 
-        # Stamp tenant context so mongo aggregations can be scoped.
+        # Stamp tenant context so mongo aggregations can be scoped. Use an
+        # INDEPENDENT session (not the processor's shared scoped session) so we
+        # don't leave a transaction open and break processing.
         try:
-            from lib.cuckoo.core.database import Database
-            stamp_tenant_info(report["info"], Database().view_task(int(report["info"]["id"])))
+            stamp_tenant_info(report["info"], _task_tenant_ctx(int(report["info"]["id"])))
         except Exception as _db_err:
             log.warning("Failed to look up task for tenant stamping (task %s): %s", report["info"].get("id"), _db_err)
             stamp_tenant_info(report["info"], None)
