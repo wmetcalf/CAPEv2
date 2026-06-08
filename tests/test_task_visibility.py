@@ -142,3 +142,14 @@ def test_count_matching_tasks_visible_filter(db):
     # break-glass counts everything, same as no filter
     allv = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
     assert db.count_matching_tasks(visible_to=allv) == db.count_matching_tasks()
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_set_task_visibility_syncs_mongo(db, monkeypatch):
+    calls = []
+    import lib.cuckoo.core.data.tasking as tk
+    monkeypatch.setattr(tk, "mongo_update_one",
+                        lambda *a, **k: calls.append((a, k)), raising=False)
+    tid = db.add_url("http://example.com", tenant_id=10, visibility="tenant")
+    db.set_task_visibility(tid, "public")
+    assert calls and calls[-1][0][0] == "analysis"  # updated the analysis collection

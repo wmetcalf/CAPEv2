@@ -38,6 +38,10 @@ try:
 except ImportError:  # pragma: no cover
     raise CuckooDependencyError("Unable to import sqlalchemy (install with `poetry install`)")
 
+try:
+    from dev_utils.mongodb import mongo_update_one
+except Exception:  # mongo optional
+    mongo_update_one = None
 
 log = logging.getLogger(__name__)
 conf = Config("cuckoo")
@@ -827,6 +831,11 @@ class TasksMixIn:
             return None
         task.visibility = visibility
         self.session.commit()
+        if mongo_update_one is not None:
+            try:
+                mongo_update_one("analysis", {"info.id": task_id}, {"$set": {"info.visibility": visibility}})
+            except Exception:
+                log.warning("failed to sync visibility to mongo for task %s", task_id)
         return task
 
     def fetch_task(self, categories: list = None):
