@@ -13,3 +13,14 @@ def test_dashboard_entitled_scopes(cape_db, mt_enabled, monkeypatch):
     assert entitled_scopes(u) == ["public", "tenant", "mine"]
     tl = User.objects.create_user("b", "b@x.com", "x")  # tenant-less
     assert entitled_scopes(tl) == ["public", "mine"]
+
+
+@pytest.mark.django_db
+def test_disabled_shows_single_global_scope():
+    """Back-compat: with multitenancy disabled (the default / basic public install),
+    every user gets a single Global panel == today's dashboard. No mt_enabled fixture
+    here, so multitenancy_config() reads the default (disabled) -> viewer_for() returns
+    is_local_admin=True -> entitled_scopes short-circuits to ['global']."""
+    from dashboard.views import entitled_scopes
+    u = User.objects.create_user("c", "c@x.com", "x")
+    assert entitled_scopes(u) == ["global"]
