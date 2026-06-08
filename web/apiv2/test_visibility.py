@@ -222,3 +222,73 @@ def test_hash_addressed_view_enforces_visibility(name):
     assert src is not None, f"{name} not found in apiv2.views"
     assert ("_deny_by_hash" in src) or ("_deny_task" in src), \
         f"apiv2.{name} serves by hash/sample but references no _deny_by_hash/_deny_task guard"
+
+
+def _hash_routed_views(urls_module):
+    """Return the set of view names for every (live, non-commented) URL whose
+    pattern captures a hash or sample-id group: md5, sha1, sha256, or sample_id.
+    Mirrors _routed_task_views but for hash/sample-id groups instead of task_id."""
+    HASH_GROUPS = ("md5", "sha1", "sha256", "sample_id")
+    text = "\n".join(
+        ln for ln in open(urls_module.__file__).read().splitlines() if not ln.lstrip().startswith("#")
+    )
+    out = set()
+    for m in re.finditer(r"(?:re_path|path)\((.*?views\.([a-zA-Z_]+))", text, re.S):
+        pattern_span, name = m.group(1), m.group(2)
+        if any(f"(?P<{g}>" in pattern_span or f"<{g}>" in pattern_span for g in HASH_GROUPS):
+            out.add(name)
+    return out
+
+
+def _all_hash_views():
+    import apiv2.urls, apiv2.views
+    discovered = _hash_routed_views(apiv2.urls)
+    # Explicitly pin tasks_search (it filters via visible_to= in list_tasks,
+    # which is in GUARD_MARKERS) so it remains covered even if its URL pattern
+    # changes to a non-hash-group form in the future.
+    names = discovered | {"tasks_search"}
+    return [(apiv2.views, n) for n in sorted(names)]
+
+
+_HASH_CASES = _all_hash_views()
+
+
+HASH_GUARD_MARKERS = GUARD_MARKERS + ("_deny_by_hash",)
+
+
+@pytest.mark.parametrize("views_mod,name", _HASH_CASES, ids=[n for _, n in _HASH_CASES])
+def test_hash_routed_view_enforces_visibility(views_mod, name):
+    """SECURITY GATE (auto-discover): every view whose URL pattern captures a
+    hash or sample-id group must reference a visibility guard from GUARD_MARKERS
+    or _deny_by_hash, or it leaks cross-tenant sample/task metadata. tasks_search
+    is pinned here regardless of future URL-pattern changes."""
+    src = _func_source(views_mod, name)
+    if src is None:
+        pytest.skip(f"{name} not found in {views_mod.__name__}")
+    assert any(m in src for m in HASH_GUARD_MARKERS), (
+        f"{views_mod.__name__}.{name} is hash/sample-id routed but references "
+        f"no guard {HASH_GUARD_MARKERS} — cross-tenant leak risk"
+    )
+
+
+def test_hash_routed_discovery_catches_unguarded(tmp_path, monkeypatch):
+    """Negative regression: confirm _hash_routed_views would flag a
+    fictitious unguarded view if one were added to urls.py."""
+    fake_urls = tmp_path / "fake_urls.py"
+    # A URL that captures sha256 but calls a view with no guard
+    fake_urls.write_text(
+        'from apiv2 import views\n'
+        'urlpatterns = [\n'
+        '    __import__("django.urls", fromlist=["re_path"]).re_path(\n'
+        '        r"^unguarded/(?P<sha256>[a-fA-F\\d]{64})/$", views.cuckoo_status\n'
+        '    ),\n'
+        ']\n'
+    )
+    import types, importlib.util
+    spec = importlib.util.spec_from_file_location("fake_urls", fake_urls)
+    fake_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake_mod)
+    discovered = _hash_routed_views(fake_mod)
+    assert "cuckoo_status" in discovered, (
+        "_hash_routed_views failed to detect a sha256-routed unguarded view"
+    )
