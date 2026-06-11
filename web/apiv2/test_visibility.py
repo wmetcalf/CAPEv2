@@ -381,3 +381,25 @@ def test_hash_routed_discovery_catches_unguarded(tmp_path, monkeypatch):
     assert "cuckoo_status" in discovered, (
         "_hash_routed_views failed to detect a sha256-routed unguarded view"
     )
+
+
+@pytest.mark.django_db
+def test_tasks_delete_many_skips_unmanageable_cross_tenant(cape_db, mt_enabled, monkeypatch):
+    """A tenant-less user POSTing another tenant's private task id to the bulk-
+    delete endpoint must NOT delete it (the worst confirmed critical)."""
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    import apiv2.views as views
+
+    deleted = []
+    monkeypatch.setattr(views.db, "view_task",
+                        lambda tid: FakeTask(user_id=999, tenant_id=10, visibility="private"))
+    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
+    monkeypatch.setattr(views, "mongo_delete_data", lambda *a, **k: None, raising=False)
+
+    u = User.objects.create_user("dm", "dm@x.com", "x")  # tenant-less -> can't manage
+    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "1"})
+    force_authenticate(req, user=u)
+    resp = views.tasks_delete_many(req)
+
+    assert deleted == []                       # cross-tenant task NOT deleted
+    assert resp.data.get(1) == "not exists"    # indistinguishable from missing
