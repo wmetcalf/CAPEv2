@@ -149,6 +149,22 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                 await self.close()
                 return
 
+            # 3b. Defense-in-depth: if the socket carries an authenticated user,
+            # confirm they may view this task. The token is mint-gated (guac
+            # index / submission status now require can_view_task), but a leaked
+            # or shared cookie must not tunnel into another tenant's live VM.
+            ws_user = self.scope.get("user")
+            if ws_user is not None and getattr(ws_user, "is_authenticated", False):
+                from users.tenancy import can_view_task
+
+                if not await sync_to_async(can_view_task)(ws_user, task):
+                    logger.warning(
+                        "WebSocket rejected: user not entitled to task %s", self.guac_task_id
+                    )
+                    await self._delete_guac_session()
+                    await self.close()
+                    return
+
             # 4. Look up VNC port server-side from libvirt
             vnc_port = await sync_to_async(_get_vnc_port)(vm_label)
             if not vnc_port:

@@ -13,6 +13,8 @@ sys.path.append(settings.CUCKOO_PATH)
 
 import lib.cuckoo.common.compare as compare
 from lib.cuckoo.common.config import Config
+from lib.cuckoo.core.database import Database
+from users.tenancy import can_view_task
 
 enabledconf = {}
 confdata = Config("reporting").get_config()
@@ -52,6 +54,11 @@ class conditional_login_required:
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def left(request, left_id):
+    # tenant isolation: caller must be able to read the seed analysis (hidden == missing)
+    _seed = Database().view_task(int(left_id))
+    if _seed is None or not can_view_task(request.user, _seed):
+        return render(request, "error.html", {"error": "No analysis found with specified ID"})
+
     if enabledconf["mongodb"]:
         left = mongo_find_one("analysis", {"info.id": int(left_id)}, {"target": 1, "info": 1})
     if es_as_db:
@@ -63,13 +70,16 @@ def left(request, left_id):
     if not left:
         return render(request, "error.html", {"error": "No analysis found with specified ID"})
 
-    # Select all analyses with same file hash.
+    # Select all analyses with same file hash — scoped to the viewer's entitled
+    # tenants so the md5 pivot can't enumerate other tenants' analyses.
+    from dashboard.views import entitled_scope_filter
+
+    _and = [{"target.file.md5": left["target"]["file"]["md5"]}, {"info.id": {"$ne": int(left_id)}}]
+    _scope = entitled_scope_filter(request.user)
+    if _scope:
+        _and.append(_scope)
     if enabledconf["mongodb"]:
-        records = mongo_find(
-            "analysis",
-            {"$and": [{"target.file.md5": left["target"]["file"]["md5"]}, {"info.id": {"$ne": int(left_id)}}]},
-            {"target": 1, "info": 1},
-        )
+        records = mongo_find("analysis", {"$and": _and}, {"target": 1, "info": 1})
     if es_as_db:
         records = []
         q = {
@@ -91,6 +101,11 @@ def left(request, left_id):
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def hash(request, left_id, right_hash):
+    # tenant isolation: caller must be able to read the seed analysis (hidden == missing)
+    _seed = Database().view_task(int(left_id))
+    if _seed is None or not can_view_task(request.user, _seed):
+        return render(request, "error.html", {"error": "No analysis found with specified ID"})
+
     if enabledconf["mongodb"]:
         left = mongo_find_one("analysis", {"info.id": int(left_id)}, {"target": 1, "info": 1})
     if es_as_db:
@@ -102,13 +117,16 @@ def hash(request, left_id, right_hash):
     if not left:
         return render(request, "error.html", {"error": "No analysis found with specified ID"})
 
-    # Select all analyses with same file hash.
+    # Select all analyses with same file hash — scoped to the viewer's entitled
+    # tenants so the md5 pivot can't enumerate other tenants' analyses.
+    from dashboard.views import entitled_scope_filter
+
+    _and = [{"target.file.md5": left["target"]["file"]["md5"]}, {"info.id": {"$ne": int(left_id)}}]
+    _scope = entitled_scope_filter(request.user)
+    if _scope:
+        _and.append(_scope)
     if enabledconf["mongodb"]:
-        records = mongo_find(
-            "analysis",
-            {"$and": [{"target.file.md5": left["target"]["file"]["md5"]}, {"info.id": {"$ne": int(left_id)}}]},
-            {"target": 1, "info": 1},
-        )
+        records = mongo_find("analysis", {"$and": _and}, {"target": 1, "info": 1})
     if es_as_db:
         records = []
         q = {
@@ -130,6 +148,13 @@ def hash(request, left_id, right_hash):
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def both(request, left_id, right_id):
+    # tenant isolation: caller must be able to read BOTH analyses (hidden == missing)
+    _db = Database()
+    for _tid in (left_id, right_id):
+        _seed = _db.view_task(int(_tid))
+        if _seed is None or not can_view_task(request.user, _seed):
+            return render(request, "error.html", {"error": "No analysis found with specified ID"})
+
     if enabledconf["mongodb"]:
         left = mongo_find_one("analysis", {"info.id": int(left_id)}, {"target": 1, "info": 1, "summary": 1})
         right = mongo_find_one("analysis", {"info.id": int(right_id)}, {"target": 1, "info": 1, "summary": 1})

@@ -7,6 +7,7 @@ from django.shortcuts import render
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
+from users.tenancy import can_view_task
 
 
 class conditional_login_required:
@@ -39,6 +40,12 @@ def _error(request, task_id, msg):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request, task_id, session_data):
+    # tenant isolation: only mint a live-VM session token for a task the caller
+    # may view (hidden == "not found" — no cross-tenant enumeration).
+    _task = db.view_task(int(task_id))
+    if _task is None or not can_view_task(request.user, _task):
+        return _error(request, task_id, "No analysis found with specified ID")
+
     if not LIBVIRT_AVAILABLE:
         return _error(request, task_id, "Libvirt not available")
 

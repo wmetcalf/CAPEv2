@@ -203,7 +203,7 @@ def require_task_manage(view):
 
     @wraps(view)
     def _wrapped(request, *args, **kwargs):
-        tid = kwargs.get("task_id")
+        tid = kwargs.get("task_id") or kwargs.get("analysis_number")
         if tid is None and args:
             tid = args[0]
         task = db.view_task(tid)
@@ -224,7 +224,7 @@ def require_task_visibility(view):
 
     @wraps(view)
     def _wrapped(request, *args, **kwargs):
-        tid = kwargs.get("task_id")
+        tid = kwargs.get("task_id") or kwargs.get("analysis_number")
         if tid is None and args:
             tid = args[0]
         task = db.view_task(tid)
@@ -3288,6 +3288,7 @@ def _file_search_all_files(search_category: str, search_term: str) -> list:
 # UI-internal: same rationale as file_nl — used for in-browser downloads
 # of dropped files, payloads, etc. via session cookie auth.
 @authentication_classes([SessionAuthentication])
+@require_task_visibility
 def file(request, category, task_id, dlfile):
     file_name = dlfile
     cd = "application/octet-stream"
@@ -3562,6 +3563,7 @@ def procdump(request, task_id, process_id, start, end, zipped=False):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def filereport(request, task_id, category):
     # check if allowed to download to all + if no if user has permissions
     if not settings.ALLOW_DL_REPORTS_TO_ALL and (
@@ -3608,6 +3610,7 @@ def filereport(request, task_id, category):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def full_memory_dump_file(request, analysis_number):
     filename = False
     for name in ("memory.dmp", "memory.dmp.zip"):
@@ -3628,6 +3631,7 @@ def full_memory_dump_file(request, analysis_number):
 
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_visibility
 def full_memory_dump_strings(request, analysis_number):
     filename = None
     for name in ("memory.dmp.strings", "memory.dmp.strings.zip"):
@@ -3739,6 +3743,10 @@ def search(request, searched=""):
             if es_as_db:
                 new = get_analysis_info(db, id=int(result["info"]["id"]))
             if not new:
+                continue
+            # tenant isolation: only surface analyses the viewer may read
+            _vt = db.view_task(int(new["id"]))
+            if _vt is None or not can_view_task(request.user, _vt):
                 continue
             analyses.append(new)
 
@@ -3913,6 +3921,7 @@ def comments(request, task_id):
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
+@require_task_manage
 def vtupload(request, category, task_id, filename, dlfile):
     if enabledconf["vtupload"] and integrations_cfg.virustotal.apikey:
         try:
@@ -4294,9 +4303,15 @@ def hunt(request):
             ])
             facet_stages[cat_id] = stages
 
-    # MongoDB Pipeline using $facet for multi-category aggregation
+    # MongoDB Pipeline using $facet for multi-category aggregation.
+    # Tenant isolation: restrict the docs the $facet/$group sees to the viewer's
+    # entitled scopes (no-op for break-glass / shared / multitenancy-disabled).
+    from dashboard.views import entitled_scope_filter
+
+    _scope = entitled_scope_filter(request.user)
+    _match = {"$and": [match_query, _scope]} if _scope else match_query
     pipeline = [
-        {"$match": match_query}
+        {"$match": _match}
     ]
     if facet_stages:
         pipeline.append({"$facet": facet_stages})
@@ -4357,7 +4372,8 @@ def tag_tasks(request):
     try:
         for tid in task_ids:
             task = db.session.get(Task, int(tid))
-            if task:
+            # only the task's owner / tenant-admin (or break-glass) may tag it
+            if task and can_manage_task(request.user, task):
                 existing_tags = task.tags_tasks or ""
                 current_tags = [t.strip() for t in existing_tags.split(",") if t.strip()]
                 if tag not in current_tags:

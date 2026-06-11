@@ -11,6 +11,10 @@ GUARD_MARKERS = (
     "_deny_if_hidden", "_deny_task", "_deny_manage", "_resolve_task_id", "visible_to",
     "require_task_visibility", "require_task_manage", "can_view_task", "can_manage_task",
     "can_toggle_task",
+    # scope-filtering primitives for aggregate / mongo surfaces (dashboard,
+    # statistics, hunt, compare): restrict an aggregation to the viewer's
+    # entitled scopes instead of gating a single task_id.
+    "scope_match", "entitled_scope_filter",
 )
 
 # Routed task_id views that legitimately need NO per-task visibility guard.
@@ -18,15 +22,28 @@ GUARD_MARKERS = (
 ALLOWLIST = set()
 
 
-def _routed_task_views(urls_module):
-    """{view_name} for every (live, non-commented) URL whose pattern captures task_id."""
+# URL capture-group names that identify a single task/analysis — any of these in
+# a route means the view resolves tenant-scoped data and needs a guard. Note:
+# `sample_id` is intentionally excluded — sample/hash-addressed routes are owned
+# by the hash gate (test_hash_routed_view_enforces_visibility, which knows about
+# _deny_by_hash); putting it here would double-flag those under the task gate.
+ID_GROUPS = ("task_id", "analysis_number", "left_id", "right_id")
+
+
+def _routed_task_views(urls_module, alias="views"):
+    """{view_name} for every (live, non-commented) URL routed via ``<alias>.NAME``
+    whose pattern captures one of ID_GROUPS. ``alias`` lets us scan the root
+    urlconf (web/web/urls.py), where analysis views are referenced as
+    ``analysis_views.NAME``. The negative lookbehind stops ``views.`` from also
+    matching inside ``analysis_views.`` when scanning with alias="views"."""
     text = "\n".join(
         ln for ln in open(urls_module.__file__).read().splitlines() if not ln.lstrip().startswith("#")
     )
     out = set()
-    for m in re.finditer(r"(?:re_path|path)\((.*?views\.([a-zA-Z_]+))", text, re.S):
+    pat = r"(?:re_path|path)\((.*?)(?<![\w.])" + re.escape(alias) + r"\.([a-zA-Z_]+)"
+    for m in re.finditer(pat, text, re.S):
         pattern_span, name = m.group(1), m.group(2)
-        if "task_id" in pattern_span:
+        if any(g in pattern_span for g in ID_GROUPS):
             out.add(name)
     return out
 
@@ -49,10 +66,23 @@ def _func_source(views_module, name):
 
 def _all_task_views():
     import apiv2.views, apiv2.urls, analysis.views, analysis.urls
+    import compare.views, compare.urls
+    import guac.views, guac.urls
+    from web import urls as web_urls
 
+    # (urls module, views module the matched names resolve to, alias used there).
+    # The root urlconf (web.urls) routes file/filereport/vtupload/full_memory*
+    # into analysis.views under the `analysis_views` alias — historically unscanned.
+    specs = (
+        (apiv2.urls, apiv2.views, "views"),
+        (analysis.urls, analysis.views, "views"),
+        (compare.urls, compare.views, "views"),
+        (guac.urls, guac.views, "views"),
+        (web_urls, analysis.views, "analysis_views"),
+    )
     cases = []
-    for urls_mod, views_mod in ((apiv2.urls, apiv2.views), (analysis.urls, analysis.views)):
-        for name in sorted(_routed_task_views(urls_mod)):
+    for urls_mod, views_mod, alias in specs:
+        for name in sorted(_routed_task_views(urls_mod, alias)):
             cases.append((views_mod.__name__, views_mod, name))
     return cases
 
@@ -79,7 +109,7 @@ def test_routed_task_view_enforces_visibility(modname, views_mod, name):
 # route, so the routed-task_id gate above can't see them. Each must still filter
 # its output by the caller's visibility. Add any new cross-task feed here — they
 # may live in EITHER apiv2.views or analysis.views (e.g. `pending`).
-AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri", "pending")
+AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri", "pending", "hunt", "search")
 
 
 @pytest.mark.parametrize("name", AGGREGATE_TASK_FEEDS)
@@ -94,6 +124,65 @@ def test_aggregate_feed_filters_by_viewer(name):
     assert src is not None, f"{name} not found in apiv2.views or analysis.views"
     assert any(m in src for m in GUARD_MARKERS), \
         f"{name} returns cross-task data but references no guard {GUARD_MARKERS} — cross-tenant leak"
+
+
+# Mutating endpoints that take task ids from the request BODY (not the URL), so
+# neither the routed-id gate nor the aggregate gate can see them. Each must gate
+# every targeted id through a management guard or one tenant can delete/modify
+# another tenant's tasks.
+BODY_KEYED_MUTATIONS = (
+    ("apiv2.views", "tasks_delete_many"),
+    ("analysis.views", "tag_tasks"),
+)
+
+
+@pytest.mark.parametrize("modname,name", BODY_KEYED_MUTATIONS)
+def test_body_keyed_mutation_enforces_manage(modname, name):
+    """SECURITY GATE (body-keyed mutation): a POST view that mutates tasks by
+    ids supplied in the request body must reference a management/visibility
+    guard, or one tenant can act on another tenant's tasks."""
+    import importlib
+
+    mod = importlib.import_module(modname)
+    src = _func_source(mod, name)
+    assert src is not None, f"{name} not found in {modname}"
+    assert any(m in src for m in GUARD_MARKERS), \
+        f"{modname}.{name} mutates tasks by body ids but references no guard {GUARD_MARKERS} — cross-tenant integrity risk"
+
+
+# Endpoints that emit the base64 session_data used to mint a Guacamole live-VM
+# session, or otherwise gate a remote-desktop tunnel into a running analysis VM.
+# Each must gate the task — a tunnel into another tenant's live malware VM is the
+# highest-severity leak class.
+GUAC_SESSION_VIEWS = (
+    ("submission.views", "status"),
+    ("submission.views", "remote_session"),
+)
+
+
+@pytest.mark.parametrize("modname,name", GUAC_SESSION_VIEWS)
+def test_guac_session_view_enforces_visibility(modname, name):
+    """SECURITY GATE (live-VM tunnel): a view that emits a guac session token
+    must gate the task, or a cross-tenant user can open a keyboard/mouse/frame-
+    buffer tunnel into another tenant's running VM."""
+    import importlib
+
+    mod = importlib.import_module(modname)
+    src = _func_source(mod, name)
+    assert src is not None, f"{name} not found in {modname}"
+    assert any(m in src for m in GUARD_MARKERS), \
+        f"{modname}.{name} emits a guac session token but references no guard {GUARD_MARKERS} — cross-tenant live-VM tunnel risk"
+
+
+def test_guac_websocket_consumer_rechecks_visibility():
+    """SECURITY GATE (websocket): the guac tunnel consumer is not URL-routed, so
+    the routed gates can't see it. It must re-check task visibility (defense in
+    depth behind the mint-time gate)."""
+    import guac.consumers
+
+    src = open(guac.consumers.__file__).read()
+    assert "can_view_task" in src, \
+        "guac websocket consumer must re-check task visibility (can_view_task) — defense-in-depth for the live-VM tunnel"
 
 
 class FakeTask:
@@ -292,3 +381,25 @@ def test_hash_routed_discovery_catches_unguarded(tmp_path, monkeypatch):
     assert "cuckoo_status" in discovered, (
         "_hash_routed_views failed to detect a sha256-routed unguarded view"
     )
+
+
+@pytest.mark.django_db
+def test_tasks_delete_many_skips_unmanageable_cross_tenant(cape_db, mt_enabled, monkeypatch):
+    """A tenant-less user POSTing another tenant's private task id to the bulk-
+    delete endpoint must NOT delete it (the worst confirmed critical)."""
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    import apiv2.views as views
+
+    deleted = []
+    monkeypatch.setattr(views.db, "view_task",
+                        lambda tid: FakeTask(user_id=999, tenant_id=10, visibility="private"))
+    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
+    monkeypatch.setattr(views, "mongo_delete_data", lambda *a, **k: None, raising=False)
+
+    u = User.objects.create_user("dm", "dm@x.com", "x")  # tenant-less -> can't manage
+    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "1"})
+    force_authenticate(req, user=u)
+    resp = views.tasks_delete_many(req)
+
+    assert deleted == []                       # cross-tenant task NOT deleted
+    assert resp.data.get(1) == "not exists"    # indistinguishable from missing
