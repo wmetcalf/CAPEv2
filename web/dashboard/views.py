@@ -64,6 +64,26 @@ _SCOPE_LABEL = {
 }
 
 
+def entitled_scope_filter(user):
+    """Combined mongo ``$match`` (over the report's ``info.*``) restricting results
+    to the analyses ``user`` may read across all their entitled scopes. Returns
+    ``None`` when no filter applies (global / break-glass / multitenancy disabled)
+    so callers can leave their query unchanged, preserving the public install."""
+    scopes = entitled_scopes(user)
+    if "global" in scopes:
+        return None
+    from lib.cuckoo.common.tenancy import scope_match
+
+    v = _ut.viewer_for(user)
+    clauses = []
+    for s in scopes:
+        sm = scope_match(s, v)
+        if sm is not None:
+            clauses.append(sm)
+    # No entitled scope resolved (e.g. tenant-less, unauth) -> match nothing.
+    return {"$or": clauses} if clauses else {"info.id": -1}
+
+
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request):

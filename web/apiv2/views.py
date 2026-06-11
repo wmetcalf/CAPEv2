@@ -2912,6 +2912,10 @@ def tasks_delete_many(request):
         task_id = int(task_id)
         task = db.view_task(task_id)
         if task:
+            if not can_manage_task(request.user, task):
+                # hidden == missing: no cross-tenant enumeration, no unauthorized delete
+                response.setdefault(task_id, "not exists")
+                continue
             if task.status == TASK_RUNNING:
                 response.setdefault(task_id, "running")
                 continue
