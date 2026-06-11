@@ -15,7 +15,7 @@ from contextlib import suppress
 
 from django.conf import settings
 
-from users.tenancy import submission_scope
+from users.tenancy import submission_scope, can_view_task
 from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render
@@ -783,7 +783,8 @@ def index(request, task_id=None, resubmit_hash=None):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def status(request, task_id):
     task = db.view_task(task_id)
-    if not task:
+    # tenant isolation: hidden == missing (also gates the emitted guac session_data)
+    if not task or not can_view_task(request.user, task):
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
     completed = False
@@ -816,7 +817,8 @@ def status(request, task_id):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def remote_session(request, task_id):
     task = db.view_task(task_id)
-    if not task:
+    # tenant isolation: hidden == missing (also gates the emitted guac session_data)
+    if not task or not can_view_task(request.user, task):
         return render(request, "error.html", {"error": "The specified task doesn't seem to exist."})
 
     machine_status = False

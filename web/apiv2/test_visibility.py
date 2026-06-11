@@ -67,6 +67,7 @@ def _func_source(views_module, name):
 def _all_task_views():
     import apiv2.views, apiv2.urls, analysis.views, analysis.urls
     import compare.views, compare.urls
+    import guac.views, guac.urls
     from web import urls as web_urls
 
     # (urls module, views module the matched names resolve to, alias used there).
@@ -76,6 +77,7 @@ def _all_task_views():
         (apiv2.urls, apiv2.views, "views"),
         (analysis.urls, analysis.views, "views"),
         (compare.urls, compare.views, "views"),
+        (guac.urls, guac.views, "views"),
         (web_urls, analysis.views, "analysis_views"),
     )
     cases = []
@@ -146,6 +148,41 @@ def test_body_keyed_mutation_enforces_manage(modname, name):
     assert src is not None, f"{name} not found in {modname}"
     assert any(m in src for m in GUARD_MARKERS), \
         f"{modname}.{name} mutates tasks by body ids but references no guard {GUARD_MARKERS} — cross-tenant integrity risk"
+
+
+# Endpoints that emit the base64 session_data used to mint a Guacamole live-VM
+# session, or otherwise gate a remote-desktop tunnel into a running analysis VM.
+# Each must gate the task — a tunnel into another tenant's live malware VM is the
+# highest-severity leak class.
+GUAC_SESSION_VIEWS = (
+    ("submission.views", "status"),
+    ("submission.views", "remote_session"),
+)
+
+
+@pytest.mark.parametrize("modname,name", GUAC_SESSION_VIEWS)
+def test_guac_session_view_enforces_visibility(modname, name):
+    """SECURITY GATE (live-VM tunnel): a view that emits a guac session token
+    must gate the task, or a cross-tenant user can open a keyboard/mouse/frame-
+    buffer tunnel into another tenant's running VM."""
+    import importlib
+
+    mod = importlib.import_module(modname)
+    src = _func_source(mod, name)
+    assert src is not None, f"{name} not found in {modname}"
+    assert any(m in src for m in GUARD_MARKERS), \
+        f"{modname}.{name} emits a guac session token but references no guard {GUARD_MARKERS} — cross-tenant live-VM tunnel risk"
+
+
+def test_guac_websocket_consumer_rechecks_visibility():
+    """SECURITY GATE (websocket): the guac tunnel consumer is not URL-routed, so
+    the routed gates can't see it. It must re-check task visibility (defense in
+    depth behind the mint-time gate)."""
+    import guac.consumers
+
+    src = open(guac.consumers.__file__).read()
+    assert "can_view_task" in src, \
+        "guac websocket consumer must re-check task visibility (can_view_task) — defense-in-depth for the live-VM tunnel"
 
 
 class FakeTask:
