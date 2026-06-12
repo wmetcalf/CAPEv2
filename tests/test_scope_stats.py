@@ -54,3 +54,58 @@ def test_top_detections_scoped_bypasses_cache(monkeypatch):
     assert hasattr(wu.top_detections, "cache"), "cache attr should still exist"
     _, cached_val = wu.top_detections.cache
     assert cached_val == stale_data, "scoped call must not have overwritten the shared cache"
+
+
+def test_static_config_lookup_scopes_mongo_query(monkeypatch):
+    """Deep-hunt: the static-config dedup lookup must AND-in the submitter's scope
+    so it can't return another tenant's task id / config-exists inference. Locked
+    viewer -> query AND-ed with the scope $or; break-glass / disabled -> unscoped."""
+    import lib.cuckoo.common.cape_utils as cu
+    from lib.cuckoo.common.tenancy import Viewer, MTConfig
+    import lib.cuckoo.common.tenancy as t
+
+    captured = {}
+    monkeypatch.setattr(cu, "mongo_find_one", lambda coll, q, proj, **k: captured.update(q=q) or None, raising=False)
+    monkeypatch.setattr(cu.repconf.mongodb, "enabled", True)
+
+    # locked, non-admin -> scoped
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(True, "locked", "", True))
+    cu.static_config_lookup("/x", sha256="a" * 64, viewer=Viewer(user_id=2, tenant_id=10))
+    assert "$and" in captured["q"], "locked-mode dedup must AND-in the tenant scope"
+    assert {"target.file.sha256": "a" * 64} in captured["q"]["$and"]
+
+    # break-glass -> unscoped (plain query)
+    cu.static_config_lookup("/x", sha256="a" * 64, viewer=Viewer(user_id=9, tenant_id=None, is_local_admin=True))
+    assert captured["q"] == {"target.file.sha256": "a" * 64}
+
+    # MT disabled -> unscoped
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    cu.static_config_lookup("/x", sha256="a" * 64, viewer=Viewer(user_id=2, tenant_id=10))
+    assert captured["q"] == {"target.file.sha256": "a" * 64}
+
+
+def test_top_detections_es_branch_scoped(monkeypatch):
+    """Deep-hunt: the ES top_detections branch must apply the viewer scope filter
+    (parity with the mongo branch), or a locked tenant's stat panels show the
+    global per-family malware landscape on an ES-backed install."""
+    import lib.cuckoo.common.web_utils as wu
+    from lib.cuckoo.common.tenancy import Viewer, MTConfig
+    import lib.cuckoo.common.tenancy as t
+
+    captured = {}
+    monkeypatch.setattr(wu.repconf.mongodb, "enabled", False)
+    monkeypatch.setattr(wu.repconf.elasticsearchdb, "enabled", True)
+    monkeypatch.setattr(wu.web_cfg.general, "top_detections", True)
+    monkeypatch.setattr(wu, "es", type("E", (), {"search": staticmethod(lambda **k: captured.update(body=k["body"]) or {"aggregations": {"family": {"buckets": []}}})}), raising=False)
+    # get_analysis_index is imported only when ES is enabled at module load; the
+    # test env loads with ES disabled, so provide it (production ES installs have it).
+    monkeypatch.setattr(wu, "get_analysis_index", lambda: "idx", raising=False)
+    if hasattr(wu.top_detections, "cache"):
+        del wu.top_detections.cache
+
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(True, "locked", "", True))
+    wu.top_detections(date_since=False, viewer=Viewer(user_id=2, tenant_id=10))
+    flt = captured["body"]["query"]["bool"].get("filter")
+    assert flt, "ES top_detections must carry a tenant scope filter in locked mode"
+    shoulds = flt[0]["bool"]["should"]
+    assert {"term": {"info.visibility": "public"}} in shoulds and {"term": {"info.user_id": 2}} in shoulds

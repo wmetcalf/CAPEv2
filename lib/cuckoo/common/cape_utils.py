@@ -320,7 +320,40 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
     return cape_config
 
 
-def static_config_lookup(file_path: str, sha256: str = False) -> dict:
+def _config_lookup_scope(viewer):
+    """Mongo $match restricting the static-config dedup lookup to the submitter's
+    entitled analyses, or None (no filter) for break-glass / MT-disabled / shared.
+    Dependency-free (pure tenancy predicate). Mirrors web_utils._viewer_scope_match
+    — duplicated here to avoid a cape_utils -> web_utils import cycle."""
+    if viewer is None:
+        return None
+    from lib.cuckoo.common.tenancy import MINE, PUBLIC, TENANT, multitenancy_config, scope_match
+
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    clauses = [m for m in (scope_match(PUBLIC, viewer), scope_match(TENANT, viewer), scope_match(MINE, viewer)) if m is not None]
+    return {"$or": clauses} if clauses else {"info.id": -1}
+
+
+def _config_lookup_es_filter(viewer):
+    """ES analogue of _config_lookup_scope (bool/should over info.* scopes), or None."""
+    if viewer is None:
+        return None
+    from lib.cuckoo.common.tenancy import multitenancy_config
+
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    shoulds = [{"term": {"info.visibility": "public"}}]
+    if getattr(viewer, "tenant_id", None) is not None:
+        shoulds.append({"bool": {"filter": [{"term": {"info.tenant_id": viewer.tenant_id}}, {"term": {"info.visibility": "tenant"}}]}})
+    if getattr(viewer, "user_id", None) is not None:
+        shoulds.append({"term": {"info.user_id": viewer.user_id}})
+    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+
+
+def static_config_lookup(file_path: str, sha256: str = False, viewer=None) -> dict:
     """
     Look up static configuration information for a given file based on its SHA-256 hash.
 
@@ -330,6 +363,10 @@ def static_config_lookup(file_path: str, sha256: str = False) -> dict:
     Args:
         file_path (str): The path to the file for which to look up configuration information.
         sha256 (str, optional): The SHA-256 hash of the file. If not provided, it will be calculated.
+        viewer: optional tenancy Viewer — when set, the dedup lookup is restricted
+            to the submitter's entitled analyses so it can't return ANOTHER
+            tenant's task id / "config exists" inference for a known hash. No-op
+            for break-glass / MT-disabled.
 
     Returns:
         dict or None: A dictionary containing the configuration information if found, otherwise None.
@@ -338,17 +375,22 @@ def static_config_lookup(file_path: str, sha256: str = False) -> dict:
         with open(file_path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
 
+    _scope = _config_lookup_scope(viewer)
     if repconf.mongodb.enabled:
+        _q = {"target.file.sha256": sha256}
+        if _scope:
+            _q = {"$and": [_q, _scope]}
         document_dict = mongo_find_one(
-            "analysis", {"target.file.sha256": sha256}, {"CAPE.configs": 1, "info.id": 1, "_id": 0}, sort=[("_id", -1)]
+            "analysis", _q, {"CAPE.configs": 1, "info.id": 1, "_id": 0}, sort=[("_id", -1)]
         )
     elif repconf.elasticsearchdb.enabled:
-        document_dict = es.search(
-            index=get_analysis_index(),
-            body={"query": {"match": {"target.file.sha256": sha256}}},
-            _source=["CAPE.configs", "info.id"],
-            sort={"_id": {"order": "desc"}},
-        )["hits"]["hits"][0]["_source"]
+        _esmust = [{"match": {"target.file.sha256": sha256}}]
+        _esbody = {"query": {"bool": {"must": _esmust}}, "_source": ["CAPE.configs", "info.id"], "sort": {"_id": {"order": "desc"}}}
+        _esf = _config_lookup_es_filter(viewer)
+        if _esf:
+            _esbody["query"]["bool"]["filter"] = [_esf]
+        _hits = es.search(index=get_analysis_index(), body=_esbody)["hits"]["hits"]
+        document_dict = _hits[0]["_source"] if _hits else None
     else:
         document_dict = None
 

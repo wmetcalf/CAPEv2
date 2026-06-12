@@ -314,7 +314,7 @@ def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: 
     return data
 
 
-def top_detections(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> dict:
+def top_detections(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None, viewer=None) -> dict:
     """
     Retrieves the top detections from the database, either from MongoDB or Elasticsearch,
     and caches the results for 10 minutes.
@@ -363,7 +363,6 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     if repconf.mongodb.enabled:
         data = mongo_aggregate("analysis", aggregation_command)
     elif repconf.elasticsearchdb.enabled:
-        # TODO(tenancy): ES stat scoping is a documented follow-up (spec out-of-scope); mongo path is scoped
         # ToDo update to new format
         q = {
             "query": {"bool": {"must": [{"exists": {"field": "detections.family"}}]}},
@@ -373,6 +372,14 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
 
         if date_since:
             q["query"]["bool"]["must"].append({"range": {"info.started": {"gte": date_since.isoformat()}}})
+
+        # Tenant scope (parity with the mongo branch's scope_match): without this
+        # a locked-mode tenant's My-Tenant/Mine stat panels return the GLOBAL
+        # per-family malware landscape on an ES-backed install. No-op for
+        # break-glass / MT-disabled.
+        _esf = _viewer_scope_es_filter(viewer)
+        if _esf:
+            q["query"]["bool"].setdefault("filter", []).append(_esf)
 
         res = es.search(index=get_analysis_index(), body=q)
         data = [{"total": r["doc_count"], "family": r["key"]} for r in res["aggregations"]["family"]["buckets"]]
@@ -609,7 +616,7 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
         sorted(details["top_samples"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    details["detections"] = top_detections(date_since=date_since, scope_match=sm)
+    details["detections"] = top_detections(date_since=date_since, scope_match=sm, viewer=viewer)
     details["asns"] = top_asn(date_since=date_since, scope_match=sm)
 
     return details
