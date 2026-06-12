@@ -181,3 +181,41 @@ def test_set_task_visibility_syncs_mongo(db, monkeypatch):
     tid = db.add_url("http://example.com", tenant_id=10, visibility="tenant")
     db.set_task_visibility(tid, "public")
     assert calls and calls[-1][0][0] == "analysis"  # updated the analysis collection
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_reschedule_propagates_tenant_visibility(db):
+    """reschedule()/recovery must carry the source task's owner/tenant/visibility
+    to the new task — otherwise rescheduled or startup-recovered tasks fall back
+    to add() defaults (user_id=0, tenant_id=None, visibility='private') and the
+    original tenant's job silently leaves its scope (invisible to everyone but
+    break-glass in locked mode)."""
+    from lib.cuckoo.core.data.task import Task
+
+    tid = db.add_url("http://example.com", user_id=5, tenant_id=10, visibility="tenant")
+    new_tid = db.reschedule(tid)
+    assert new_tid and new_tid != tid
+    new = db.session.get(Task, new_tid)
+    assert new.user_id == 5
+    assert new.tenant_id == 10
+    assert new.visibility == "tenant"
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_count_samples_global_matches_unscoped(db):
+    """B-extra-2 back-compat: count_samples(scope='global', viewer=...) must equal
+    the unscoped count(Sample.id) — the global/empty-scope branch must NOT switch
+    to distinct(Task.sample_id) (which drops orphan/parent-only samples and drifts
+    the dashboard figure from upstream)."""
+    from lib.cuckoo.common.tenancy import Viewer
+
+    def mk(owner, tenant, vis):
+        t = _mk_task()
+        t.user_id, t.tenant_id, t.visibility = owner, tenant, vis
+        db.session.add(t)
+        db.session.commit()
+
+    mk(1, 10, "public")
+    mk(2, 10, "private")
+    v = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
+    assert db.count_samples(scope="global", viewer=v) == db.count_samples()

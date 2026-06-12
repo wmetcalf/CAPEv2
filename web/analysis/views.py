@@ -2711,12 +2711,14 @@ def split_signature_calls(report):
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def report(request, task_id):
     # Tenant/visibility enforcement — parallel to the apiv2 read guard. Deny
-    # before any (expensive) report loading.
+    # before any (expensive) report loading. A hidden task and a missing/deleted
+    # task are INDISTINGUISHABLE (no cross-tenant enumeration) and both render
+    # the generic "no analysis found" page at HTTP 200 — matching upstream's
+    # missing-task behavior, so this is a true no-op on a disabled/legacy install
+    # (can_view_task is always True when multitenancy is disabled).
     _task = db.view_task(task_id)
-    if _task is None:
-        return HttpResponseForbidden("Task not found")
-    if not can_view_task(request.user, _task):
-        return HttpResponseForbidden("Access denied")
+    if _task is None or not can_view_task(request.user, _task):
+        return render(request, "error.html", {"error": "No analysis found with specified ID"})
     can_toggle_visibility = can_toggle_task(request.user, _task)
     network_report = {}
     report = {}

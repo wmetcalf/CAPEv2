@@ -2894,10 +2894,15 @@ def statistics_data(requests, days):
         from dashboard.views import entitled_scopes
 
         v = viewer_for(requests.user)
-        data = {
-            scope: statistics(int(days), scope=scope, viewer=v)
-            for scope in entitled_scopes(requests.user)
-        }
+        scopes = entitled_scopes(requests.user)
+        # Back-compat: when only the global panel applies (MT disabled / shared /
+        # break-glass) return the legacy FLAT stats dict so existing API clients
+        # reading resp["data"]["signatures"] keep working. The per-scope dict is
+        # only used in locked mode where there are multiple entitled scopes.
+        if scopes == ["global"]:
+            data = statistics(int(days))
+        else:
+            data = {scope: statistics(int(days), scope=scope, viewer=v) for scope in scopes}
         resp = {"Error": False, "data": data}
     else:
         resp = {"Error": True, "error_value": "Provide days as number"}

@@ -388,16 +388,20 @@ class SamplesMixIn:
         When scope/viewer are provided, counts distinct sample_ids referenced
         by tasks visible in that scope — mirroring _scope_where's branch logic.
         """
-        if scope is None and viewer is None:
-            stmt = select(func.count(Sample.id))
-            return self.session.scalar(stmt)
+        conds = [] if (scope is None and viewer is None) else self._scope_where(scope, viewer)
+        if not conds:
+            # No scope predicate (global / disabled / break-glass): count ALL
+            # samples exactly like upstream — count(Sample.id) includes parent-
+            # only/orphaned samples that the distinct-Task.sample_id branch drops,
+            # so the dashboard figure matches the pre-tenancy build.
+            return self.session.scalar(select(func.count(Sample.id)))
 
         # Scope-aware: count distinct Task.sample_id values for tasks in scope.
         stmt = (
             select(func.count(distinct(Task.sample_id)))
             .where(Task.sample_id.isnot(None))
         )
-        for cond in self._scope_where(scope, viewer):
+        for cond in conds:
             stmt = stmt.where(cond)
         return self.session.scalar(stmt)
 

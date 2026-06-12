@@ -9,35 +9,41 @@ class ForeignTask:
     visibility = "private"
 
 
+def _report_url():
+    try:
+        from django.urls import reverse
+        return reverse("report", kwargs={"task_id": 1})
+    except Exception:
+        return "/analysis/1/"
+
+
 @pytest.mark.django_db
 def test_report_denies_cross_tenant_private(cape_db, mt_enabled, monkeypatch, client):
+    """A cross-tenant private task is not shown. The denial is the generic
+    "no analysis found" page (HTTP 200), INDISTINGUISHABLE from a missing task,
+    so another tenant's task IDs can't be enumerated by status code."""
     import analysis.views as av
 
     monkeypatch.setattr(av.db, "view_task", lambda *a, **k: ForeignTask())
     other = User.objects.create_user("b", "b@x.com", "x")
     client.force_login(other)
 
-    try:
-        from django.urls import reverse
-        url = reverse("report", kwargs={"task_id": 1})
-    except Exception:
-        url = "/analysis/1/"
-    r = client.get(url)
-    assert r.status_code == 403
+    r = client.get(_report_url())
+    assert r.status_code == 200
+    assert b"No analysis found" in r.content
 
 
 @pytest.mark.django_db
-def test_report_missing_task_forbidden(cape_db, monkeypatch, client):
+def test_report_missing_task_renders_error_200(cape_db, monkeypatch, client):
+    """A missing/deleted task renders the same generic error page at HTTP 200 as
+    a hidden task (upstream parity + indistinguishability) — not a 403."""
     import analysis.views as av
     monkeypatch.setattr(av.db, "view_task", lambda *a, **k: None)
     u = User.objects.create_user("c", "c@x.com", "x")
     client.force_login(u)
-    try:
-        from django.urls import reverse
-        url = reverse("report", kwargs={"task_id": 1})
-    except Exception:
-        url = "/analysis/1/"
-    assert client.get(url).status_code == 403
+    r = client.get(_report_url())
+    assert r.status_code == 200
+    assert b"No analysis found" in r.content
 
 
 @pytest.mark.django_db

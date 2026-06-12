@@ -562,11 +562,16 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
         sorted(details["tasks"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    if HAVE_DIST and dist_conf.distributed.enabled:
+    # The distributed-tasks panel runs against a separate dist DB whose Task
+    # schema has no tenant_id/visibility column, so it cannot be scope-filtered.
+    # Until that schema gains tenancy columns, only populate it for the GLOBAL
+    # scope (MT disabled / shared / break-glass) — never for a locked-mode
+    # tenant/mine panel, where per-node-per-day counts would leak other tenants'
+    # submission volumes.
+    if HAVE_DIST and dist_conf.distributed.enabled and (scope is None or scope == "global"):
         details["distributed_tasks"] = {}
         dist_db = dist_session()
         dist_tasks = dist_db.query(DTask).filter(DTask.clock.between(date_since, date_till)).all()
-        # distributed_tasks: separate distributed DB, no tenant column — not scoped (follow-up)
         id2name = {}
         # load node names
         for node in dist_db.query(Node).all() or []:

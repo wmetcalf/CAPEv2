@@ -143,16 +143,22 @@ class MongoDB(Report):
                 CuckooReportError("Mongo schema version not expected, check data migration tool")
         else:
             mongo_insert_one("cuckoo_schema", {"version": self.SCHEMA_VERSION})
-            # Best-effort compound index for tenant-scoped aggregations.
-            try:
-                mongo_create_index(
-                    "analysis",
-                    [("info.tenant_id", 1), ("info.visibility", 1), ("info.user_id", 1)],
-                    background=True,
-                    name="tenant_scope_idx",
-                )
-            except Exception as idx_err:
-                log.warning("Could not create tenant_scope_idx on analysis collection: %s", idx_err)
+            # Best-effort compound index for tenant-scoped aggregations — only
+            # when multitenancy is enabled (a disabled install stays exactly
+            # upstream; the index backs the scope_match queries that only run
+            # in locked mode).
+            from lib.cuckoo.common.tenancy import multitenancy_config
+
+            if multitenancy_config().enabled:
+                try:
+                    mongo_create_index(
+                        "analysis",
+                        [("info.tenant_id", 1), ("info.visibility", 1), ("info.user_id", 1)],
+                        background=True,
+                        name="tenant_scope_idx",
+                    )
+                except Exception as idx_err:
+                    log.warning("Could not create tenant_scope_idx on analysis collection: %s", idx_err)
 
         # Create a copy of the dictionary. This is done in order to not modify
         # the original dictionary and possibly compromise the following
@@ -181,12 +187,18 @@ class MongoDB(Report):
 
         # Stamp tenant context so mongo aggregations can be scoped. Use an
         # INDEPENDENT session (not the processor's shared scoped session) so we
-        # don't leave a transaction open and break processing.
-        try:
-            stamp_tenant_info(report["info"], _task_tenant_ctx(int(report["info"]["id"])))
-        except Exception as _db_err:
-            log.warning("Failed to look up task for tenant stamping (task %s): %s", report["info"].get("id"), _db_err)
-            stamp_tenant_info(report["info"], None)
+        # don't leave a transaction open and break processing. Gated on
+        # multitenancy being enabled so a disabled/public install writes EXACTLY
+        # the upstream report shape (no info.tenant_id/user_id/visibility keys);
+        # the migration backfill stamps existing docs when MT is first enabled.
+        from lib.cuckoo.common.tenancy import multitenancy_config
+
+        if multitenancy_config().enabled:
+            try:
+                stamp_tenant_info(report["info"], _task_tenant_ctx(int(report["info"]["id"])))
+            except Exception as _db_err:
+                log.warning("Failed to look up task for tenant stamping (task %s): %s", report["info"].get("id"), _db_err)
+                stamp_tenant_info(report["info"], None)
 
         # Delete old data just before inserting new one to avoid "missing report" window
         # or data loss if insertion fails during preparation (e.g. OOM)
