@@ -12,18 +12,25 @@ def viewer_for(user) -> Viewer:
     crosses tenants; when off, only IdP-provisioned superusers (those with a
     linked allauth SocialAccount) do — a local createsuperuser does not.
     """
-    if not getattr(user, "is_authenticated", False):
-        return Viewer(user_id=None, tenant_id=None)
-
-    prof = getattr(user, "userprofile", None)
     cfg = multitenancy_config()
     is_super = bool(getattr(user, "is_superuser", False))
     if not cfg.enabled:
-        # Multitenancy off => legacy single-tenant behavior: an authenticated
-        # user sees and manages everything (is_local_admin short-circuits the
-        # predicate and the list filter). Existing/legacy tasks are NOT hidden.
-        return Viewer(user_id=user.id, tenant_id=None, is_superuser=is_super,
+        # Multitenancy off => legacy single-tenant behavior for EVERY principal,
+        # INCLUDING anonymous (a no-auth public install, or apiv2 with token-auth
+        # disabled => DRF AllowAny): see and manage everything, exactly like
+        # upstream. is_local_admin short-circuits the predicate and the list
+        # filter; existing/legacy tasks are NOT hidden. This MUST run BEFORE the
+        # is_authenticated check, or anonymous requests on a disabled install get
+        # is_local_admin=False and every can_read/visible_to guard denies the
+        # private-default tasks upstream served (back-compat regression).
+        return Viewer(user_id=getattr(user, "id", None), tenant_id=None, is_superuser=is_super,
                       is_tenant_admin=False, is_local_admin=True)
+
+    if not getattr(user, "is_authenticated", False):
+        # MT enabled: an anonymous request stays public-only (no break-glass).
+        return Viewer(user_id=None, tenant_id=None)
+
+    prof = getattr(user, "userprofile", None)
     if not is_super:
         is_local = False
     elif cfg.local_admins_manage_all_tenants:
