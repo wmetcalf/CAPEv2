@@ -2703,22 +2703,26 @@ def cuckoo_status(request):
 @api_view(["GET"])
 def task_x_hours(request):
     session = db.Session()
-    # tenant isolation: restrict to the caller's visible tasks (no-op when MT
-    # disabled/break-glass — list_tasks(visible_to=local_admin) returns all).
-    visible_ids = {t.id for t in db.list_tasks(visible_to=viewer_for(request.user))}
-    res = (
-        session.query(Task)
-        .filter(Task.added_on.between(datetime.datetime.now(), datetime.datetime.now() - datetime.timedelta(days=1)))
-        .filter(Task.id.in_(visible_ids))
-        .all()
-    )
-    results = {}
-    if res:
-        for date, samples in res:
-            results.setdefault(date.strftime("%Y-%m-%eT%H:%M:00"), samples)
-    session.close()
-    resp = {"error": False, "stats": results}
-    return Response(resp)
+    try:
+        # Query the bounded last-24h window FIRST (a small set), then filter by
+        # visibility in Python — avoids loading the whole visible set into memory
+        # (OOM). Tenant isolation via can_view_task is a no-op when multitenancy
+        # is disabled / break-glass. (Also fixes the pre-existing reversed
+        # between() args, which made this always return empty.)
+        tasks = (
+            session.query(Task)
+            .filter(Task.added_on.between(datetime.datetime.now() - datetime.timedelta(days=1), datetime.datetime.now()))
+            .all()
+        )
+        results = {}
+        for t in tasks:
+            if not can_view_task(request.user, t):
+                continue
+            bucket = t.added_on.strftime("%Y-%m-%eT%H:%M:00")
+            results[bucket] = results.get(bucket, 0) + 1
+    finally:
+        session.close()
+    return Response({"error": False, "stats": results})
 
 
 @csrf_exempt
