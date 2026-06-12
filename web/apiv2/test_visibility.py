@@ -477,3 +477,65 @@ def test_viewer_scope_es_filter_locked_vs_disabled(monkeypatch):
     monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
     assert web_utils._viewer_scope_es_filter(v) is None
     assert web_utils._viewer_scope_es_filter(None) is None
+
+
+# Multi-doc mongo pivots (mongo_aggregate / mongo_find) can span tenants — unlike
+# task_id-keyed mongo_find_one / es.search reads gated by the view decorator. Each
+# web view issuing one MUST be reviewed to be tenant-scoped; a NEW caller trips
+# the gate below so a *secondary* unscoped cross-task query (the leak class behind
+# report()/existent_tasks and the compare/hunt pivots) can't land silently. The
+# marker gates can't catch this — they pass as long as ANY guard string appears in
+# the function, even when a second query in the same function is unscoped.
+# perform_search pivots are covered by test_every_perform_search_caller_passes_viewer.
+CROSS_TASK_MONGO_PIVOTS = {"mongo_aggregate", "mongo_find"}
+REVIEWED_MONGO_PIVOTS = {
+    "analysis.views:index": "mongo_find by info.id $in IDs from list_tasks(visible_to=) — scoped upstream",
+    "analysis.views:search_behavior": "mongo_find('calls', _id $in) — ObjectIds from the gated task's own behavior doc",
+    "analysis.views:report": "mongo_aggregate $match info.id == the can_view_task-gated task_id",
+    "analysis.views:hunt": "mongo_aggregate $facet pinned by entitled_scope_filter()",
+    "apiv2.views:tasks_rollingsuri": "mongo_find then per-row can_view_task (+ is_local_admin fast-path)",
+    "compare.views:left": "mongo_find md5-pivot AND-ed with entitled_scope_filter()",
+    "compare.views:hash": "mongo_find md5-pivot AND-ed with entitled_scope_filter()",
+}
+
+
+def _functions_calling(modname, names):
+    import ast
+    import importlib
+
+    mod = importlib.import_module(modname)
+    tree = ast.parse(open(mod.__file__).read())
+    out = set()
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                nm = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if nm in names:
+                    out.add(f"{modname}:{fn.name}")
+    return out
+
+
+def test_cross_task_mongo_pivots_are_reviewed():
+    """SECURITY GATE: every web view issuing a multi-doc mongo pivot
+    (mongo_aggregate/mongo_find) must be in REVIEWED_MONGO_PIVOTS — i.e. proven
+    tenant-scoped. A new (or newly-added) pivot trips this gate so a secondary
+    unscoped cross-task query can't ship without review. Closes the marker-gate
+    blind spot that let report()'s existent_tasks pivot leak while its primary
+    read was gated."""
+    found = set()
+    for modname in ("analysis.views", "apiv2.views", "compare.views", "dashboard.views", "submission.views", "guac.views"):
+        try:
+            found |= _functions_calling(modname, CROSS_TASK_MONGO_PIVOTS)
+        except ModuleNotFoundError:
+            continue
+
+    unreviewed = sorted(found - set(REVIEWED_MONGO_PIVOTS))
+    assert not unreviewed, (
+        f"Unreviewed cross-task mongo pivot(s): {unreviewed}. A multi-doc "
+        f"mongo_aggregate/mongo_find can span tenants — verify it is tenant-scoped "
+        f"(scope_match / entitled_scope_filter / per-row can_view_task / task_id-keyed "
+        f"after a gate) and add it to REVIEWED_MONGO_PIVOTS with the reason."
+    )
+    # Keep the allowlist tight: drop entries whose function no longer exists.
+    stale = sorted(set(REVIEWED_MONGO_PIVOTS) - found)
+    assert not stale, f"Stale REVIEWED_MONGO_PIVOTS entries (function gone): {stale}"
