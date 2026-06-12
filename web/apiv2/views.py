@@ -30,7 +30,7 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from users.tenancy import submission_scope, can_view_task, can_toggle_task, can_manage_task, viewer_for
+from users.tenancy import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
 from lib.cuckoo.common.tenancy import VISIBILITIES
 
 
@@ -71,19 +71,11 @@ def _deny_by_hash(request, *, sha256=None, sha1=None, md5=None, sample_id=None):
     When multitenancy is DISABLED (or for a break-glass admin), viewer_for returns
     is_local_admin=True and this function is a no-op — it must NOT gate the public
     install, and must NOT 404 dropped/procdump payloads that have no Sample row."""
-    viewer = viewer_for(request.user)
-    if viewer.is_local_admin:
-        # Multitenancy disabled (see-all) or break-glass superuser -> no gating.
-        return None
-    if sample_id is not None:
-        sample = db.view_sample(sample_id)
-    elif sha256 or sha1 or md5:
-        sample = db.find_sample(sha256=sha256, sha1=sha1, md5=md5)
-    else:
-        sample = None
-    if sample is None:
-        return Response({"error": True, "error_value": "Sample not found"}, status=404)
-    if db.list_tasks(sample_id=sample.id, visible_to=viewer, limit=1):
+    # Delegate the entitlement decision to the shared tenancy.can_view_sample so
+    # this gate, web file()'s sample/static branch, and the submission resubmit /
+    # download-services paths all enforce the SAME by-hash boundary and can't
+    # drift (no-op for break-glass / MT-disabled — handled inside the helper).
+    if can_view_sample(request.user, sha256=sha256, sha1=sha1, md5=md5, sample_id=sample_id):
         return None
     return Response({"error": True, "error_value": "Sample not found"}, status=404)
 
@@ -834,6 +826,12 @@ def tasks_search(request, md5=None, sha1=None, sha256=None):
                     if task.sample:
                         buf["sample"] = task.sample.to_dict()
                     resp["data"].append(buf)
+            # No visible task for this sample => respond byte-identically to
+            # "sample absent" so the error-field doesn't become a cross-tenant
+            # existence oracle (mirror _deny_by_hash). Break-glass / MT-disabled
+            # keeps the {"error": []} shape (back-compat, no-op).
+            if not resp["data"] and not viewer_for(request.user).is_local_admin:
+                resp = {"data": [], "error": False}
         else:
             resp = {"data": [], "error": False}
 
@@ -3022,6 +3020,9 @@ def tasks_download_services(request):
     if opt_apikey:
         details["apikey"] = opt_apikey
 
+    # viewer gates the local-cache reuse inside download_from_3rdparty (no
+    # cross-tenant sample-bytes via a "Local" cache hit). No-op when MT disabled.
+    details["viewer"] = viewer_for(request.user)
     details = download_from_3rdparty(hashes, opt_filename, details)
     if isinstance(details.get("task_ids"), list):
         tasks_count = len(details["task_ids"])

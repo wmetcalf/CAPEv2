@@ -680,7 +680,11 @@ def download_from_3rdparty(samples: str, opt_filename: str, details: dict) -> di
         # clean old content
         if "content" in details:
             del details["content"]
-        paths = db.sample_path_by_hash(h)
+        # Only reuse a locally-cached copy if the requester is entitled to the
+        # sample (visible-task boundary). Otherwise fall through to the external
+        # downloader exactly as if uncached — so a non-entitled tenant can neither
+        # obtain another tenant's bytes nor learn the hash was present locally.
+        paths = db.sample_path_by_hash(h, visible_to=details.get("viewer"))
         if paths:
             details["content"] = get_file_content(paths)
             details["service"] = "Local"
@@ -1837,10 +1841,12 @@ def process_new_task_files(request, samples: list, details: dict, opt_filename: 
                 )
                 continue
 
+            from users.tenancy import viewer_for as _viewer_for
+
             if (
                 not request.user.is_staff
                 and (web_cfg.uniq_submission.enabled or unique)
-                and db.check_file_uniq(sha256, hours=web_cfg.uniq_submission.hours)
+                and db.check_file_uniq(sha256, hours=web_cfg.uniq_submission.hours, visible_to=_viewer_for(request.user))
             ):
                 details["errors"].append(
                     {filename: "Duplicated file, disable unique option on submit or in conf/web.conf to force submission"}

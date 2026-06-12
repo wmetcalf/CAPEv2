@@ -542,3 +542,44 @@ def test_cross_task_mongo_pivots_are_reviewed():
     # Keep the allowlist tight: drop entries whose function no longer exists.
     stale = sorted(set(REVIEWED_MONGO_PIVOTS) - found)
     assert not stale, f"Stale REVIEWED_MONGO_PIVOTS entries (function gone): {stale}"
+
+
+# By-hash access to the global content-addressed sample store (storage/binaries
+# + db.sample_path_by_hash) is shared across tenants, so it MUST go through the
+# visible-task boundary (tenancy.can_view_sample / _deny_by_hash / sample_path_
+# by_hash(visible_to=)). A web view that resolves a sample by attacker-supplied
+# hash WITHOUT one of those markers streams another tenant's bytes (the deep-hunt
+# capeyarazipall + resubmit + download-services criticals). This gate trips on any
+# such function lacking a by-hash guard.
+BYHASH_RESOLVERS = ("sample_path_by_hash",)            # call markers
+BYHASH_GUARDS = ("can_view_sample", "_deny_by_hash", "visible_to")
+
+
+def test_byhash_sample_resolution_is_gated():
+    """SECURITY GATE: any web view that resolves a sample by hash (calls
+    sample_path_by_hash, or builds a storage/binaries/<hash> path) must reference
+    a by-hash entitlement guard (can_view_sample / _deny_by_hash / visible_to).
+    Locks the deep-hunt byte-exfil fixes so a new by-hash surface can't ship
+    ungated."""
+    import ast
+    import importlib
+
+    offenders = []
+    for modname in ("analysis.views", "apiv2.views", "submission.views", "compare.views"):
+        mod = importlib.import_module(modname)
+        with open(mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src)
+        lines = src.splitlines()
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            body = "\n".join(lines[fn.lineno - 1: fn.end_lineno])
+            resolves_byhash = any(r in body for r in BYHASH_RESOLVERS) or (
+                '"binaries"' in body or "'binaries'" in body
+            )
+            if resolves_byhash and not any(g in body for g in BYHASH_GUARDS):
+                offenders.append(f"{modname}:{fn.name}")
+    assert not offenders, (
+        f"By-hash sample resolution without an entitlement guard {BYHASH_GUARDS}: "
+        f"{offenders}. Gate via can_view_sample / _deny_by_hash / sample_path_by_hash(visible_to=) "
+        f"— an attacker-supplied hash must not stream another tenant's sample bytes."
+    )

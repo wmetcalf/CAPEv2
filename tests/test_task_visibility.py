@@ -249,3 +249,33 @@ def test_count_samples_nonadmin_global_is_restricted(db):
     assert db.count_samples(scope="mine", viewer=admin_v) >= 0  # smoke: scoped path runs
     # the non-admin global count must be strictly fewer than all distinct sample_ids
     assert db.count_samples(scope="global", viewer=tenant_v) < 4
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_check_file_uniq_scoped_even_with_hours_zero(db):
+    """#10 review (security-high): the duplicate check must be tenant-scoped for
+    ALL hours values — incl. hours=0 (all-time) — else it's a cross-tenant
+    existence oracle. A tenant-B-only private hash must read 'not duplicate' for a
+    tenant-A viewer; break-glass still sees it."""
+    from lib.cuckoo.core.data.task import Task
+    from lib.cuckoo.core.data.samples import Sample
+    from lib.cuckoo.common.tenancy import Viewer
+
+    h = "d" * 64
+    s = Sample(md5="d" * 32, crc32="0000", sha1="d" * 40, sha256=h, sha512="d" * 128, file_size=1, file_type="x")
+    db.session.add(s)
+    db.session.commit()
+    t = _mk_task()
+    t.user_id, t.tenant_id, t.visibility, t.sample_id = 999, 20, "private", s.id  # tenant-B private
+    db.session.add(t)
+    db.session.commit()
+
+    tenant_a = Viewer(user_id=2, tenant_id=10)               # non-admin, other tenant
+    admin = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
+
+    # hours=0 (all-time) MUST be scoped: A cannot observe B's private hash
+    assert db.check_file_uniq(h, hours=0, visible_to=tenant_a) is False
+    assert db.check_file_uniq(h, hours=24, visible_to=tenant_a) is False
+    # break-glass sees it (no-op); also the unscoped call (no viewer) preserves legacy behavior
+    assert db.check_file_uniq(h, hours=0, visible_to=admin) is True
+    assert db.check_file_uniq(h, hours=0) is True

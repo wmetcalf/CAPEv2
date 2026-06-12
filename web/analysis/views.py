@@ -192,7 +192,7 @@ if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
 
 db: TasksMixIn = Database()
 
-from users.tenancy import can_view_task, can_toggle_task, can_manage_task, viewer_for
+from users.tenancy import can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
 
 
 def require_task_manage(view):
@@ -570,33 +570,29 @@ def index(request, page=1):
     first_pcap = 0
     first_url = 0
     # On a fresh install, we need handle where there are 0 tasks.
-    buf = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc())
-    if len(buf) == 1:
-        first_file = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()[
-            "id"
-        ]
+    # One query per category (limit=1, visible_to-scoped): reuse buf[0] rather
+    # than re-querying for the id (halves the DB round-trips).
+    buf = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
+    if buf:
+        first_file = buf[0].to_dict()["id"]
         paging["show_file_prev"] = "show"
     else:
         paging["show_file_prev"] = "hide"
-    buf = db.list_tasks(limit=1, category="static", not_status=TASK_PENDING, order_by=Task.added_on.asc())
-    if len(buf) == 1:
-        first_static = db.list_tasks(limit=1, category="static", not_status=TASK_PENDING, order_by=Task.added_on.asc())[
-            0
-        ].to_dict()["id"]
+    buf = db.list_tasks(limit=1, category="static", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
+    if buf:
+        first_static = buf[0].to_dict()["id"]
         paging["show_static_prev"] = "show"
     else:
         paging["show_static_prev"] = "hide"
-    buf = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc())
-    if len(buf) == 1:
-        first_url = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()["id"]
+    buf = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
+    if buf:
+        first_url = buf[0].to_dict()["id"]
         paging["show_url_prev"] = "show"
     else:
         paging["show_url_prev"] = "hide"
-    buf = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc())
-    if len(buf) == 1:
-        first_pcap = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc())[0].to_dict()[
-            "id"
-        ]
+    buf = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
+    if buf:
+        first_pcap = buf[0].to_dict()["id"]
         paging["show_pcap_prev"] = "show"
     else:
         paging["show_pcap_prev"] = "hide"
@@ -3327,6 +3323,13 @@ def file(request, category, task_id, dlfile):
         return render(request, "error.html", {"error": "Missed pyzipper library: poetry install"})
 
     if category in ("sample", "static", "staticzip"):
+        # By-hash access to the global content-addressed binary store. @require_
+        # task_visibility only gates task_id, not the attacker-supplied hash, so
+        # enforce the SAME visible-task-referencing-the-sample boundary as apiv2
+        # _deny_by_hash (no-op for break-glass / MT-disabled). Hidden == missing
+        # (generic error, no existence oracle).
+        if not can_view_sample(request.user, sha256=file_name):
+            return render(request, "error.html", {"error": "File not found"})
         path = os.path.join(CUCKOO_ROOT, "storage", "binaries", file_name)
     elif category in ("dropped", "droppedzip"):
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "files", file_name)
@@ -3961,6 +3964,12 @@ def vtupload(request, category, task_id, filename, dlfile):
             folder_name = False
             path = False
             if category in ("sample", "static"):
+                # By-hash access to the global binary store — enforce the visible-
+                # task-referencing-the-sample boundary (else a tenant uploads
+                # another tenant's sample to VirusTotal by hash). No-op for
+                # break-glass / MT-disabled.
+                if not can_view_sample(request.user, sha256=dlfile):
+                    return render(request, "error.html", {"error": "File not found"})
                 path = os.path.join(CUCKOO_ROOT, "storage", "binaries", dlfile)
             elif category == "dropped":
                 folder_name = "files"
