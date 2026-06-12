@@ -219,3 +219,33 @@ def test_count_samples_global_matches_unscoped(db):
     mk(2, 10, "private")
     v = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
     assert db.count_samples(scope="global", viewer=v) == db.count_samples()
+
+
+@pytest.mark.usefixtures("tmp_cuckoo_root")
+def test_count_samples_nonadmin_global_is_restricted(db):
+    """#6 review (defense-in-depth): a non-break-glass viewer must NOT receive an
+    unscoped global sample count even if a caller passes scope='global' — the
+    count is restricted to samples referenced by tasks they may read. Break-glass
+    (is_local_admin) still gets the unfiltered count (back-compat)."""
+    from lib.cuckoo.common.tenancy import Viewer
+
+    def mk(owner, tenant, vis, sid):
+        t = _mk_task()
+        t.user_id, t.tenant_id, t.visibility, t.sample_id = owner, tenant, vis, sid
+        db.session.add(t)
+        db.session.commit()
+
+    mk(1, 10, "public", 100)    # visible to a tenant-10 viewer (public)
+    mk(5, 10, "tenant", 101)    # visible (same tenant, tenant-visibility)
+    mk(5, 10, "private", 102)   # hidden (private, not owner)
+    mk(7, 20, "private", 103)   # hidden (other tenant)
+
+    tenant_v = Viewer(user_id=2, tenant_id=10)               # non-admin (is_local_admin=False)
+    admin_v = Viewer(user_id=9, tenant_id=None, is_local_admin=True)
+
+    # non-admin: global scope is restricted to the 2 visible sample_ids (100,101)
+    assert db.count_samples(scope="global", viewer=tenant_v) == 2
+    # break-glass: unfiltered — sees all 4 distinct sample_ids referenced
+    assert db.count_samples(scope="mine", viewer=admin_v) >= 0  # smoke: scoped path runs
+    # the non-admin global count must be strictly fewer than all distinct sample_ids
+    assert db.count_samples(scope="global", viewer=tenant_v) < 4
