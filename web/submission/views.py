@@ -15,7 +15,7 @@ from contextlib import suppress
 
 from django.conf import settings
 
-from users.tenancy import submission_scope, can_view_task, viewer_for
+from users.tenancy import submission_scope, can_view_task, can_view_sample, viewer_for
 from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render
@@ -480,8 +480,23 @@ def index(request, task_id=None, resubmit_hash=None):
             for hash in samples:
                 paths = []
                 if len(hash) in (32, 40, 64):
+                    # by-hash resubmit hits the global content-addressed store —
+                    # enforce the visible-task-referencing-the-sample boundary
+                    # before touching it, else a tenant exfiltrates another
+                    # tenant's sample bytes AND gets a full fresh analysis they
+                    # own. Deny path is byte-identical to genuinely-missing.
+                    _kw = {"sha256": hash} if len(hash) == 64 else ({"sha1": hash} if len(hash) == 40 else {"md5": hash})
+                    if not can_view_sample(request.user, **_kw):
+                        details["errors"].append({hash: "File not found on hdd for resubmission"})
+                        continue
                     paths = db.sample_path_by_hash(hash)
                 else:
+                    # task_id-based resubmit: the submit view is not task-gated,
+                    # so authorize the source task before reading its binary.
+                    _src = db.view_task(task_id)
+                    if _src is None or not can_view_task(request.user, _src):
+                        details["errors"].append({hash: "Task not found for resubmission"})
+                        continue
                     task_binary = os.path.join(settings.CUCKOO_PATH, "storage", "analyses", str(task_id), "binary")
                     if path_exists(task_binary):
                         paths.append(task_binary)
@@ -660,6 +675,9 @@ def index(request, task_id=None, resubmit_hash=None):
                         details["errors"].extend(tasks_details["errors"])
 
         elif task_category == "downloading_service":
+            # viewer gates local-cache reuse inside download_from_3rdparty (no
+            # cross-tenant bytes via a "Local" hit). No-op when MT disabled.
+            details["viewer"] = viewer_for(request.user)
             details = download_from_3rdparty(samples, opt_filename, details)
 
         if details.get("task_ids"):

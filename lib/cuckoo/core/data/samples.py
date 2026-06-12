@@ -161,7 +161,7 @@ class SamplesMixIn:
         return sample
 
 
-    def check_file_uniq(self, sha256: str, hours: int = 0):
+    def check_file_uniq(self, sha256: str, hours: int = 0, visible_to=None):
         # TODO This function is poorly named. It returns True if a sample with the given
         # sha256 already exists in the database, rather than returning True if the given
         # sha256 is unique.
@@ -175,6 +175,19 @@ class SamplesMixIn:
                 .where(Sample.sha256 == sha256)
                 .where(Task.added_on >= date_since)
             )
+            # Tenant scope: a non-break-glass viewer's duplicate check must only
+            # consider THEIR visible tasks — otherwise the "Duplicated file"
+            # rejection is a cross-tenant existence+recency oracle for any hash.
+            # Mirrors list_tasks(visible_to=). No-op for break-glass / MT-disabled.
+            if visible_to is not None and not visible_to.is_local_admin:
+                from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+                conds = [Task.visibility == PUBLIC]
+                if visible_to.user_id is not None:
+                    conds.append(Task.user_id == visible_to.user_id)
+                if visible_to.tenant_id is not None:
+                    conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
+                stmt = stmt.where(or_(*conds))
             return self.session.scalar(select(stmt.exists()))
         else:
             if not self.find_sample(sha256=sha256):
@@ -269,10 +282,15 @@ class SamplesMixIn:
                 hasher.update(chunk)
         return hasher.hexdigest()
 
-    def sample_path_by_hash(self, sample_hash: str = False, task_id: int = False):
+    def sample_path_by_hash(self, sample_hash: str = False, task_id: int = False, visible_to=None):
         """Retrieve information on a sample location by given hash.
         @param hash: md5/sha1/sha256/sha256.
         @param task_id: task_id
+        @param visible_to: optional tenancy Viewer — when set, only resolve a
+            sample the viewer has a VISIBLE task for (the shared by-hash boundary,
+            so a tenant can't pull another tenant's sample bytes by hash). No-op
+            for break-glass / MT-disabled (is_local_admin). Empty result is
+            indistinguishable from genuinely-not-found.
         @return: samples path(s) as list.
         """
         sizes = {
@@ -281,6 +299,16 @@ class SamplesMixIn:
             64: Sample.sha256,
             128: Sample.sha512,
         }
+
+        if visible_to is not None and not getattr(visible_to, "is_local_admin", False):
+            _h = sample_hash
+            if not _h and task_id:
+                _row = self.session.scalar(select(Sample).join(Task, Sample.id == Task.sample_id).where(Task.id == task_id))
+                _h = _row.sha256 if _row else None
+            _col = sizes.get(len(_h)) if _h else None
+            _samp = self.session.scalar(select(Sample).where(_col == _h)) if _col else None
+            if _samp is None or not self.list_tasks(sample_id=_samp.id, visible_to=visible_to, limit=1):
+                return []
 
         hashlib_sizes = {
             32: hashlib.md5,

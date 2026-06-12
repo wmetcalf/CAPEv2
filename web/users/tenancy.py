@@ -75,6 +75,34 @@ def can_manage_task(user, task) -> bool:
     return can_toggle(viewer_for(user), _job_for(task))
 
 
+def can_view_sample(user, *, sha256=None, sha1=None, md5=None, sample_id=None) -> bool:
+    """True iff `user` may access a content-addressed sample identified by
+    hash/id — i.e. has >=1 VISIBLE task referencing it. Samples are shared across
+    tenants by sha256, so access follows the union of the viewer's visible tasks
+    (the same intended boundary apiv2 _deny_by_hash enforces).
+
+    No-op (returns True) when multitenancy is disabled or for a break-glass admin
+    (viewer_for -> is_local_admin). THE single source of truth for every by-hash
+    surface (apiv2 _deny_by_hash, web file() sample/static, submission resubmit /
+    download-services) so they cannot drift apart.
+    """
+    viewer = viewer_for(user)
+    if viewer.is_local_admin:
+        return True
+    from lib.cuckoo.core.database import Database
+
+    db = Database()
+    if sample_id is not None:
+        sample = db.view_sample(sample_id)
+    elif sha256 or sha1 or md5:
+        sample = db.find_sample(sha256=sha256, sha1=sha1, md5=md5)
+    else:
+        sample = None
+    if sample is None:
+        return False
+    return bool(db.list_tasks(sample_id=sample.id, visible_to=viewer, limit=1))
+
+
 def submission_scope(request):
     """Resolve (tenant_id, visibility) for a new submission from the request.
 
