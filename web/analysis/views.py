@@ -570,33 +570,29 @@ def index(request, page=1):
     first_pcap = 0
     first_url = 0
     # On a fresh install, we need handle where there are 0 tasks.
+    # One query per category (limit=1, visible_to-scoped): reuse buf[0] rather
+    # than re-querying for the id (halves the DB round-trips).
     buf = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
-    if len(buf) == 1:
-        first_file = db.list_tasks(limit=1, category="file", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)[0].to_dict()[
-            "id"
-        ]
+    if buf:
+        first_file = buf[0].to_dict()["id"]
         paging["show_file_prev"] = "show"
     else:
         paging["show_file_prev"] = "hide"
     buf = db.list_tasks(limit=1, category="static", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
-    if len(buf) == 1:
-        first_static = db.list_tasks(limit=1, category="static", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)[
-            0
-        ].to_dict()["id"]
+    if buf:
+        first_static = buf[0].to_dict()["id"]
         paging["show_static_prev"] = "show"
     else:
         paging["show_static_prev"] = "hide"
     buf = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
-    if len(buf) == 1:
-        first_url = db.list_tasks(limit=1, category="url", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)[0].to_dict()["id"]
+    if buf:
+        first_url = buf[0].to_dict()["id"]
         paging["show_url_prev"] = "show"
     else:
         paging["show_url_prev"] = "hide"
     buf = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)
-    if len(buf) == 1:
-        first_pcap = db.list_tasks(limit=1, category="pcap", not_status=TASK_PENDING, order_by=Task.added_on.asc(), visible_to=_visible)[0].to_dict()[
-            "id"
-        ]
+    if buf:
+        first_pcap = buf[0].to_dict()["id"]
         paging["show_pcap_prev"] = "show"
     else:
         paging["show_pcap_prev"] = "hide"

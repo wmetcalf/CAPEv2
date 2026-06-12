@@ -165,36 +165,33 @@ class SamplesMixIn:
         # TODO This function is poorly named. It returns True if a sample with the given
         # sha256 already exists in the database, rather than returning True if the given
         # sha256 is unique.
-        uniq = False
-        if hours and sha256:
-            date_since = _utcnow_naive() - timedelta(hours=hours)
+        if not sha256:
+            return False
 
-            stmt = (
-                select(Task)
-                .join(Sample, Task.sample_id == Sample.id)
-                .where(Sample.sha256 == sha256)
-                .where(Task.added_on >= date_since)
-            )
-            # Tenant scope: a non-break-glass viewer's duplicate check must only
-            # consider THEIR visible tasks — otherwise the "Duplicated file"
-            # rejection is a cross-tenant existence+recency oracle for any hash.
-            # Mirrors list_tasks(visible_to=). No-op for break-glass / MT-disabled.
-            if visible_to is not None and not visible_to.is_local_admin:
-                from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+        # The tenant scope must apply for ANY hours value — including hours=0
+        # (all-time uniqueness) — else a non-break-glass viewer's duplicate check
+        # is a cross-tenant existence oracle (the original else-branch called
+        # find_sample() unscoped). Build the scoped Task-exists query when a
+        # viewer is supplied; preserve the original unscoped behavior otherwise.
+        stmt = select(Task).join(Sample, Task.sample_id == Sample.id).where(Sample.sha256 == sha256)
+        if hours:
+            stmt = stmt.where(Task.added_on >= _utcnow_naive() - timedelta(hours=hours))
 
-                conds = [Task.visibility == PUBLIC]
-                if visible_to.user_id is not None:
-                    conds.append(Task.user_id == visible_to.user_id)
-                if visible_to.tenant_id is not None:
-                    conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
-                stmt = stmt.where(or_(*conds))
+        if visible_to is not None and not visible_to.is_local_admin:
+            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+            conds = [Task.visibility == PUBLIC]
+            if visible_to.user_id is not None:
+                conds.append(Task.user_id == visible_to.user_id)
+            if visible_to.tenant_id is not None:
+                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
+            stmt = stmt.where(or_(*conds))
             return self.session.scalar(select(stmt.exists()))
-        else:
-            if not self.find_sample(sha256=sha256):
-                uniq = False
-            else:
-                uniq = True
-        return uniq
+
+        # Unscoped (break-glass / MT-disabled / no viewer): original semantics.
+        if not hours:
+            return self.find_sample(sha256=sha256) is not None
+        return self.session.scalar(select(stmt.exists()))
 
     def get_file_types(self) -> List[str]:
         """Gets a sorted list of unique sample file types."""
@@ -301,12 +298,13 @@ class SamplesMixIn:
         }
 
         if visible_to is not None and not getattr(visible_to, "is_local_admin", False):
-            _h = sample_hash
-            if not _h and task_id:
-                _row = self.session.scalar(select(Sample).join(Task, Sample.id == Task.sample_id).where(Task.id == task_id))
-                _h = _row.sha256 if _row else None
-            _col = sizes.get(len(_h)) if _h else None
-            _samp = self.session.scalar(select(Sample).where(_col == _h)) if _col else None
+            if task_id:
+                # task_id already gives us the Sample via the join — no extra query.
+                _samp = self.session.scalar(select(Sample).join(Task, Sample.id == Task.sample_id).where(Task.id == task_id))
+            elif sample_hash and sizes.get(len(sample_hash)):
+                _samp = self.session.scalar(select(Sample).where(sizes[len(sample_hash)] == sample_hash))
+            else:
+                _samp = None
             if _samp is None or not self.list_tasks(sample_id=_samp.id, visible_to=visible_to, limit=1):
                 return []
 

@@ -553,11 +553,6 @@ def test_cross_task_mongo_pivots_are_reviewed():
 # such function lacking a by-hash guard.
 BYHASH_RESOLVERS = ("sample_path_by_hash",)            # call markers
 BYHASH_GUARDS = ("can_view_sample", "_deny_by_hash", "visible_to")
-# Functions that resolve a sample by hash but are verified safe by other means.
-BYHASH_ALLOWLIST = {
-    # web file() builds storage/binaries/<hash> directly (no sample_path_by_hash
-    # call) and is guarded by can_view_sample — caught by the guard scan below.
-}
 
 
 def test_byhash_sample_resolution_is_gated():
