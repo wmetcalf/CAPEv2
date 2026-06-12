@@ -3073,11 +3073,19 @@ def report(request, task_id):
             report["target"]["file"]["sha256"],
             search_limit=10,
             projection={"info.id": 1, "detections": 1, "_id": 0},
+            viewer=viewer_for(request.user),
         )
         for record in records:
-            if record["info"]["id"] == report["info"]["id"]:
+            rid = (record.get("info") or {}).get("id")
+            if rid is None or rid == report["info"]["id"]:
                 continue
-            existent_tasks[record["info"]["id"]] = record.get("detections")
+            # tenant isolation: only surface other analyses of this sample that
+            # the requester may read (no-op when MT disabled). Without this, the
+            # report page leaks other tenants' task ids + detections for the hash.
+            _vt = db.view_task(rid)
+            if _vt is None or not can_view_task(request.user, _vt):
+                continue
+            existent_tasks[rid] = record.get("detections")
 
     # process log per task if enabled:
     process_log_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "process.log")
@@ -3243,10 +3251,11 @@ category_map = {
 }
 
 
-def _file_search_all_files(search_category: str, search_term: str) -> list:
+def _file_search_all_files(search_category: str, search_term: str, request) -> list:
     path = []
     try:
         projection = {
+            "info.id": 1,
             "info.parent_sample.path": 1,
             "info.parent_sample.cape_yara.name": 1,
             "target.file.path": 1,
@@ -3268,11 +3277,24 @@ def _file_search_all_files(search_category: str, search_term: str) -> list:
             "CAPE.payloads.extracted_files_tool.path": 1,
             "CAPE.payloads.extracted_files_tool.cape_yara.name": 1,
         }
-        records = perform_search(search_category, search_term, projection=projection)
+        # Tenant isolation: scope the search to the requester's entitled
+        # analyses at the query layer (no-op when multitenancy disabled). Without
+        # this, capeyarazipall streams other tenants' artifact bytes for any file
+        # matching the supplied YARA rule name.
+        records = perform_search(search_category, search_term, projection=projection, viewer=viewer_for(request.user))
         search_term = search_term.lower()
         for _, filepath, _, _ in yara_detected(search_term, records):
             if not path_exists(filepath):
                 continue
+            # Defense-in-depth: drop any artifact whose owning analysis the
+            # requester may not read. The query scope above is the primary gate;
+            # this guards paths under storage/analyses/<task_id>/ regardless of
+            # backend (no-op when MT disabled — can_view_task -> is_local_admin).
+            _m = re.search(r"/analyses/(\d+)/", filepath)
+            if _m:
+                _vt = db.view_task(int(_m.group(1)))
+                if _vt is None or not can_view_task(request.user, _vt):
+                    continue
             path.append(filepath)
     except ValueError as e:
         print("mongodb load", e)
@@ -3418,7 +3440,7 @@ def file(request, category, task_id, dlfile):
     elif category == "capeyarazipall":
         # search in mongo and get the path
         if enabledconf["mongodb"] and web_cfg.zipped_download.download_all:
-            path = _file_search_all_files(category.replace("zipall", ""), dlfile)
+            path = _file_search_all_files(category.replace("zipall", ""), dlfile, request)
     elif category == "logszipall":
         buf = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "logs")
         path = []
@@ -3720,7 +3742,7 @@ def search(request, searched=""):
         term_only, value_only = term, value
 
         try:
-            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff)
+            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, viewer=viewer_for(request.user))
         except ValueError:
             if term:
                 return render(

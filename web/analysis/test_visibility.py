@@ -90,3 +90,36 @@ def test_tag_tasks_skips_unmanageable_cross_tenant(cape_db, mt_enabled, client):
     assert r.status_code == 200
     av.db.session.expire_all()
     assert "pwned" not in (av.db.session.get(Task, tid).tags_tasks or "")
+
+
+@pytest.mark.django_db
+def test_file_search_all_files_drops_cross_tenant_paths(cape_db, mt_enabled, monkeypatch):
+    """CRITICAL leak regression (capeyarazipall): _file_search_all_files must NOT
+    return artifact paths belonging to analyses the requester can't read — else
+    file() streams another tenant's dropped/payload/sample bytes. The per-path
+    owning-task gate drops paths under storage/analyses/<foreign_tid>/."""
+    from django.test import RequestFactory
+    from django.contrib.auth.models import User
+    import analysis.views as av
+
+    class OwnTask:      # task 2 — visible to the requester (public)
+        id = 2; user_id = 0; tenant_id = 10; visibility = "public"
+
+    class ForeignTask:  # task 3 — another tenant's private analysis
+        id = 3; user_id = 999; tenant_id = 20; visibility = "private"
+
+    monkeypatch.setattr(av, "perform_search", lambda *a, **k: [{"info": {"id": 2}}, {"info": {"id": 3}}])
+    # yara_detected yields (kind, filepath, block, fileobj) — one own, one foreign
+    monkeypatch.setattr(av, "yara_detected", lambda term, recs: [
+        ("dropped", "/opt/CAPEv2/storage/analyses/2/files/own.bin", {}, {}),
+        ("dropped", "/opt/CAPEv2/storage/analyses/3/files/secret.bin", {}, {}),
+    ])
+    monkeypatch.setattr(av, "path_exists", lambda p: True)
+    monkeypatch.setattr(av.db, "view_task", lambda tid: OwnTask() if int(tid) == 2 else ForeignTask())
+
+    req = RequestFactory().get("/file/capeyarazipall/2/Emotet/")
+    req.user = User.objects.create_user("fs", "fs@x.com", "x")  # tenant-less, non-admin
+
+    paths = av._file_search_all_files("capeyara", "Emotet", req)
+    assert "/opt/CAPEv2/storage/analyses/2/files/own.bin" in paths      # readable kept
+    assert "/opt/CAPEv2/storage/analyses/3/files/secret.bin" not in paths  # foreign dropped

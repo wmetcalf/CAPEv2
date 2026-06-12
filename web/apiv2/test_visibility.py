@@ -403,3 +403,49 @@ def test_tasks_delete_many_skips_unmanageable_cross_tenant(cape_db, mt_enabled, 
 
     assert deleted == []                       # cross-tenant task NOT deleted
     assert resp.data.get(1) == "not exists"    # indistinguishable from missing
+
+
+def test_every_perform_search_caller_passes_viewer():
+    """SECURITY GATE: perform_search() is unscoped by default (no tenant filter
+    at the mongo/ES layer). Every web caller MUST pass viewer= so the query is
+    tenant-scoped — otherwise it leaks cross-tenant task ids / hashes / detections
+    / artifact paths (this is exactly how the capeyarazipall + report-existent_tasks
+    leaks happened). Fails the build if any caller omits viewer=."""
+    import ast
+    import importlib
+
+    offenders = []
+    for modname in ("analysis.views", "apiv2.views", "submission.views"):
+        mod = importlib.import_module(modname)
+        tree = ast.parse(open(mod.__file__).read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "perform_search":
+                if "viewer" not in {kw.arg for kw in node.keywords}:
+                    offenders.append(f"{modname}:{node.lineno}")
+    assert not offenders, f"perform_search() called without viewer= (cross-tenant leak risk) at: {offenders}"
+
+
+def test_viewer_scope_match_locked_vs_disabled(monkeypatch):
+    """The systemic perform_search scope helper: a locked-mode tenant viewer gets
+    a public/tenant/mine $or; break-glass and MT-disabled get None (no filter).
+    _viewer_scope_match reads lib.cuckoo.common.tenancy.multitenancy_config at
+    call time, so patch THAT (not users.tenancy's copy)."""
+    from lib.cuckoo.common import web_utils
+    from lib.cuckoo.common.tenancy import Viewer, MTConfig
+    import lib.cuckoo.common.tenancy as t
+
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(True, "locked", "", True))
+    v = Viewer(user_id=2, tenant_id=10)              # locked, non-admin
+    f = web_utils._viewer_scope_match(v)
+    assert "$or" in f
+    assert {"info.visibility": "public"} in f["$or"]
+    assert {"info.tenant_id": 10, "info.visibility": "tenant"} in f["$or"]
+    assert {"info.user_id": 2} in f["$or"]
+
+    # break-glass -> no filter
+    assert web_utils._viewer_scope_match(Viewer(user_id=9, tenant_id=None, is_local_admin=True)) is None
+    # MT disabled -> no filter
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    assert web_utils._viewer_scope_match(v) is None
+    # no viewer -> no filter
+    assert web_utils._viewer_scope_match(None) is None

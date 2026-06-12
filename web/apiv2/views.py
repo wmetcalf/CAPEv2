@@ -883,7 +883,7 @@ def ext_tasks_search(request):
             del tmp_value
         try:
             projection = lean_search_filters if request.data.get("lean") else None
-            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, web=False, projection=projection)
+            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, web=False, projection=projection, viewer=viewer_for(request.user))
         except ValueError:
             if not term:
                 resp = {"error": True, "error_value": "No option provided."}
@@ -2703,9 +2703,13 @@ def cuckoo_status(request):
 @api_view(["GET"])
 def task_x_hours(request):
     session = db.Session()
+    # tenant isolation: restrict to the caller's visible tasks (no-op when MT
+    # disabled/break-glass — list_tasks(visible_to=local_admin) returns all).
+    visible_ids = {t.id for t in db.list_tasks(visible_to=viewer_for(request.user))}
     res = (
         session.query(Task)
         .filter(Task.added_on.between(datetime.datetime.now(), datetime.datetime.now() - datetime.timedelta(days=1)))
+        .filter(Task.id.in_(visible_ids))
         .all()
     )
     results = {}
