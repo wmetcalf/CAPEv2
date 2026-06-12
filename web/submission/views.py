@@ -62,6 +62,8 @@ def _scope_existent(request, records):
     analysis.search. No-op when MT disabled (can_view_task -> is_local_admin)."""
     out = []
     for record in records or []:
+        if not isinstance(record, dict):
+            continue
         rid = (record.get("info") or {}).get("id")
         if rid is None:
             continue
