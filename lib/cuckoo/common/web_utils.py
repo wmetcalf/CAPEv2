@@ -1379,8 +1379,34 @@ def _build_es_user_filter(privs: bool, user_id: int):
     return user_filter
 
 
+def _viewer_scope_match(viewer):
+    """Mongo $match restricting an analysis-collection query to the viewer's
+    entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
+    filter applies — multitenancy disabled, shared mode, or break-glass
+    (is_local_admin). Dependency-free (imports only the pure predicate module, no
+    web import) so the search primitive is secure-by-default rather than relying
+    on every caller to post-filter. Mirrors dashboard.entitled_scope_filter; keys
+    target the report's stamped info.* fields.
+    """
+    if viewer is None:
+        return None
+    from lib.cuckoo.common.tenancy import MINE, PUBLIC, TENANT, multitenancy_config, scope_match
+
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    clauses = []
+    for _scope in (PUBLIC, TENANT, MINE):
+        m = scope_match(_scope, viewer)
+        if m is not None:
+            clauses.append(m)
+    # No entitled scope resolved (tenant-less/anon) -> match nothing, never global.
+    return {"$or": clauses} if clauses else {"info.id": -1}
+
+
 def perform_search(
-    term: str, value: str, search_limit: int = 0, user_id: int = 0, privs: bool = False, web: bool = True, projection: dict = None
+    term: str, value: str, search_limit: int = 0, user_id: int = 0, privs: bool = False, web: bool = True, projection: dict = None,
+    viewer=None,
 ):
     """
     Perform a search based on the provided term and value.
@@ -1483,20 +1509,28 @@ def perform_search(
             # The file details are uniq, and we store 1 to many. So where hash type is uniq, IDs are list
             split_by = "," if "," in query_val else " "
             query_filter_list = {"$in": [val.strip() for val in query_val.split(split_by)]}
+            # The files collection is NOT tenant-stamped, so we $lookup back to
+            # the analysis doc (which IS stamped) and filter THERE. The tenant
+            # $match and the $limit are applied AFTER the join — limiting before
+            # the scope filter would let other tenants' hits crowd out / truncate
+            # the viewer's own visible results.
             pipeline = [
-                # Stages 1-5: Find, unwind, group, sort, limit IDs
                 {"$match": {hash_searches[term]: query_filter_list}},
                 {"$unwind": "$_task_ids"},
                 {"$group": {"_id": "$_task_ids"}},
                 {"$sort": {"_id": -1}},
-                {"$limit": search_limit},
-                # Stage 6: Join with the tasks collection
+                # Join with the analysis collection
                 {"$lookup": {"from": "analysis", "localField": "_id", "foreignField": "info.id", "as": "task_doc"}},
-                # Stage 7: Unpack the joined doc
                 {"$unwind": "$task_doc"},
-                # Stage 8: Make the task doc the new root
                 {"$replaceRoot": {"newRoot": "$task_doc"}},
             ]
+
+            # Tenant scope — applied regardless of `privs` (Django is_staff is NOT
+            # the tenancy break-glass; only is_local_admin is, handled inside
+            # _viewer_scope_match). No-op when multitenancy is disabled/shared.
+            _scope = _viewer_scope_match(viewer)
+            if _scope:
+                pipeline.append({"$match": _scope})
 
             if not privs:
                 if force_bool(web_cfg.general.get("public_searches", True)):
@@ -1505,7 +1539,8 @@ def perform_search(
                 else:
                     pipeline.append({"$match": {"info.user_id": user_id}})
 
-            # Stage 9: Add your custom projection
+            # Limit AFTER scoping, then project.
+            pipeline.append({"$limit": search_limit})
             pipeline.append({"$project": projection or perform_search_filters})
 
             retval = list(mongo_aggregate(FILES_COLL, pipeline))
@@ -1540,6 +1575,12 @@ def perform_search(
                         }
                 else:
                     mongo_search_query["info.user_id"] = user_id
+
+            # Tenant scope — applied regardless of `privs` (is_staff is not the
+            # tenancy break-glass). No-op when multitenancy disabled/shared.
+            _scope = _viewer_scope_match(viewer)
+            if _scope:
+                mongo_search_query = {"$and": [mongo_search_query, _scope]}
 
             retval = list(mongo_find("analysis", mongo_search_query, projection, limit=search_limit))
 

@@ -883,7 +883,7 @@ def ext_tasks_search(request):
             del tmp_value
         try:
             projection = lean_search_filters if request.data.get("lean") else None
-            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, web=False, projection=projection)
+            records = perform_search(term, value, user_id=request.user.id, privs=request.user.is_staff, web=False, projection=projection, viewer=viewer_for(request.user))
         except ValueError:
             if not term:
                 resp = {"error": True, "error_value": "No option provided."}
@@ -2703,18 +2703,26 @@ def cuckoo_status(request):
 @api_view(["GET"])
 def task_x_hours(request):
     session = db.Session()
-    res = (
-        session.query(Task)
-        .filter(Task.added_on.between(datetime.datetime.now(), datetime.datetime.now() - datetime.timedelta(days=1)))
-        .all()
-    )
-    results = {}
-    if res:
-        for date, samples in res:
-            results.setdefault(date.strftime("%Y-%m-%eT%H:%M:00"), samples)
-    session.close()
-    resp = {"error": False, "stats": results}
-    return Response(resp)
+    try:
+        # Query the bounded last-24h window FIRST (a small set), then filter by
+        # visibility in Python — avoids loading the whole visible set into memory
+        # (OOM). Tenant isolation via can_view_task is a no-op when multitenancy
+        # is disabled / break-glass. (Also fixes the pre-existing reversed
+        # between() args, which made this always return empty.)
+        tasks = (
+            session.query(Task)
+            .filter(Task.added_on.between(datetime.datetime.now() - datetime.timedelta(days=1), datetime.datetime.now()))
+            .all()
+        )
+        results = {}
+        for t in tasks:
+            if not can_view_task(request.user, t):
+                continue
+            bucket = t.added_on.strftime("%Y-%m-%eT%H:%M:00")
+            results[bucket] = results.get(bucket, 0) + 1
+    finally:
+        session.close()
+    return Response({"error": False, "stats": results})
 
 
 @csrf_exempt

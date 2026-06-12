@@ -15,7 +15,7 @@ from contextlib import suppress
 
 from django.conf import settings
 
-from users.tenancy import submission_scope, can_view_task
+from users.tenancy import submission_scope, can_view_task, viewer_for
 from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render
@@ -555,7 +555,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
-                        records = _scope_existent(request, perform_search("target_sha256", hash, search_limit=5))
+                        records = _scope_existent(request, perform_search("target_sha256", hash, search_limit=5, viewer=viewer_for(request.user)))
                         if records:
                             for record in records or []:
                                 existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
@@ -576,7 +576,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.general.get("existent_tasks", False):
-                        records = _scope_existent(request, perform_search("target_sha256", sha256, search_limit=5))
+                        records = _scope_existent(request, perform_search("target_sha256", sha256, search_limit=5, viewer=viewer_for(request.user)))
                         if records:
                             for record in records:
                                 if record.get("target").get("file", {}).get("sha256"):
@@ -771,7 +771,7 @@ def index(request, task_id=None, resubmit_hash=None):
         existent_tasks = {}
         if resubmit_hash:
             if web_conf.general.get("existent_tasks", False):
-                records = _scope_existent(request, perform_search("target_sha256", resubmit_hash, search_limit=5))
+                records = _scope_existent(request, perform_search("target_sha256", resubmit_hash, search_limit=5, viewer=viewer_for(request.user)))
                 if records:
                     for record in records:
                         existent_tasks.setdefault(record["target"]["file"]["sha256"], [])
