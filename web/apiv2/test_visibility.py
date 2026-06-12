@@ -504,9 +504,11 @@ def _functions_calling(modname, names):
     import importlib
 
     mod = importlib.import_module(modname)
-    tree = ast.parse(open(mod.__file__).read())
+    with open(mod.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
     out = set()
-    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+    # Include async views — an async def issuing an unscoped pivot must not bypass the gate.
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
         for node in ast.walk(fn):
             if isinstance(node, ast.Call):
                 nm = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
@@ -522,12 +524,13 @@ def test_cross_task_mongo_pivots_are_reviewed():
     unscoped cross-task query can't ship without review. Closes the marker-gate
     blind spot that let report()'s existent_tasks pivot leak while its primary
     read was gated."""
+    # Import directly (no silent skip): a module that can't be scanned is a
+    # coverage hole, not a pass — the gate must fail loudly rather than miss a
+    # module's pivots. These all import in the test env (same set the routed gate
+    # scans via _all_task_views()).
     found = set()
     for modname in ("analysis.views", "apiv2.views", "compare.views", "dashboard.views", "submission.views", "guac.views"):
-        try:
-            found |= _functions_calling(modname, CROSS_TASK_MONGO_PIVOTS)
-        except ModuleNotFoundError:
-            continue
+        found |= _functions_calling(modname, CROSS_TASK_MONGO_PIVOTS)
 
     unreviewed = sorted(found - set(REVIEWED_MONGO_PIVOTS))
     assert not unreviewed, (
