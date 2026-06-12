@@ -3735,18 +3735,23 @@ def search(request, searched=""):
 
         analyses = []
         for result in records or []:
-            new = None
+            task_id = None
             if enabledconf["mongodb"] and enabledconf["elasticsearchdb"] and essearch and not term:
-                new = get_analysis_info(db, id=int(result["_source"]["task_id"]))
-            if enabledconf["mongodb"] and term and "info" in result:
-                new = get_analysis_info(db, id=int(result["info"]["id"]))
-            if es_as_db:
-                new = get_analysis_info(db, id=int(result["info"]["id"]))
-            if not new:
+                task_id = int(result["_source"]["task_id"])
+            elif enabledconf["mongodb"] and term and "info" in result:
+                task_id = int(result["info"]["id"])
+            elif es_as_db:
+                task_id = int(result["info"]["id"])
+            if task_id is None:
                 continue
-            # tenant isolation: only surface analyses the viewer may read
-            _vt = db.view_task(int(new["id"]))
+            # tenant isolation: gate BEFORE the heavy get_analysis_info() (mongo/es
+            # lookups + processing) — skip unauthorized tasks cheaply and reuse the
+            # resolved task so get_analysis_info doesn't re-query Postgres.
+            _vt = db.view_task(task_id)
             if _vt is None or not can_view_task(request.user, _vt):
+                continue
+            new = get_analysis_info(db, task=_vt)
+            if not new:
                 continue
             analyses.append(new)
 

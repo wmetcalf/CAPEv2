@@ -91,8 +91,18 @@ def left(request, left_id):
             }
         }
         results = es.search(index=get_analysis_index(), body=q)["hits"]["hits"]
+        # tenant isolation: the mongo path filters via entitled_scope_filter; the
+        # ES backend can't take that $match, so post-filter each hit through
+        # can_view_task (no-op for break-glass / shared / multitenancy disabled).
+        _db = Database()
         for item in results:
-            records.append(item["_source"])
+            _source = item["_source"]
+            _tid = _source.get("info", {}).get("id")
+            if _tid is None:
+                continue
+            _vt = _db.view_task(int(_tid))
+            if _vt is not None and can_view_task(request.user, _vt):
+                records.append(_source)
 
     data = {"title": "Compare", "left": left, "records": records}
     return render(request, "compare/left.html", data)
@@ -138,8 +148,18 @@ def hash(request, left_id, right_hash):
             }
         }
         results = es.search(index=get_analysis_index(), body=q)["hits"]["hits"]
+        # tenant isolation: the mongo path filters via entitled_scope_filter; the
+        # ES backend can't take that $match, so post-filter each hit through
+        # can_view_task (no-op for break-glass / shared / multitenancy disabled).
+        _db = Database()
         for item in results:
-            records.append(item["_source"])
+            _source = item["_source"]
+            _tid = _source.get("info", {}).get("id")
+            if _tid is None:
+                continue
+            _vt = _db.view_task(int(_tid))
+            if _vt is not None and can_view_task(request.user, _vt):
+                records.append(_source)
 
     # Select all analyses with specified file hash.
     return render(request, "compare/hash.html", {"left": left, "records": records, "hash": right_hash})
