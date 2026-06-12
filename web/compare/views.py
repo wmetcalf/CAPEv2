@@ -100,7 +100,10 @@ def left(request, left_id):
             _tid = (_source.get("info") or {}).get("id")
             if _tid is None:
                 continue
-            _vt = _db.view_task(int(_tid))
+            try:
+                _vt = _db.view_task(int(_tid))
+            except (ValueError, TypeError):
+                continue  # malformed id in a corrupt ES doc — skip, don't 500
             if _vt is not None and can_view_task(request.user, _vt):
                 records.append(_source)
 
@@ -157,7 +160,10 @@ def hash(request, left_id, right_hash):
             _tid = (_source.get("info") or {}).get("id")
             if _tid is None:
                 continue
-            _vt = _db.view_task(int(_tid))
+            try:
+                _vt = _db.view_task(int(_tid))
+            except (ValueError, TypeError):
+                continue  # malformed id in a corrupt ES doc — skip, don't 500
             if _vt is not None and can_view_task(request.user, _vt):
                 records.append(_source)
 

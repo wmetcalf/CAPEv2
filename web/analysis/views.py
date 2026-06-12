@@ -3744,7 +3744,10 @@ def search(request, searched=""):
                 task_id = (result.get("info") or {}).get("id")
             if task_id is None:
                 continue
-            task_id = int(task_id)
+            try:
+                task_id = int(task_id)
+            except (ValueError, TypeError):
+                continue  # malformed id in a corrupt report — skip, don't 500
             # tenant isolation: gate BEFORE the heavy get_analysis_info() (mongo/es
             # lookups + processing) — skip unauthorized tasks cheaply and reuse the
             # resolved task so get_analysis_info doesn't re-query Postgres.
