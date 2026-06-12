@@ -103,6 +103,65 @@ def test_disabled_is_backcompat_see_all(monkeypatch):
 
 
 @pytest.mark.django_db
+def test_disabled_anonymous_is_backcompat_see_all(monkeypatch):
+    """B0 back-compat (the headline gating regression): on a DISABLED install a
+    no-auth public deployment (WEB_AUTHENTICATION off) or apiv2 with token-auth
+    off (DRF AllowAny) serves every request as AnonymousUser. viewer_for MUST
+    short-circuit the disabled case BEFORE the is_authenticated check so an
+    anonymous viewer is is_local_admin=True and can_read a private-default task,
+    exactly like upstream. Regression guard: previously the anon branch returned
+    is_local_admin=False before reading cfg, so ~45 guards denied non-public
+    tasks on a plain public install."""
+    from django.contrib.auth.models import AnonymousUser
+    from lib.cuckoo.common.tenancy import MTConfig
+    from users.tenancy import can_view_task, can_manage_task, viewer_for
+    import users.tenancy as ut
+
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+
+    class PrivateTask:  # private-default, owned by someone (no anon owner)
+        user_id = 999
+        tenant_id = 10
+        visibility = "private"
+
+    anon = AnonymousUser()
+    v = viewer_for(anon)
+    assert v.is_local_admin is True          # disabled => see-all even for anon
+    assert v.user_id is None
+    assert can_view_task(anon, PrivateTask()) is True   # not hidden (upstream parity)
+    assert can_manage_task(anon, PrivateTask()) is True # mutations also unblocked when disabled
+
+
+@pytest.mark.django_db
+def test_enabled_anonymous_stays_public_only(monkeypatch):
+    """Counterpart to B0: when MT is ENABLED (locked), an anonymous viewer must
+    remain public-only — the disabled short-circuit must NOT leak into enabled
+    mode."""
+    from django.contrib.auth.models import AnonymousUser
+    from lib.cuckoo.common.tenancy import MTConfig
+    from users.tenancy import can_view_task, viewer_for
+    import users.tenancy as ut
+
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(True, "locked", "", True))
+
+    class PrivateTask:
+        user_id = 999
+        tenant_id = 10
+        visibility = "private"
+
+    class PublicTask:
+        user_id = 999
+        tenant_id = 10
+        visibility = "public"
+
+    anon = AnonymousUser()
+    v = viewer_for(anon)
+    assert v.is_local_admin is False
+    assert can_view_task(anon, PrivateTask()) is False  # enabled => restricted
+    assert can_view_task(anon, PublicTask()) is True     # public still readable
+
+
+@pytest.mark.django_db
 def test_viewer_for_local_admin_gate(monkeypatch):
     from lib.cuckoo.common.tenancy import MTConfig
     import users.tenancy as ut

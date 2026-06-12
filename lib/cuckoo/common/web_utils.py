@@ -562,26 +562,39 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
         sorted(details["tasks"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    if HAVE_DIST and dist_conf.distributed.enabled:
+    # The distributed-tasks panel runs against a separate dist DB whose Task
+    # schema has no tenant_id/visibility column, so it cannot be scope-filtered.
+    # Until that schema gains tenancy columns, only populate it for the GLOBAL
+    # scope (MT disabled / shared / break-glass) — never for a locked-mode
+    # tenant/mine panel, where per-node-per-day counts would leak other tenants'
+    # submission volumes.
+    if HAVE_DIST and dist_conf.distributed.enabled and (scope is None or scope == "global"):
+        # A dist DB that's down/misconfigured must not 500 the whole dashboard —
+        # just omit the panel.
         details["distributed_tasks"] = {}
-        dist_db = dist_session()
-        dist_tasks = dist_db.query(DTask).filter(DTask.clock.between(date_since, date_till)).all()
-        # distributed_tasks: separate distributed DB, no tenant column — not scoped (follow-up)
-        id2name = {}
-        # load node names
-        for node in dist_db.query(Node).all() or []:
-            id2name.setdefault(node.id, node.name)
+        dist_db = None
+        try:
+            dist_db = dist_session()
+            dist_tasks = dist_db.query(DTask).filter(DTask.clock.between(date_since, date_till)).all()
+            id2name = {}
+            # load node names
+            for node in dist_db.query(Node).all() or []:
+                id2name.setdefault(node.id, node.name)
 
-        for task in dist_tasks or []:
-            day = task.clock.strftime("%Y-%m-%d")
-            if day not in details["distributed_tasks"]:
-                details["distributed_tasks"].setdefault(day, {})
-            if id2name.get(task.node_id) not in details["distributed_tasks"][day]:
-                details["distributed_tasks"][day].setdefault(id2name[task.node_id], 0)
-            details["distributed_tasks"][day][id2name[task.node_id]] += 1
-        dist_db.close()
+            for task in dist_tasks or []:
+                day = task.clock.strftime("%Y-%m-%d")
+                if day not in details["distributed_tasks"]:
+                    details["distributed_tasks"].setdefault(day, {})
+                if id2name.get(task.node_id) not in details["distributed_tasks"][day]:
+                    details["distributed_tasks"][day].setdefault(id2name[task.node_id], 0)
+                details["distributed_tasks"][day][id2name[task.node_id]] += 1
 
-        details["distributed_tasks"] = OrderedDict(sorted(details["distributed_tasks"].items(), key=lambda x: x[0], reverse=True))
+            details["distributed_tasks"] = OrderedDict(sorted(details["distributed_tasks"].items(), key=lambda x: x[0], reverse=True))
+        except Exception as dist_err:
+            log.warning("Could not load distributed_tasks panel: %s", dist_err)
+        finally:
+            if dist_db is not None:
+                dist_db.close()
 
     # Get top15 of samples per day and seen more than once
     for day in top_samples:

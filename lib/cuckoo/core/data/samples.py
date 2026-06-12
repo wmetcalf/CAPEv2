@@ -22,11 +22,13 @@ if repconf.mongodb.enabled:
 from sqlalchemy.exc import IntegrityError
 try:
     from sqlalchemy import (
+        and_,
         BigInteger,
         distinct,
         func,
         ForeignKey,
         Index,
+        or_,
         select,
         String,
         Text,
@@ -388,16 +390,39 @@ class SamplesMixIn:
         When scope/viewer are provided, counts distinct sample_ids referenced
         by tasks visible in that scope — mirroring _scope_where's branch logic.
         """
-        if scope is None and viewer is None:
-            stmt = select(func.count(Sample.id))
-            return self.session.scalar(stmt)
+        conds = [] if (scope is None and viewer is None) else self._scope_where(scope, viewer)
+
+        # Defense-in-depth: a non-break-glass viewer must NEVER receive an
+        # unscoped global count, even if a caller passes scope='global' — restrict
+        # to the samples referenced by tasks they may read. is_local_admin
+        # (break-glass, AND every principal when multitenancy is disabled — see
+        # viewer_for) keeps the unfiltered upstream count, so the public-install
+        # dashboard figure is unchanged. For the explicit public/tenant/mine
+        # panels this clause is a redundant superset that intersects to the same
+        # result; for a (mis)passed global scope it is the safety net.
+        from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+
+        if viewer is not None and not viewer.is_local_admin:
+            vis = [Task.visibility == PUBLIC]
+            if viewer.user_id is not None:
+                vis.append(Task.user_id == viewer.user_id)
+            if viewer.tenant_id is not None:
+                vis.append(and_(Task.visibility == TENANT, Task.tenant_id == viewer.tenant_id))
+            conds.append(or_(*vis))
+
+        if not conds:
+            # No scope predicate (global / disabled / break-glass): count ALL
+            # samples exactly like upstream — count(Sample.id) includes parent-
+            # only/orphaned samples that the distinct-Task.sample_id branch drops,
+            # so the dashboard figure matches the pre-tenancy build.
+            return self.session.scalar(select(func.count(Sample.id)))
 
         # Scope-aware: count distinct Task.sample_id values for tasks in scope.
         stmt = (
             select(func.count(distinct(Task.sample_id)))
             .where(Task.sample_id.isnot(None))
         )
-        for cond in self._scope_where(scope, viewer):
+        for cond in conds:
             stmt = stmt.where(cond)
         return self.session.scalar(stmt)
 

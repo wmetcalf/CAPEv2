@@ -53,6 +53,29 @@ web_conf = Config("web")
 
 db = Database()
 
+
+def _scope_existent(request, records):
+    """Tenant isolation for the existent_tasks resubmit-by-hash display:
+    perform_search applies only the legacy TLP/public_searches filter, so in
+    locked mode it would surface other tenants' task id / sha256 / malware-family
+    for a known hash. Drop records the requester may not view — mirroring
+    analysis.search. No-op when MT disabled (can_view_task -> is_local_admin)."""
+    out = []
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        rid = (record.get("info") or {}).get("id")
+        if rid is None:
+            continue
+        try:
+            vt = db.view_task(int(rid))
+        except (ValueError, TypeError):
+            continue
+        if vt is not None and can_view_task(request.user, vt):
+            out.append(record)
+    return out
+
+
 from urllib3 import disable_warnings
 
 disable_warnings()
@@ -532,7 +555,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.web_reporting.get("enabled", False) and web_conf.general.get("existent_tasks", False):
-                        records = perform_search("target_sha256", hash, search_limit=5)
+                        records = _scope_existent(request, perform_search("target_sha256", hash, search_limit=5))
                         if records:
                             for record in records or []:
                                 existent_tasks.setdefault(record["target"]["file"]["sha256"], []).append(record)
@@ -553,7 +576,7 @@ def index(request, task_id=None, resubmit_hash=None):
                     if tasks_details.get("errors"):
                         details["errors"].extend(tasks_details["errors"])
                     if web_conf.general.get("existent_tasks", False):
-                        records = perform_search("target_sha256", sha256, search_limit=5)
+                        records = _scope_existent(request, perform_search("target_sha256", sha256, search_limit=5))
                         if records:
                             for record in records:
                                 if record.get("target").get("file", {}).get("sha256"):
@@ -578,7 +601,8 @@ def index(request, task_id=None, resubmit_hash=None):
                         details["errors"].append({os.path.basename(path): "Conversion from SAZ to PCAP failed."})
                         continue
 
-                task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0)
+                task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0,
+                                      tenant_id=_tenant_id, visibility=_visibility)
                 if task_id:
                     details["task_ids"].append(task_id)
 
@@ -747,7 +771,7 @@ def index(request, task_id=None, resubmit_hash=None):
         existent_tasks = {}
         if resubmit_hash:
             if web_conf.general.get("existent_tasks", False):
-                records = perform_search("target_sha256", resubmit_hash, search_limit=5)
+                records = _scope_existent(request, perform_search("target_sha256", resubmit_hash, search_limit=5))
                 if records:
                     for record in records:
                         existent_tasks.setdefault(record["target"]["file"]["sha256"], [])

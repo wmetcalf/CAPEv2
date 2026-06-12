@@ -940,6 +940,9 @@ class TasksMixIn:
                 task.clock,
                 tlp=task.tlp,
                 route=task.route,
+                user_id=task.user_id,
+                tenant_id=task.tenant_id,
+                visibility=task.visibility,
             )
         elif task.category in ("pcap", "static"):
             new_task_id = add(
@@ -956,6 +959,9 @@ class TasksMixIn:
                 task.enforce_timeout,
                 task.clock,
                 tlp=task.tlp,
+                user_id=task.user_id,
+                tenant_id=task.tenant_id,
+                visibility=task.visibility,
             )
 
         self.session.get(Task, task_id).custom = f"Recovery_{new_task_id}"
