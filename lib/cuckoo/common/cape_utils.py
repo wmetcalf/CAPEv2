@@ -320,37 +320,9 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
     return cape_config
 
 
-def _config_lookup_scope(viewer):
-    """Mongo $match restricting the static-config dedup lookup to the submitter's
-    entitled analyses, or None (no filter) for break-glass / MT-disabled / shared.
-    Dependency-free (pure tenancy predicate). Mirrors web_utils._viewer_scope_match
-    — duplicated here to avoid a cape_utils -> web_utils import cycle."""
-    if viewer is None:
-        return None
-    from lib.cuckoo.common.tenancy import MINE, PUBLIC, TENANT, multitenancy_config, scope_match
-
-    cfg = multitenancy_config()
-    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
-        return None
-    clauses = [m for m in (scope_match(PUBLIC, viewer), scope_match(TENANT, viewer), scope_match(MINE, viewer)) if m is not None]
-    return {"$or": clauses} if clauses else {"info.id": -1}
-
-
-def _config_lookup_es_filter(viewer):
-    """ES analogue of _config_lookup_scope (bool/should over info.* scopes), or None."""
-    if viewer is None:
-        return None
-    from lib.cuckoo.common.tenancy import multitenancy_config
-
-    cfg = multitenancy_config()
-    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
-        return None
-    shoulds = [{"term": {"info.visibility": "public"}}]
-    if getattr(viewer, "tenant_id", None) is not None:
-        shoulds.append({"bool": {"filter": [{"term": {"info.tenant_id": viewer.tenant_id}}, {"term": {"info.visibility": "tenant"}}]}})
-    if getattr(viewer, "user_id", None) is not None:
-        shoulds.append({"term": {"info.user_id": viewer.user_id}})
-    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+# Shared, single-source-of-truth scope builders (avoid drift with web_utils).
+from lib.cuckoo.common.tenancy import viewer_scope_match as _config_lookup_scope  # noqa: E402
+from lib.cuckoo.common.tenancy import viewer_scope_es_filter as _config_lookup_es_filter  # noqa: E402
 
 
 def static_config_lookup(file_path: str, sha256: str = False, viewer=None) -> dict:
@@ -384,7 +356,7 @@ def static_config_lookup(file_path: str, sha256: str = False, viewer=None) -> di
             "analysis", _q, {"CAPE.configs": 1, "info.id": 1, "_id": 0}, sort=[("_id", -1)]
         )
     elif repconf.elasticsearchdb.enabled:
-        _esmust = [{"match": {"target.file.sha256": sha256}}]
+        _esmust = [{"term": {"target.file.sha256": sha256}}]  # exact hash -> term, not analyzed match
         _esbody = {"query": {"bool": {"must": _esmust}}, "_source": ["CAPE.configs", "info.id"], "sort": {"_id": {"order": "desc"}}}
         _esf = _config_lookup_es_filter(viewer)
         if _esf:
