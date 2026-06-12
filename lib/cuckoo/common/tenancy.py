@@ -120,3 +120,42 @@ def default_visibility(cfg: MTConfig) -> str:
     if cfg.default_visibility in VISIBILITIES:
         return cfg.default_visibility
     return PUBLIC if cfg.mode == "shared" else TENANT
+
+
+def viewer_scope_match(viewer):
+    """Mongo $match restricting an analysis-collection query to the viewer's
+    entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
+    filter applies — multitenancy disabled, shared mode, or break-glass
+    (is_local_admin). THE single source of truth (imported by web_utils,
+    cape_utils, …) so the search/dedup/stats by-scope query builders can't drift.
+    Keys target the report's stamped info.* fields.
+    """
+    if viewer is None:
+        return None
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    clauses = [m for m in (scope_match(PUBLIC, viewer), scope_match(TENANT, viewer), scope_match(MINE, viewer)) if m is not None]
+    # No entitled scope resolved (tenant-less/anon) -> match nothing, never global.
+    return {"$or": clauses} if clauses else {"info.id": -1}
+
+
+def viewer_scope_es_filter(viewer):
+    """Elasticsearch bool-filter analogue of viewer_scope_match (public OR
+    own-tenant TENANT OR mine), or None when no filter applies. Uses the term/
+    info.* idiom. A tenant-less/anonymous locked-mode viewer sees only public.
+    """
+    if viewer is None:
+        return None
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    shoulds = [{"term": {"info.visibility": PUBLIC}}]
+    if getattr(viewer, "tenant_id", None) is not None:
+        shoulds.append({"bool": {"filter": [
+            {"term": {"info.tenant_id": viewer.tenant_id}},
+            {"term": {"info.visibility": TENANT}},
+        ]}})
+    if getattr(viewer, "user_id", None) is not None:
+        shoulds.append({"term": {"info.user_id": viewer.user_id}})
+    return {"bool": {"should": shoulds, "minimum_should_match": 1}}

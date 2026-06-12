@@ -314,7 +314,7 @@ def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: 
     return data
 
 
-def top_detections(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> dict:
+def top_detections(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None, viewer=None) -> list:
     """
     Retrieves the top detections from the database, either from MongoDB or Elasticsearch,
     and caches the results for 10 minutes.
@@ -363,7 +363,6 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     if repconf.mongodb.enabled:
         data = mongo_aggregate("analysis", aggregation_command)
     elif repconf.elasticsearchdb.enabled:
-        # TODO(tenancy): ES stat scoping is a documented follow-up (spec out-of-scope); mongo path is scoped
         # ToDo update to new format
         q = {
             "query": {"bool": {"must": [{"exists": {"field": "detections.family"}}]}},
@@ -373,6 +372,14 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
 
         if date_since:
             q["query"]["bool"]["must"].append({"range": {"info.started": {"gte": date_since.isoformat()}}})
+
+        # Tenant scope (parity with the mongo branch's scope_match): without this
+        # a locked-mode tenant's My-Tenant/Mine stat panels return the GLOBAL
+        # per-family malware landscape on an ES-backed install. No-op for
+        # break-glass / MT-disabled.
+        _esf = _viewer_scope_es_filter(viewer)
+        if _esf:
+            q["query"]["bool"].setdefault("filter", []).append(_esf)
 
         res = es.search(index=get_analysis_index(), body=q)
         data = [{"total": r["doc_count"], "family": r["key"]} for r in res["aggregations"]["family"]["buckets"]]
@@ -609,7 +616,7 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
         sorted(details["top_samples"].items(), key=lambda x: datetime.strptime(x[0], "%Y-%m-%d"), reverse=True)
     )
 
-    details["detections"] = top_detections(date_since=date_since, scope_match=sm)
+    details["detections"] = top_detections(date_since=date_since, scope_match=sm, viewer=viewer)
     details["asns"] = top_asn(date_since=date_since, scope_match=sm)
 
     return details
@@ -1383,54 +1390,11 @@ def _build_es_user_filter(privs: bool, user_id: int):
     return user_filter
 
 
-def _viewer_scope_match(viewer):
-    """Mongo $match restricting an analysis-collection query to the viewer's
-    entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
-    filter applies — multitenancy disabled, shared mode, or break-glass
-    (is_local_admin). Dependency-free (imports only the pure predicate module, no
-    web import) so the search primitive is secure-by-default rather than relying
-    on every caller to post-filter. Mirrors dashboard.entitled_scope_filter; keys
-    target the report's stamped info.* fields.
-    """
-    if viewer is None:
-        return None
-    from lib.cuckoo.common.tenancy import MINE, PUBLIC, TENANT, multitenancy_config, scope_match
-
-    cfg = multitenancy_config()
-    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
-        return None
-    clauses = []
-    for _scope in (PUBLIC, TENANT, MINE):
-        m = scope_match(_scope, viewer)
-        if m is not None:
-            clauses.append(m)
-    # No entitled scope resolved (tenant-less/anon) -> match nothing, never global.
-    return {"$or": clauses} if clauses else {"info.id": -1}
-
-
-def _viewer_scope_es_filter(viewer):
-    """Elasticsearch bool-filter clause restricting a query to the viewer's
-    entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
-    filter applies (multitenancy disabled / shared / break-glass). ES analogue of
-    _viewer_scope_match — uses the same term/info.* idiom as _build_es_user_filter.
-    A tenant-less/anonymous locked-mode viewer sees only public (never global).
-    """
-    if viewer is None:
-        return None
-    from lib.cuckoo.common.tenancy import multitenancy_config
-
-    cfg = multitenancy_config()
-    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
-        return None
-    shoulds = [{"term": {"info.visibility": "public"}}]
-    if getattr(viewer, "tenant_id", None) is not None:
-        shoulds.append({"bool": {"filter": [
-            {"term": {"info.tenant_id": viewer.tenant_id}},
-            {"term": {"info.visibility": "tenant"}},
-        ]}})
-    if getattr(viewer, "user_id", None) is not None:
-        shoulds.append({"term": {"info.user_id": viewer.user_id}})
-    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+# The viewer-scope query builders live in the pure tenancy module (single source
+# of truth, shared with cape_utils & co); keep the _-prefixed local aliases so the
+# in-module callers (perform_search, top_detections) are unchanged.
+from lib.cuckoo.common.tenancy import viewer_scope_match as _viewer_scope_match  # noqa: E402
+from lib.cuckoo.common.tenancy import viewer_scope_es_filter as _viewer_scope_es_filter  # noqa: E402
 
 
 def perform_search(

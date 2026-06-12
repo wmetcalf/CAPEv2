@@ -510,7 +510,12 @@ class TasksMixIn:
                 # On huge loads this just become a bottleneck
                 config = False
                 if web_conf.general.check_config_exists:
-                    config = static_config_lookup(file)
+                    # Scope the dedup lookup to the submitter's entitled analyses
+                    # so it can't return another tenant's task id / config-exists
+                    # inference for a known hash. No-op for MT-disabled / shared.
+                    from lib.cuckoo.common.tenancy import Viewer as _Viewer
+
+                    config = static_config_lookup(file, viewer=_Viewer(user_id=user_id or None, tenant_id=tenant_id))
                     if config:
                         task_ids.append(config["id"])
                     else:
