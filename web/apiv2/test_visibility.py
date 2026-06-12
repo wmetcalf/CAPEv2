@@ -449,3 +449,31 @@ def test_viewer_scope_match_locked_vs_disabled(monkeypatch):
     assert web_utils._viewer_scope_match(v) is None
     # no viewer -> no filter
     assert web_utils._viewer_scope_match(None) is None
+
+
+def test_viewer_scope_es_filter_locked_vs_disabled(monkeypatch):
+    """ES analogue of the scope helper: locked-mode tenant viewer gets a
+    public/own-tenant/mine bool-should; break-glass / disabled / None -> no
+    filter (so the ES search branches are scoped the same as the mongo ones)."""
+    from lib.cuckoo.common import web_utils
+    from lib.cuckoo.common.tenancy import Viewer, MTConfig
+    import lib.cuckoo.common.tenancy as t
+
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(True, "locked", "", True))
+    v = Viewer(user_id=2, tenant_id=10)
+    f = web_utils._viewer_scope_es_filter(v)
+    shoulds = f["bool"]["should"]
+    assert {"term": {"info.visibility": "public"}} in shoulds
+    assert {"term": {"info.user_id": 2}} in shoulds
+    assert any(c.get("bool", {}).get("filter") == [{"term": {"info.tenant_id": 10}}, {"term": {"info.visibility": "tenant"}}] for c in shoulds)
+    assert f["bool"]["minimum_should_match"] == 1
+
+    # anon/tenant-less in locked mode -> public only (never global)
+    anon = web_utils._viewer_scope_es_filter(Viewer(user_id=None, tenant_id=None))
+    assert anon["bool"]["should"] == [{"term": {"info.visibility": "public"}}]
+
+    # break-glass / disabled / None -> no filter
+    assert web_utils._viewer_scope_es_filter(Viewer(user_id=9, tenant_id=None, is_local_admin=True)) is None
+    monkeypatch.setattr(t, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    assert web_utils._viewer_scope_es_filter(v) is None
+    assert web_utils._viewer_scope_es_filter(None) is None

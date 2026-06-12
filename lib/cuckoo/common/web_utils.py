@@ -1404,6 +1404,31 @@ def _viewer_scope_match(viewer):
     return {"$or": clauses} if clauses else {"info.id": -1}
 
 
+def _viewer_scope_es_filter(viewer):
+    """Elasticsearch bool-filter clause restricting a query to the viewer's
+    entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
+    filter applies (multitenancy disabled / shared / break-glass). ES analogue of
+    _viewer_scope_match — uses the same term/info.* idiom as _build_es_user_filter.
+    A tenant-less/anonymous locked-mode viewer sees only public (never global).
+    """
+    if viewer is None:
+        return None
+    from lib.cuckoo.common.tenancy import multitenancy_config
+
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    shoulds = [{"term": {"info.visibility": "public"}}]
+    if getattr(viewer, "tenant_id", None) is not None:
+        shoulds.append({"bool": {"filter": [
+            {"term": {"info.tenant_id": viewer.tenant_id}},
+            {"term": {"info.visibility": "tenant"}},
+        ]}})
+    if getattr(viewer, "user_id", None) is not None:
+        shoulds.append({"term": {"info.user_id": viewer.user_id}})
+    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+
+
 def perform_search(
     term: str, value: str, search_limit: int = 0, user_id: int = 0, privs: bool = False, web: bool = True, projection: dict = None,
     viewer=None,
@@ -1425,10 +1450,18 @@ def perform_search(
     """
     if repconf.mongodb.enabled and repconf.elasticsearchdb.enabled and essearch and not term:
         multi_match_search = {"query": {"multi_match": {"query": value, "fields": ["*"]}}}
+        # Legacy TLP/user filter (skipped for privs) + tenant scope (applied
+        # regardless of privs — is_staff is not the tenancy break-glass).
+        es_filters = []
         if not privs:
-            user_filter = _build_es_user_filter(privs, user_id)
-            if user_filter:
-                multi_match_search = {"query": {"bool": {"must": [{"multi_match": {"query": value, "fields": ["*"]}}], "filter": [user_filter]}}}
+            uf = _build_es_user_filter(privs, user_id)
+            if uf:
+                es_filters.append(uf)
+        sf = _viewer_scope_es_filter(viewer)
+        if sf:
+            es_filters.append(sf)
+        if es_filters:
+            multi_match_search = {"query": {"bool": {"must": [{"multi_match": {"query": value, "fields": ["*"]}}], "filter": es_filters}}}
         numhits = es.search(index=get_analysis_index(), body=multi_match_search, size=0)["hits"]["total"]
         return [
             d["_source"]
@@ -1593,18 +1626,26 @@ def perform_search(
     if es_as_db:
         _source_fields = list((projection or perform_search_filters).keys())[:-1]
 
+        # Legacy TLP/user filter (skipped for privs) + tenant scope (applied
+        # regardless of privs — is_staff is not the tenancy break-glass).
+        es_filters = []
         user_filter = _build_es_user_filter(privs, user_id)
+        if user_filter:
+            es_filters.append(user_filter)
+        scope_filter = _viewer_scope_es_filter(viewer)
+        if scope_filter:
+            es_filters.append(scope_filter)
 
         if isinstance(search_term_map[term], str):
             q = {"query": {"match": {search_term_map[term]: value}}}
-            if user_filter:
-                q = {"query": {"bool": {"must": [q["query"]], "filter": [user_filter]}}}
+            if es_filters:
+                q = {"query": {"bool": {"must": [q["query"]], "filter": es_filters}}}
             return [d["_source"] for d in es.search(index=get_analysis_index(), body=q, _source=_source_fields)["hits"]["hits"]]
         else:
             queries = [{"match": {search_term: value}} for search_term in search_term_map[term]]
             q = {"query": {"bool": {"should": queries, "minimum_should_match": 1}}}
-            if user_filter:
-                q["query"]["bool"]["filter"] = [user_filter]
+            if es_filters:
+                q["query"]["bool"]["filter"] = es_filters
             return [d["_source"] for d in es.search(index=get_analysis_index(), body=q, _source=_source_fields)["hits"]["hits"]]
 
 
