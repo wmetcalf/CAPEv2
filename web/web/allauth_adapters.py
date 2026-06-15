@@ -193,11 +193,22 @@ except ImportError:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _token_claims(extra: dict) -> dict:
+    """OIDC claims may sit at the top level of extra_data OR — for allauth's
+    openid_connect provider, which stores extra_data as
+    {"id_token": <raw>, "userinfo": {...claims...}} — nested under "userinfo".
+    Return a merged view (userinfo winning) so claim lookups (groups, email, …)
+    work regardless of where the IdP surfaces them. Without this, every OIDC
+    user resolves to NO tenant/role because the claims live under "userinfo"."""
+    ui = extra.get("userinfo")
+    return {**extra, **ui} if isinstance(ui, dict) else extra
+
+
 def _extract_groups(extra: dict) -> set:
     """Return the set of IdP group names from token extra data."""
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
-    raw = extra.get(claim) or []
+    raw = _token_claims(extra).get(claim) or []
     if isinstance(raw, str):
         raw = [raw]
     elif not isinstance(raw, (list, tuple, set)):
@@ -234,7 +245,8 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     """
     changed = False
 
-    email = extra.get("email") or ""
+    claims = _token_claims(extra)
+    email = claims.get("email") or ""
     if email and user.email != email:
         user.email = email
         changed = True
@@ -244,7 +256,7 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     if admin_groups or super_groups:
         oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
         claim = oidc_cfg.get("groups_claim") or "groups"
-        if claim not in extra:
+        if claim not in claims:
             log.warning(
                 "OIDC groups claim %r absent from token for %s; skipping role reconciliation",
                 claim, user.username,
@@ -434,5 +446,5 @@ def _reconcile_sso_user_on_login(sender, request, user, **kwargs):
     # only touch tenant membership when the groups claim is actually present.
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
-    if claim in extra:
+    if claim in _token_claims(extra):
         reconcile_tenant(user, _extract_groups(extra))

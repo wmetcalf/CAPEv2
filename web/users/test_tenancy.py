@@ -219,3 +219,20 @@ def test_submission_scope(mt_enabled, monkeypatch):
     r3.data = {"visibility": "bogus"}
     with _pytest.raises(ValueError):
         ut.submission_scope(r3)
+
+
+def test_extract_groups_reads_userinfo_nested_claims():
+    """REGRESSION (live-Keycloak e2e, 2026-06-15): allauth's openid_connect
+    provider stores extra_data as {"id_token": ..., "userinfo": {...claims...}},
+    so the groups claim is nested under 'userinfo', NOT top-level. _extract_groups
+    + the login wiring must read it there — otherwise EVERY OIDC user resolves to
+    no tenant (silent MT break). The direct reconcile_tenant unit tests pass a
+    group set, so they never exercised the token-shape parsing that broke."""
+    from web.allauth_adapters import _extract_groups, _token_claims
+
+    assert _extract_groups({"groups": ["acme"]}) == {"acme"}  # top-level (flat providers)
+    # the real allauth openid_connect shape — groups nested under userinfo
+    assert _extract_groups({"id_token": "x", "userinfo": {"groups": ["acme", "acme-admins"]}}) == {"acme", "acme-admins"}
+    assert _extract_groups({"id_token": "x", "userinfo": {"sub": "1"}}) == set()  # absent -> fail-closed
+    # merged view surfaces nested claims (email + groups) for role/email reconciliation
+    assert _token_claims({"userinfo": {"email": "a@x", "groups": ["g"]}}).get("email") == "a@x"
