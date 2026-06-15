@@ -93,3 +93,60 @@ def test_compare_left_es_backend_filters_cross_tenant(cape_db, mt_enabled, monke
     # the foreign tenant's analysis (task 2) must NOT survive the post-filter
     assert all(rec.get("info", {}).get("id") != 2 for rec in captured.get("records", []))
     assert captured.get("records") == []
+
+
+# --- T8: compare.hash (md5-pivot) cross-tenant denial ---
+
+@pytest.mark.django_db
+def test_compare_hash_denies_cross_tenant_seed(cape_db, mt_enabled, monkeypatch, client):
+    """compare.hash pivots on an attacker-supplied right_hash; the SEED gate must
+    deny a viewer who can't read the left analysis (hidden == "No analysis found").
+    Sibling both/left have HTTP tests; hash() did not."""
+    import compare.views as cv
+
+    class FakeDB:
+        def view_task(self, tid):
+            return ForeignTask()
+
+    monkeypatch.setattr(cv, "Database", lambda: FakeDB())
+    client.force_login(User.objects.create_user("ch", "ch@x.com", "x"))  # tenant-less
+    r = client.get("/compare/1/" + "a" * 32 + "/")
+    assert r.status_code == 200
+    assert b"No analysis found" in r.content
+
+
+@pytest.mark.django_db
+def test_compare_hash_es_backend_filters_cross_tenant(cape_db, mt_enabled, monkeypatch, client):
+    """The ES backend of compare.hash must post-filter the md5-pivot hits through
+    can_view_task (the mongo $match isn't applied there). A cross-tenant private
+    hit must be dropped from the rendered comparison."""
+    import compare.views as cv
+
+    def _view(tid):
+        return _public_task(1) if int(tid) == 1 else ForeignTask()
+
+    class FakeDB:
+        view_task = staticmethod(_view)
+
+    class FakeES:
+        def search(self, index=None, query=None, body=None):
+            if body is not None:  # md5 pivot
+                return {"hits": {"hits": [{"_source": {"info": {"id": 2}, "target": {}}}]}}
+            # seed lookup by info.id
+            return {"hits": {"hits": [{"_source": {"info": {"id": 1}, "target": {"file": {"md5": "abc"}}}}]}}
+
+    monkeypatch.setattr(cv, "Database", lambda: FakeDB())
+    monkeypatch.setattr(cv, "es_as_db", True, raising=False)
+    monkeypatch.setattr(cv, "es", FakeES(), raising=False)
+    monkeypatch.setattr(cv, "enabledconf", {"mongodb": False, "elasticsearchdb": True}, raising=False)
+    monkeypatch.setattr(cv, "get_analysis_index", lambda: "idx", raising=False)
+    monkeypatch.setattr(cv, "get_query_by_info_id", lambda i: {}, raising=False)
+
+    captured = {}
+    real_render = cv.render
+    monkeypatch.setattr(cv, "render", lambda req, tmpl, ctx=None: captured.update(ctx or {}) or real_render(req, tmpl, ctx))
+    client.force_login(User.objects.create_user("che", "che@x.com", "x"))
+
+    r = client.get("/compare/1/" + "a" * 32 + "/")
+    assert r.status_code == 200
+    assert captured.get("records") == []   # foreign-tenant pivot hit (task 2) dropped

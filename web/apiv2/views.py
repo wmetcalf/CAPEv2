@@ -80,6 +80,29 @@ def _deny_by_hash(request, *, sha256=None, sha1=None, md5=None, sample_id=None):
     return Response({"error": True, "error_value": "Sample not found"}, status=404)
 
 
+def _reauthorize_rtid(request, task_id, check):
+    """validate_task() transparently resolves a TASK_RECOVERED task
+    (custom="Recovery_<N>") to its underlying task N, returned as check["rtid"].
+    The caller's _deny_if_hidden ran on the recovery WRAPPER, not on N — so a
+    viewer who can see the wrapper but not N would otherwise read N's analysis
+    across the tenant boundary. Re-authorize the resolved task before serving it.
+    Returns (task_id_to_serve, denial_Response_or_None).
+
+    validate_task() only emits rtid when it resolved to a DIFFERENT underlying
+    task (web_utils sets rtid iff tid != task_id), so a present rtid always means
+    "switch tasks" — re-gate unconditionally. Do NOT guard with `rtid != task_id`:
+    rtid is an int while task_id is the raw URL string, so that comparison is a
+    no-op today and would become a silent re-auth bypass the moment a caller
+    pre-coerces task_id to int."""
+    rtid = check.get("rtid", 0)
+    if rtid:
+        denied = _deny_if_hidden(request, db.view_task(rtid))
+        if denied is not None:
+            return task_id, denied
+        return rtid, None
+    return task_id, None
+
+
 @api_view(["PATCH"])
 def tasks_set_visibility(request, task_id):
     """Owner (or tenant-admin for public/tenant jobs, or superuser) re-toggles a
@@ -459,7 +482,7 @@ def tasks_create_file(request):
                     else:
                         details["error"].append({os.path.basename(tmp_path): "Failed to convert SAZ to PCAP"})
                         continue
-                task_id = db.add_pcap(file_path=tmp_path)
+                task_id = db.add_pcap(file_path=tmp_path, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
                 details["task_ids"].append(task_id)
                 continue
             if static:
@@ -1037,6 +1060,11 @@ def tasks_view(request, task_id):
         if m:
             task_id = int(m.group("taskid"))
             task = db.view_task(task_id, details=True)
+            # T12: re-authorize the RESOLVED recovery target — the gate above ran
+            # on the wrapper, not on this task (cross-tenant recovery-chain leak).
+            _rdenied = _deny_if_hidden(request, task)
+            if _rdenied is not None:
+                return _rdenied
             resp["error"] = []
             if task:
                 entry = task.to_dict()
@@ -1314,9 +1342,9 @@ def tasks_report(request, task_id, report_format="json", make_zip=False):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     resp = {}
 
@@ -1501,9 +1529,9 @@ def tasks_iocs(request, task_id, detail=None):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     buf = {}
     if repconf.mongodb.get("enabled") and not buf:
@@ -1738,9 +1766,9 @@ def tasks_screenshot(request, task_id, screenshot="all"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "shots")
     if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
@@ -1794,9 +1822,9 @@ def tasks_pcap(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "dump.pcap")
     if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
@@ -1833,9 +1861,9 @@ def _resolve_task_id(request, task_id, enabled_key, check_tlp=True):
         return None, Response(check)
     if check_tlp and (check.get("tlp") or "").lower() == "red":
         return None, Response({"error": True, "error_value": "Task has a TLP of RED"})
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return None, _rdenied
     return task_id, None
 
 
@@ -2091,9 +2119,9 @@ def tasks_evtx(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     evtxfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "evtx", "evtx.zip")
     if not os.path.normpath(evtxfile).startswith(ANALYSIS_BASE_PATH):
@@ -2122,9 +2150,9 @@ def tasks_mitmdump(request, task_id):
     check = validate_task(task_id)
     if check["error"]:
         return Response(check)
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
     harfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "mitmdump", "dump.har")
     if not os.path.normpath(harfile).startswith(ANALYSIS_BASE_PATH):
         return render(request, "error.html", {"error": f"File not found: {os.path.basename(harfile)}"})
@@ -2157,9 +2185,9 @@ def tasks_dropped(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "files")
     if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
@@ -2210,9 +2238,9 @@ def tasks_selfextracted(request, task_id, tool="all"):
     if check.get("tlp", "") in ("red", "Red"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "selfextracted")
     if not os.path.normpath(srcdir).startswith(ANALYSIS_BASE_PATH):
@@ -2312,9 +2340,9 @@ def tasks_surifile(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", "%s" % task_id, "logs", "files.zip")
     if not os.path.normpath(srcfile).startswith(ANALYSIS_BASE_PATH):
@@ -2400,9 +2428,9 @@ def tasks_procmemory(request, task_id, pid="all"):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     # Check if any process memory dumps exist
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", f"{task_id}", "memory")
@@ -2481,9 +2509,9 @@ def tasks_fullmemory(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     filename = ""
     file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory.dmp")
@@ -2700,7 +2728,7 @@ def cuckoo_status(request):
 @csrf_exempt
 @api_view(["GET"])
 def task_x_hours(request):
-    session = db.Session()
+    session = db.session()
     try:
         # Query the bounded last-24h window FIRST (a small set), then filter by
         # visibility in Python — avoids loading the whole visible set into memory
@@ -2709,7 +2737,7 @@ def task_x_hours(request):
         # between() args, which made this always return empty.)
         tasks = (
             session.query(Task)
-            .filter(Task.added_on.between(datetime.datetime.now() - datetime.timedelta(days=1), datetime.datetime.now()))
+            .filter(Task.added_on.between(datetime.now() - timedelta(days=1), datetime.now()))
             .all()
         )
         results = {}
@@ -2752,9 +2780,9 @@ def tasks_payloadfiles(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     srcdir = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "CAPE")
 
@@ -2792,9 +2820,9 @@ def tasks_procdumpfiles(request, task_id):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     # ToDo add all/one
 
@@ -2832,9 +2860,9 @@ def tasks_config(request, task_id, cape_name=False):
         return Response({"error": True, "error_value": "Task has a TLP of RED"})
 
 
-    rtid = check.get("rtid", 0)
-    if rtid:
-        task_id = rtid
+    task_id, _rdenied = _reauthorize_rtid(request, task_id, check)
+    if _rdenied is not None:
+        return _rdenied
 
     buf = {}
     if repconf.mongodb.get("enabled"):

@@ -664,7 +664,7 @@ def cuckoo_dedup_cluster_queue():
     Cleans duplicated pending tasks from cluster queue
     """
 
-    session = db.Session()
+    session = db.session()
     dist_session = create_session(repconf.distributed.db, echo=False)
     dist_db = dist_session()
     hash_dict = {}
