@@ -24,6 +24,10 @@ class CentralModeConfig:
     s3_bucket: str = ""
     s3_region: str = "us-east-1"
     s3_prefix: str = "results"  # results/<job_id>/...
+    # The report doc -> central DocumentDB write is the NATIVE mongodb.py reporting
+    # module pointed at DocumentDB via [mongodb] (tls=yes, retrywrites=no) — the
+    # write path compat/docdb_compat.py already validated against live DocumentDB.
+    # central_mode therefore only carries the FS->S3 artifact location.
 
 
 def _parse(sec) -> "CentralModeConfig":

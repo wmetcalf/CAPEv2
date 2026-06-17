@@ -3186,6 +3186,28 @@ def load_evtx_channel_count(request, task_id):
 @authentication_classes([SessionAuthentication])
 @require_task_visibility
 def file_nl(request, category, task_id, dlfile):
+    from lib.cuckoo.common.central_mode import central_mode_config
+
+    if central_mode_config().enabled:
+        # Central mode: serve from S3 via the storage seam (no local FS).
+        from lib.cuckoo.common.artifact_storage import artifact_response
+        from django.http import Http404
+
+        if category == "screenshot":
+            cands = [(os.path.join("shots", dlfile + ext), dlfile + ext, cd) for ext, cd in ((".jpg", "image/jpeg"), (".png", "image/png"))]
+        elif category == "bingraph":
+            cands = [(os.path.join("bingraph", dlfile + "-ent.svg"), dlfile + "-ent.svg", "image/svg+xml")]
+        elif category == "vba2graph":
+            cands = [(os.path.join("vba2graph", "svg", f"{dlfile}.svg"), f"{dlfile}.svg", "image/svg+xml")]
+        else:
+            return render(request, "error.html", {"error": "Category not defined"})
+        for relpath, fn, cd in cands:
+            try:
+                return artifact_response(task_id, relpath, cd, fn)
+            except Http404:
+                continue
+        return render(request, "error.html", {"error": f"Could not find {category} {dlfile}"})
+
     base_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id))
     path = False
     if category == "screenshot":
@@ -3623,13 +3645,29 @@ def filereport(request, task_id, category):
     }
 
     if category in formats:
-        path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "reports", formats[category])
+        fname = formats[category]
+
+        # Central mode: serve the report file from S3 via the FS->S3 seam. Single-node
+        # path below is unchanged (the seam returns the local file when central is off).
+        from lib.cuckoo.common.central_mode import central_mode_config
+
+        if central_mode_config().enabled:
+            from django.http import Http404
+
+            from lib.cuckoo.common.artifact_storage import artifact_response
+
+            try:
+                return artifact_response(task_id, f"reports/{fname}", "application/octet-stream", f"{task_id}_{fname}")
+            except Http404:
+                return render(request, "error.html", {"error": f"File not found: {fname}"})
+
+        path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "reports", fname)
 
         if not _path_safe(path) or not path_exists(path):
-            return render(request, "error.html", {"error": f"File not found: {formats[category]}"})
+            return render(request, "error.html", {"error": f"File not found: {fname}"})
 
         response = HttpResponse(Path(path).read_bytes(), content_type="application/octet-stream")
-        response["Content-Disposition"] = f"attachment; filename={task_id}_{formats[category]}"
+        response["Content-Disposition"] = f"attachment; filename={task_id}_{fname}"
         return response
 
     return render(request, "error.html", {"error": "File not found"}, status=404)
@@ -4330,40 +4368,19 @@ def hunt(request):
         start_date = (datetime.datetime.utcnow() - delta).strftime("%Y-%m-%d %H:%M:%S")
         match_query["info.started"] = {"$gte": start_date}
 
-    # Dynamic multi-category aggregation
-    facet_stages = {}
-    for cat_id, cat_config in HUNT_MAP.items():
-        if categories[cat_id]:
-            stages = []
-            if cat_config["db_unwind"]:
-                stages.append({"$unwind": cat_config["db_unwind"]})
-            stages.extend([
-                {"$group": {"_id": cat_config["db_group"], "count": {"$sum": 1}, "task_ids": {"$addToSet": "$info.id"}}},
-                {"$match": cat_config.get("db_match", {"count": {"$gte": min_count}})},
-                {"$sort": {"count": -1}},
-                {"$limit": 100}
-            ])
-            facet_stages[cat_id] = stages
-
-    # MongoDB Pipeline using $facet for multi-category aggregation.
-    # Tenant isolation: restrict the docs the $facet/$group sees to the viewer's
-    # entitled scopes (no-op for break-glass / shared / multitenancy-disabled).
+    # Tenant isolation: restrict the docs the per-category $group sees to the
+    # viewer's entitled scopes (no-op for break-glass / shared / multitenancy-disabled).
     from dashboard.views import entitled_scope_filter
+    from lib.cuckoo.common.hunt_query import build_hunt_facets
 
     _scope = entitled_scope_filter(request.user)
     _match = {"$and": [match_query, _scope]} if _scope else match_query
-    pipeline = [
-        {"$match": _match}
-    ]
-    if facet_stages:
-        pipeline.append({"$facet": facet_stages})
 
     try:
-        if facet_stages:
-            res = list(mongo_aggregate("analysis", pipeline))
-            facets = res[0] if res else {}
-        else:
-            facets = {}
+        # Per-category $group loop (NOT a single $facet): Amazon DocumentDB rejects
+        # $facet, so central mode requires this; single-node behavior is identical
+        # (same match, same scope, same per-category stages, same result shape).
+        facets = build_hunt_facets(mongo_aggregate, _match, HUNT_MAP, categories, min_count)
     except Exception as e:
         return render(request, "error.html", {"error": f"Threat hunting aggregation failed: {e}"})
 
