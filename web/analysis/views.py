@@ -3191,8 +3191,13 @@ def file_nl(request, category, task_id, dlfile):
     if central_mode_config().enabled:
         # Central mode: serve from S3 via the storage seam (no local FS).
         from lib.cuckoo.common.artifact_storage import artifact_response
+        from dashboard.views import entitled_scope_filter
         from django.http import Http404
 
+        # require_task_visibility already authorized the relational task; thread the
+        # viewer's tenant scope into the S3/DocumentDB lookup as defence-in-depth
+        # against task_id collisions across workers (audit HIGH).
+        scope = entitled_scope_filter(request.user)
         if category == "screenshot":
             cands = [(os.path.join("shots", dlfile + ext), dlfile + ext, cd) for ext, cd in ((".jpg", "image/jpeg"), (".png", "image/png"))]
         elif category == "bingraph":
@@ -3203,7 +3208,7 @@ def file_nl(request, category, task_id, dlfile):
             return render(request, "error.html", {"error": "Category not defined"})
         for relpath, fn, cd in cands:
             try:
-                return artifact_response(task_id, relpath, cd, fn)
+                return artifact_response(task_id, relpath, cd, fn, scope=scope)
             except Http404:
                 continue
         return render(request, "error.html", {"error": f"Could not find {category} {dlfile}"})
@@ -3654,10 +3659,12 @@ def filereport(request, task_id, category):
         if central_mode_config().enabled:
             from django.http import Http404
 
+            from dashboard.views import entitled_scope_filter
             from lib.cuckoo.common.artifact_storage import artifact_response
 
+            scope = entitled_scope_filter(request.user)  # tenant-scope the central lookup (audit HIGH)
             try:
-                return artifact_response(task_id, f"reports/{fname}", "application/octet-stream", f"{task_id}_{fname}")
+                return artifact_response(task_id, f"reports/{fname}", "application/octet-stream", f"{task_id}_{fname}", scope=scope)
             except Http404:
                 return render(request, "error.html", {"error": f"File not found: {fname}"})
 
@@ -4368,19 +4375,40 @@ def hunt(request):
         start_date = (datetime.datetime.utcnow() - delta).strftime("%Y-%m-%d %H:%M:%S")
         match_query["info.started"] = {"$gte": start_date}
 
-    # Tenant isolation: restrict the docs the per-category $group sees to the
-    # viewer's entitled scopes (no-op for break-glass / shared / multitenancy-disabled).
+    # Tenant isolation: restrict the docs the aggregation sees to the viewer's
+    # entitled scopes (no-op for break-glass / shared / multitenancy-disabled).
     from dashboard.views import entitled_scope_filter
+    from lib.cuckoo.common.central_mode import central_mode_config
     from lib.cuckoo.common.hunt_query import build_hunt_facets
 
     _scope = entitled_scope_filter(request.user)
     _match = {"$and": [match_query, _scope]} if _scope else match_query
 
     try:
-        # Per-category $group loop (NOT a single $facet): Amazon DocumentDB rejects
-        # $facet, so central mode requires this; single-node behavior is identical
-        # (same match, same scope, same per-category stages, same result shape).
-        facets = build_hunt_facets(mongo_aggregate, _match, HUNT_MAP, categories, min_count)
+        if central_mode_config().enabled:
+            # Amazon DocumentDB rejects $facet -> per-category $group loop. Same
+            # result shape as the single-node $facet path below.
+            facets = build_hunt_facets(mongo_aggregate, _match, HUNT_MAP, categories, min_count)
+        else:
+            # Single-node: preserve the original single-$facet pipeline byte-for-byte
+            # (only the toggle changes single-node behavior).
+            facet_stages = {}
+            for cat_id, cat_config in HUNT_MAP.items():
+                if categories[cat_id]:
+                    stages = []
+                    if cat_config["db_unwind"]:
+                        stages.append({"$unwind": cat_config["db_unwind"]})
+                    stages.extend([
+                        {"$group": {"_id": cat_config["db_group"], "count": {"$sum": 1}, "task_ids": {"$addToSet": "$info.id"}}},
+                        {"$match": cat_config.get("db_match", {"count": {"$gte": min_count}})},
+                        {"$sort": {"count": -1}},
+                        {"$limit": 100},
+                    ])
+                    facet_stages[cat_id] = stages
+            facets = {}
+            if facet_stages:
+                res = list(mongo_aggregate("analysis", [{"$match": _match}, {"$facet": facet_stages}]))
+                facets = res[0] if res else {}
     except Exception as e:
         return render(request, "error.html", {"error": f"Threat hunting aggregation failed: {e}"})
 

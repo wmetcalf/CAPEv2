@@ -14,13 +14,33 @@ def _local_analysis_path(task_id, relpath):
     return os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), relpath)
 
 
-def _job_id_for_task(task_id):
+def _safe_relpath(relpath):
+    """Reject traversal/absolute/backslash before a relpath becomes an S3 key
+    segment. Callers today pass regex-constrained (\\w+) or fixed relpaths, but this
+    keeps the seam safe independent of caller discipline (audit MEDIUM-1)."""
+    from django.http import Http404
+
+    if not relpath or relpath.startswith("/") or "\\" in relpath or ".." in relpath.split("/"):
+        raise Http404(f"invalid artifact path: {relpath!r}")
+    return relpath
+
+
+def _job_id_for_task(task_id, scope=None):
     """Central mode keys S3 by the global job_id (the broker passes it in custom,
-    stamped into info.job_id at reporting). Resolve task_id -> job_id via mongo."""
+    stamped into info.job_id at reporting). Resolve task_id -> job_id via mongo.
+
+    `scope` is the requesting viewer's tenant filter (e.g. entitled_scope_filter):
+    info.id is a per-worker sequence and collides across workers in a central
+    deployment, so the lookup is ANDed with the viewer's scope to guarantee the
+    resolved doc is one the viewer may actually see — not another tenant's analysis
+    that happens to share the numeric id (audit HIGH: cross-store id collision)."""
     from dev_utils.mongodb import mongo_find_one
     from django.http import Http404
 
-    doc = mongo_find_one("analysis", {"info.id": int(task_id)}, {"info.job_id": 1})
+    query = {"info.id": int(task_id)}
+    if scope:
+        query = {"$and": [query, scope]}
+    doc = mongo_find_one("analysis", query, {"info.job_id": 1})
     job_id = (doc or {}).get("info", {}).get("job_id")
     if not job_id:
         raise Http404("no job_id mapping for task")
@@ -42,8 +62,12 @@ def _file_iter(path, chunk):
             yield data
 
 
-def artifact_response(task_id, relpath, content_type, filename, chunk=8192):
-    """Return a Django streaming response for an analysis artifact, local or S3."""
+def artifact_response(task_id, relpath, content_type, filename, chunk=8192, scope=None):
+    """Return a Django streaming response for an analysis artifact, local or S3.
+
+    `scope`: the requesting viewer's tenant filter, threaded into the central
+    task_id->job_id lookup so a viewer can't pull another tenant's artifact via an
+    id collision (see _job_id_for_task)."""
     from django.http import StreamingHttpResponse, Http404
 
     cfg = central_mode_config()
@@ -56,7 +80,7 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192):
         resp["Content-Disposition"] = f"attachment; filename={filename}"
         return resp
 
-    key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id)}/{relpath}"
+    key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
     try:
         obj = _s3_client(cfg.s3_region).get_object(Bucket=cfg.s3_bucket, Key=key)
     except Exception:
@@ -68,7 +92,7 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192):
     return resp
 
 
-def read_artifact_text(task_id, relpath, max_bytes=100000):
+def read_artifact_text(task_id, relpath, max_bytes=100000, scope=None):
     """Read a text artifact (e.g. process.log), local or S3, truncated to max_bytes."""
     cfg = central_mode_config()
     if not cfg.enabled:
@@ -78,7 +102,7 @@ def read_artifact_text(task_id, relpath, max_bytes=100000):
         with open(path, "r", errors="replace") as f:
             data = f.read(max_bytes + 1)
     else:
-        key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id)}/{relpath}"
+        key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
         try:
             obj = _s3_client(cfg.s3_region).get_object(Bucket=cfg.s3_bucket, Key=key, Range=f"bytes=0-{max_bytes}")
             data = obj["Body"].read().decode("utf-8", errors="replace")

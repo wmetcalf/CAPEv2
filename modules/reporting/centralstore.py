@@ -14,12 +14,19 @@ plus the job_id keying the read seam (artifact_storage.artifact_response) resolv
 """
 import logging
 import os
+import re
 
 from lib.cuckoo.common.abstracts import Report
 from lib.cuckoo.common.central_mode import central_mode_config
 from lib.cuckoo.common.exceptions import CuckooReportError
 
 log = logging.getLogger(__name__)
+
+# job_id becomes an S3 key segment, so it must not contain path separators or
+# traversal. The broker should stamp an authenticated job_id; this is the last
+# line of defence against a tenant-supplied `custom` poisoning another job's
+# prefix (audit CRITICAL-1). local-<int> fallback satisfies the allowlist.
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 # Upload the whole analysis tree to S3 (the "heavy detail" tier): shots, dropped
 # files, pcap, procdump, AND reports/ (report.json/html/pdf are downloadable
@@ -64,6 +71,10 @@ class CentralStore(Report):
         info = results.setdefault("info", {})
         analysis_id = info.get("id")
         job_id = info.get("job_id") or resolve_job_id(info.get("custom"), analysis_id)
+        if not _JOB_ID_RE.match(job_id):
+            # Refuse a job_id that could escape/poison another job's S3 prefix.
+            raise CuckooReportError(
+                "centralstore: refusing unsafe job_id %r (must match %s)" % (job_id, _JOB_ID_RE.pattern))
         info["job_id"] = job_id  # carried into the DocumentDB doc; read seam keys S3 by it
 
         try:
@@ -81,11 +92,19 @@ class CentralStore(Report):
         if not base or not os.path.isdir(base):
             log.warning("centralstore: analysis_path missing or not a dir: %s", base)
             return 0
+        base_real = os.path.realpath(base)
         count = 0
         for root, dirs, files in os.walk(base):
-            dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS]
+            # don't descend symlinked dirs; drop excluded dirs
+            dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS and not os.path.islink(os.path.join(root, d))]
             for fn in files:
                 full = os.path.join(root, fn)
+                # Skip symlinks and anything that resolves outside the analysis tree:
+                # artifacts are partly sample-influenced; a planted symlink (e.g. to
+                # ~/.aws/credentials) would otherwise be read + exfiltrated to S3.
+                if os.path.islink(full) or not os.path.realpath(full).startswith(base_real + os.sep):
+                    log.warning("centralstore: skipping symlink/out-of-tree artifact %s", full)
+                    continue
                 rel = os.path.relpath(full, base)
                 key = f"{prefix}/{job_id}/{rel}"
                 try:
