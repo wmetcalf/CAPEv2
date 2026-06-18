@@ -52,9 +52,15 @@ def index(request, task_id, session_data):
     if machinery not in machinery_available:
         return _error(request, task_id, f"Machinery type '{machinery}' is not supported")
 
+    # Central mode: a broker-dispatched job's VM is on a worker — check that
+    # worker's libvirt. None => local (single-node), DSN unchanged.
+    from lib.cuckoo.common.central_guac import libvirt_dsn_for_task
+
+    dsn, _worker_ip = libvirt_dsn_for_task(int(task_id), machinery_dsn)
+
     conn = None
     try:
-        conn = libvirt.open(machinery_dsn)
+        conn = libvirt.open(dsn)
         if not conn:
             return _error(request, task_id, "Could not connect to hypervisor")
 

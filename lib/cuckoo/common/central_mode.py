@@ -24,6 +24,9 @@ class CentralModeConfig:
     s3_bucket: str = ""
     s3_region: str = "us-east-1"
     s3_prefix: str = "results"  # results/<job_id>/...
+    # Broker job-tracking DynamoDB table — lets the central node resolve a live
+    # job to the worker hosting its VM (interactive Guacamole worker routing).
+    broker_table: str = ""
     # The report doc -> central DocumentDB write is the NATIVE mongodb.py reporting
     # module pointed at DocumentDB via [mongodb] (tls=yes, retrywrites=no) — the
     # write path compat/docdb_compat.py already validated against live DocumentDB.
@@ -38,6 +41,7 @@ def _parse(sec) -> "CentralModeConfig":
         s3_bucket=str(get("s3_bucket", "") or ""),
         s3_region=str(get("s3_region", "us-east-1") or "us-east-1"),
         s3_prefix=str(get("s3_prefix", "results") or "results"),
+        broker_table=str(get("broker_table", "") or ""),
     )
 
 

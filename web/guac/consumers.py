@@ -31,13 +31,15 @@ TASK_POLL_INTERVAL = 10
 ACTIVE_GUAC_TASK_STATUSES = ("pending", "running")
 
 
-def _get_vnc_port(vm_label):
-    """Look up VNC port for a VM from libvirt. Must be called from sync context."""
+def _get_vnc_port(vm_label, dsn=machinery_dsn):
+    """Look up VNC port for a VM from libvirt. Must be called from sync context.
+    `dsn` is the local hypervisor for single-node, or a worker's libvirt-over-SSH
+    in central mode (the VM lives on the worker hosting the job)."""
     if not LIBVIRT_AVAILABLE:
         return None
     conn = None
     try:
-        conn = libvirt.open(machinery_dsn)
+        conn = libvirt.open(dsn)
         if not conn:
             return None
         dom = conn.lookupByName(vm_label)
@@ -165,8 +167,15 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                     await self.close()
                     return
 
-            # 4. Look up VNC port server-side from libvirt
-            vnc_port = await sync_to_async(_get_vnc_port)(vm_label)
+            # 4. Central mode: a broker-dispatched job's VM lives on a worker, so
+            # resolve that worker and look up the VNC port from ITS libvirt; the
+            # guac tunnel then targets the worker's guacd. None => local (single-node).
+            from lib.cuckoo.common.central_guac import libvirt_dsn_for_task
+
+            vnc_dsn, worker_ip = await sync_to_async(libvirt_dsn_for_task)(self.guac_task_id, machinery_dsn)
+
+            # 4b. Look up VNC port server-side from libvirt (local or worker)
+            vnc_port = await sync_to_async(_get_vnc_port)(vm_label, vnc_dsn)
             if not vnc_port:
                 logger.warning(
                     "WebSocket rejected: no VNC port for VM %s", vm_label
@@ -174,8 +183,9 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                 await self.close()
                 return
 
-            # 5. Parse config
-            guacd_hostname = web_cfg.guacamole.guacd_host or "localhost"
+            # 5. Parse config. Central mode: target the WORKER's guacd (which
+            # reaches the VM's VNC on its own localhost); single-node uses configured guacd.
+            guacd_hostname = worker_ip or web_cfg.guacamole.guacd_host or "localhost"
             guacd_port = int(web_cfg.guacamole.guacd_port) or 4822
             guacd_recording_path = web_cfg.guacamole.guacd_recording_path or ""
             guest_protocol = web_cfg.guacamole.guest_protocol or "vnc"
@@ -205,7 +215,9 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                     "disable-theming": "true",
                 }
             else:
-                guest_host = web_cfg.guacamole.vnc_host or "localhost"
+                # Central: the worker's guacd reaches its VM's VNC on its own
+                # localhost; single-node uses the configured vnc_host.
+                guest_host = "localhost" if worker_ip else (web_cfg.guacamole.vnc_host or "localhost")
                 guest_port = vnc_port
                 ignore_cert = "false"
                 vnc_color_depth = str(
