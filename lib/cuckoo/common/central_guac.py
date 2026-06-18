@@ -48,4 +48,9 @@ def libvirt_dsn_for_task(task_id, local_dsn):
     worker-hosted task, else the local DSN. (Requires the central node's cape user
     to hold an SSH key authorized on workers — deploy-time plumbing.)"""
     ip = worker_ip_for_task(task_id)
-    return (f"qemu+ssh://cape@{ip}/system", ip) if ip else (local_dsn, None)
+    if not ip:
+        return (local_dsn, None)
+    # cape's baked SSH key authorizes the central node onto workers; no_verify skips
+    # host-key prompts for ephemeral in-VPC workers.
+    dsn = f"qemu+ssh://cape@{ip}/system?keyfile=/home/cape/.ssh/id_ed25519&no_verify=1"
+    return (dsn, ip)
