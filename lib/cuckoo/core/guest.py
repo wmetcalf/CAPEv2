@@ -337,17 +337,8 @@ class GuestManager:
             # Use the correct os.sep in the filepath based on what OS this file is destined for
             if self.platform == "windows":
                 filepath = ntpath.join(self.determine_temp_path(), options["file_name"])
-                parent = ntpath.dirname(filepath)
             else:
                 filepath = os.path.join(self.determine_temp_path(), options["file_name"])
-                parent = os.path.dirname(filepath)
-            # file_name was prefixed with the task-id subdirectory above, so the sample
-            # lands in <TEMP>/<task_id>/. The agent's /store does a bare open(filepath)
-            # with NO makedirs, so that subdir must exist first or the write 500s with
-            # FileNotFoundError (breaks every file analysis; URL tasks skip this path).
-            # Create it via the agent's /mkdir (os.makedirs(..., exist_ok=True)).
-            if parent:
-                self.post("/mkdir", data={"dirpath": parent})
             data = {"filepath": filepath}
             files = {
                 "file": ("sample.bin", open(sample_path, "rb")),
