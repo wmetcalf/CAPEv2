@@ -3189,29 +3189,9 @@ def file_nl(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        # Central mode: serve from S3 via the storage seam (no local FS).
-        from lib.cuckoo.common.artifact_storage import artifact_response
-        from dashboard.views import entitled_scope_filter
-        from django.http import Http404
+        from web.analysis.central_views import central_file_nl
 
-        # require_task_visibility already authorized the relational task; thread the
-        # viewer's tenant scope into the S3/DocumentDB lookup as defence-in-depth
-        # against task_id collisions across workers (audit HIGH).
-        scope = entitled_scope_filter(request.user)
-        if category == "screenshot":
-            cands = [(os.path.join("shots", dlfile + ext), dlfile + ext, cd) for ext, cd in ((".jpg", "image/jpeg"), (".png", "image/png"))]
-        elif category == "bingraph":
-            cands = [(os.path.join("bingraph", dlfile + "-ent.svg"), dlfile + "-ent.svg", "image/svg+xml")]
-        elif category == "vba2graph":
-            cands = [(os.path.join("vba2graph", "svg", f"{dlfile}.svg"), f"{dlfile}.svg", "image/svg+xml")]
-        else:
-            return render(request, "error.html", {"error": "Category not defined"})
-        for relpath, fn, cd in cands:
-            try:
-                return artifact_response(task_id, relpath, cd, fn, scope=scope)
-            except Http404:
-                continue
-        return render(request, "error.html", {"error": f"Could not find {category} {dlfile}"})
+        return central_file_nl(request, category, task_id, dlfile)
 
     base_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id))
     path = False
@@ -3326,72 +3306,6 @@ def _file_search_all_files(search_category: str, search_term: str, request) -> l
     return list(set(path))
 
 
-def _file_central_response(request, category, task_id, dlfile):
-    """Central-mode branch of the file() download view: serve the artifact from S3
-    via the storage seam instead of the local FS. Maps each category to its
-    analysis-relative path — the same layout centralstore uploads to
-    s3://<bucket>/results/<job_id>/<relpath>. On-the-fly bundles (zip_categories,
-    pcapng) and search-driven *zipall sets aren't materialized in S3, so they return
-    a clear central-mode error rather than a silent 404 (no silent truncation)."""
-    from lib.cuckoo.common.artifact_storage import artifact_response
-    from dashboard.views import entitled_scope_filter
-    from django.http import Http404
-
-    OCTET = "application/octet-stream"
-    PCAP = "application/vnd.tcpdump.pcap"
-
-    if category in ("sample", "static"):
-        # by-hash sample download: enforce the SAME visible-task-referencing-the-sample
-        # boundary as single-node (audit CRITICAL). The analysis sample is uploaded as
-        # <job_id>/binary; dropped-by-hash is a documented follow-on (not served here).
-        if not can_view_sample(request.user, sha256=dlfile):
-            return render(request, "error.html", {"error": "File not found"})
-        spec = ("binary", dlfile, OCTET)
-    elif category == "dropped":
-        spec = (f"files/{dlfile}", dlfile, OCTET)
-    elif category.startswith("CAPE") and category not in zip_categories:
-        spec = (f"CAPE/{dlfile}", dlfile, OCTET)
-    elif category == "pcap":
-        spec = ("dump.pcap", f"{dlfile}.pcap", PCAP)
-    elif category == "decrypted_pcap":
-        spec = ("dump_decrypted.pcap", f"{dlfile}.pcap", PCAP)
-    elif category == "mixed_pcap":
-        spec = ("dump_mixed.pcap", f"{dlfile}.pcap", PCAP)
-    elif category == "debugger_log":
-        spec = (f"debugger/{dlfile}.log", f"{dlfile}.log", "text/plain")
-    elif category.startswith("procdump") and category not in zip_categories:
-        spec = (f"procdump/{dlfile}", dlfile, OCTET)
-    elif category in ("memdump", "memdumpstrings"):
-        ext = ".dmp" if category == "memdump" else ".dmp.strings"
-        spec = (f"memory/{dlfile}{ext}", f"{dlfile}{ext}", OCTET)
-    elif category == "rtf":
-        spec = (f"rtf_objects/{dlfile}", dlfile, OCTET)
-    elif category == "usage":
-        spec = ("aux/usage.svg", "usage.svg", "image/svg+xml")
-    elif category == "suricata":
-        spec = (f"logs/files/{dlfile}", dlfile, OCTET)
-    elif category == "zip":  # suricata dropped files bundle (pre-existing in tree)
-        spec = ("logs/files.zip", "files.zip", "application/zip")
-    elif category == "tlskeys":
-        spec = ("tlsdump/tlsdump.log", "tlsdump.log", "text/plain")
-    elif category == "sysmon":
-        spec = ("sysmon/sysmon.data", "sysmon.data", OCTET)
-    elif category == "evtx":
-        spec = ("evtx/evtx.zip", f"{task_id}_evtx.zip", "application/zip")
-    elif category == "mitmdump":
-        spec = ("mitmdump/dump.har", "dump.har", "text/plain")
-    else:
-        return render(request, "error.html", {
-            "error": f"'{category}' is not yet available in central mode (server-side bundle/generated artifact)"})
-
-    relpath, fn, cd = spec
-    scope = entitled_scope_filter(request.user)
-    try:
-        return artifact_response(task_id, relpath, cd, f"{task_id}_{fn}", scope=scope)
-    except Http404:
-        return render(request, "error.html", {"error": f"Could not find {category} {dlfile}"})
-
-
 @require_safe
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 @csrf_exempt
@@ -3406,7 +3320,9 @@ def file(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        return _file_central_response(request, category, task_id, dlfile)
+        from web.analysis.central_views import central_file
+
+        return central_file(request, category, task_id, dlfile)
 
     file_name = dlfile
     cd = "application/octet-stream"
@@ -3632,26 +3548,11 @@ def procdump(request, task_id, process_id, start, end, zipped=False):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        # Central: the proc memory dump is sliced by chunk offsets below, so it needs a
-        # real local file — stream memory/<origname> (or its .zip) from S3 to a temp,
-        # reusing tmp_file_path so the existing cleanup unlinks it.
-        from lib.cuckoo.common.artifact_storage import materialize_artifact
-        from dashboard.views import entitled_scope_filter
+        from web.analysis.central_views import central_open_procdump
 
-        scope = entitled_scope_filter(request.user)
-        dumpfile, is_temp = materialize_artifact(task_id, f"memory/{origname}", scope=scope)
-        if dumpfile and is_temp:
-            tmp_file_path = dumpfile
+        dumpfile, tmp_file_path, tmpdir = central_open_procdump(request, task_id, origname)
         if not dumpfile:
-            zpath, zt = materialize_artifact(task_id, f"memory/{origname}.zip", scope=scope)
-            if not zpath:
-                return render(request, "error.html", {"error": "File not found"})
-            tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=settings.TEMP_PATH)
-            with zipfile.ZipFile(zpath, "r") as f:
-                tmp_file_path = f.extract(origname, path=tmpdir)
-            if zt:
-                os.unlink(zpath)
-            dumpfile = tmp_file_path
+            return render(request, "error.html", {"error": "File not found"})
     else:
         dumpfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id, "memory", origname)
 
@@ -3782,17 +3683,9 @@ def full_memory_dump_file(request, analysis_number):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from lib.cuckoo.common.artifact_storage import artifact_response
-        from dashboard.views import entitled_scope_filter
-        from django.http import Http404
+        from web.analysis.central_views import central_full_memory_dump
 
-        scope = entitled_scope_filter(request.user)
-        for name in ("memory.dmp", "memory.dmp.zip"):
-            try:
-                return artifact_response(analysis_number, name, "application/octet-stream", name, scope=scope)
-            except Http404:
-                continue
-        return render(request, "error.html", {"error": "File not found"})
+        return central_full_memory_dump(request, analysis_number, ("memory.dmp", "memory.dmp.zip"))
 
     filename = False
     for name in ("memory.dmp", "memory.dmp.zip"):
@@ -3818,17 +3711,9 @@ def full_memory_dump_strings(request, analysis_number):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from lib.cuckoo.common.artifact_storage import artifact_response
-        from dashboard.views import entitled_scope_filter
-        from django.http import Http404
+        from web.analysis.central_views import central_full_memory_dump
 
-        scope = entitled_scope_filter(request.user)
-        for name in ("memory.dmp.strings", "memory.dmp.strings.zip"):
-            try:
-                return artifact_response(analysis_number, name, "application/octet-stream", name, scope=scope)
-            except Http404:
-                continue
-        return render(request, "error.html", {"error": "File not found"})
+        return central_full_memory_dump(request, analysis_number, ("memory.dmp.strings", "memory.dmp.strings.zip"))
 
     filename = None
     for name in ("memory.dmp.strings", "memory.dmp.strings.zip"):
@@ -4041,11 +3926,9 @@ def pcapstream(request, task_id, conntuple):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        # Regenerates a per-connection filtered pcap from the local dump.pcap; the full
-        # capture is downloadable via file?category=pcap. Per-connection extraction in
-        # central mode is a documented follow-on (would materialize dump.pcap + filter).
-        return render(request, "error.html", {
-            "error": "Per-connection pcap stream is not yet available in central mode — download the full pcap instead"})
+        from web.analysis.central_views import central_pcapstream
+
+        return central_pcapstream(request)
 
     src, sport, dst, dport, proto = conntuple.split(",")
     sport, dport = int(sport), int(dport)
@@ -4141,47 +4024,9 @@ def vtupload(request, category, task_id, filename, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        if not (enabledconf["vtupload"] and integrations_cfg.virustotal.apikey):
-            return render(request, "error.html", {"error": "VirusTotal upload is not enabled"})
-        from lib.cuckoo.common.artifact_storage import materialize_artifact
-        from dashboard.views import entitled_scope_filter
+        from web.analysis.central_views import central_vtupload
 
-        if category in ("sample", "static"):
-            if not can_view_sample(request.user, sha256=dlfile):
-                return render(request, "error.html", {"error": "File not found"})
-            relpath = "binary"
-        elif category == "dropped":
-            relpath = f"files/{filename}"
-        elif category in ("CAPE", "procdump"):
-            relpath = f"{category}/{filename}"
-        else:
-            return render(request, "error.html", {"error": "Category not defined"})
-
-        scope = entitled_scope_filter(request.user)
-        path, is_temp = materialize_artifact(task_id, relpath, scope=scope)
-        if not path:
-            return render(request, "error.html", {"error": "File not found"})
-        try:
-            headers = {"x-apikey": integrations_cfg.virustotal.apikey}
-            with open(path, "rb") as fh:
-                response = requests.post(
-                    "https://www.virustotal.com/api/v3/files", files={"file": (filename, fh)}, headers=headers
-                )
-            if response.ok:
-                vid = response.json().get("data", {}).get("id")
-                if vid:
-                    hashbytes, _ = base64.b64decode(vid).split(b":")
-                    return render(
-                        request, "success_vtup.html",
-                        {"permalink": "https://www.virustotal.com/gui/file/{id}".format(id=hashbytes.decode())},
-                    )
-            return render(request, "error.html", {"error": "Response code: {} - {}".format(response.status_code, response.reason)})
-        finally:
-            if is_temp:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        return central_vtupload(request, category, task_id, filename, dlfile)
 
     if enabledconf["vtupload"] and integrations_cfg.virustotal.apikey:
         try:
@@ -4285,11 +4130,9 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        # On-demand re-processing reads/writes the local analysis dir + re-runs
-        # processing modules; in central mode that's a worker/broker re-enqueue concern,
-        # not a UI-node action. Documented follow-on.
-        return render(request, "error.html", {
-            "error": "On-demand detail generation is not available in central mode (re-processing is handled by workers)"})
+        from web.analysis.central_views import central_on_demand
+
+        return central_on_demand(request)
 
     if service in CUSTOM_SERVICES:
         pass
