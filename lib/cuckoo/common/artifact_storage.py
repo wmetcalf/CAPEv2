@@ -92,6 +92,38 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192, scop
     return resp
 
 
+def materialize_artifact(task_id, relpath, scope=None):
+    """Return (local_path, is_temp) for an artifact that a caller must open as a real
+    file — random-access slicing (procdump), filtering/regeneration (pcap), or handing
+    to an external tool (VT upload). Single-node: the real local path, is_temp=False
+    (DO NOT delete it). Central: the S3 object streamed to a temp file, is_temp=True
+    (caller deletes it in a finally). Returns (None, False) if the artifact is absent."""
+    cfg = central_mode_config()
+    if not cfg.enabled:
+        path = _local_analysis_path(task_id, relpath)
+        return (path, False) if os.path.exists(path) else (None, False)
+
+    import tempfile
+
+    key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
+    try:
+        obj = _s3_client(cfg.s3_region).get_object(Bucket=cfg.s3_bucket, Key=key)
+    except Exception:
+        return (None, False)
+    fd, tmp = tempfile.mkstemp(prefix="cape_central_")
+    try:
+        with os.fdopen(fd, "wb") as f:  # closes fd even on exception
+            for chunk in obj["Body"].iter_chunks(65536):
+                f.write(chunk)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return (None, False)
+    return (tmp, True)
+
+
 def read_artifact_text(task_id, relpath, max_bytes=100000, scope=None):
     """Read a text artifact (e.g. process.log), local or S3, truncated to max_bytes."""
     cfg = central_mode_config()
