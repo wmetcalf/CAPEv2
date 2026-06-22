@@ -17,7 +17,7 @@ import os
 import re
 
 from lib.cuckoo.common.abstracts import Report
-from lib.cuckoo.common.central_mode import central_mode_config
+from lib.cuckoo.common.central_mode import central_mode_config, upload_target_realpath
 from lib.cuckoo.common.exceptions import CuckooReportError
 
 log = logging.getLogger(__name__)
@@ -83,33 +83,122 @@ class CentralStore(Report):
             raise CuckooReportError("centralstore: central mode requires boto3") from e
 
         s3 = boto3.client("s3", region_name=cfg.s3_region)
-        uploaded = self._upload_tree(s3, cfg.s3_bucket, cfg.s3_prefix, job_id)
-        log.info("centralstore: uploaded %d artifacts to s3://%s/%s/%s/",
-                 uploaded, cfg.s3_bucket, cfg.s3_prefix, job_id)
+        uploaded, failed = self._upload_tree(s3, cfg.s3_bucket, cfg.s3_prefix, job_id)
+        # Guac recordings live outside the analysis tree (top-level storage/
+        # guacrecordings/), so they need their own pass. Fold their counts in so the
+        # done marker — the cleanup purge gate — only fires once EVERYTHING this job
+        # produced (tree + binaries + any recording) is confirmed in S3.
+        rec_up, rec_failed = self._upload_guacrecordings(s3, cfg.s3_bucket, cfg.s3_prefix, job_id, analysis_id)
+        uploaded += rec_up
+        failed += rec_failed
+        log.info("centralstore: uploaded %d artifacts (%d recordings) to s3://%s/%s/%s/ (%d failed)",
+                 uploaded, rec_up, cfg.s3_bucket, cfg.s3_prefix, job_id, failed)
+
+        # Stamp a local marker ONLY when the whole tree is confirmed in S3. The worker's
+        # cape-nvme-cleanup gate keys off this file: present => artifacts are durable in
+        # the central stores => the local (ephemeral-NVMe) copy is safe to purge. On any
+        # upload failure we leave no marker, so the analysis is retained until it is
+        # re-confirmed or the worker recycles (24h) — never purged unconfirmed.
+        if failed == 0:
+            self._write_done_marker(cfg, job_id, uploaded)
+        else:
+            log.warning("centralstore: %d upload(s) failed for job_id=%s; NOT marking done "
+                        "(local copy retained for cleanup safety)", failed, job_id)
+
+    def _trusted_roots(self, base_real):
+        """Content roots a sample-influenced symlink may legitimately resolve into:
+        storage/binaries (the content-addressed sample/dropped-file store the analysis
+        dir's `binary` symlink targets) and storage/guacrecordings. base_real is
+        .../storage/analyses/<id>, so the storage root is two levels up."""
+        storage_root = os.path.dirname(os.path.dirname(base_real))
+        return [
+            os.path.realpath(os.path.join(storage_root, "binaries")),
+            os.path.realpath(os.path.join(storage_root, "guacrecordings")),
+        ]
 
     def _upload_tree(self, s3, bucket, prefix, job_id):
         base = self.analysis_path
         if not base or not os.path.isdir(base):
             log.warning("centralstore: analysis_path missing or not a dir: %s", base)
-            return 0
+            return 0, 0
         base_real = os.path.realpath(base)
+        trusted_roots = self._trusted_roots(base_real)
         count = 0
+        failed = 0
         for root, dirs, files in os.walk(base):
             # don't descend symlinked dirs; drop excluded dirs
             dirs[:] = [d for d in dirs if d not in _EXCLUDE_DIRS and not os.path.islink(os.path.join(root, d))]
             for fn in files:
                 full = os.path.join(root, fn)
-                # Skip symlinks and anything that resolves outside the analysis tree:
-                # artifacts are partly sample-influenced; a planted symlink (e.g. to
-                # ~/.aws/credentials) would otherwise be read + exfiltrated to S3.
-                if os.path.islink(full) or not os.path.realpath(full).startswith(base_real + os.sep):
-                    log.warning("centralstore: skipping symlink/out-of-tree artifact %s", full)
+                # A regular in-tree file uploads itself; a symlink into a trusted
+                # content root (binary -> storage/binaries/<sha256>, a recording ->
+                # storage/guacrecordings/) uploads its RESOLVED content under the
+                # analysis-relative key. Anything resolving elsewhere (a planted
+                # symlink to e.g. ~/.aws/credentials) returns None and is skipped —
+                # the artifact-exfil guard stays intact (audit CRITICAL).
+                src = upload_target_realpath(full, base_real, trusted_roots)
+                if src is None:
+                    log.warning("centralstore: skipping out-of-tree/untrusted artifact %s", full)
                     continue
                 rel = os.path.relpath(full, base)
                 key = f"{prefix}/{job_id}/{rel}"
                 try:
-                    s3.upload_file(full, bucket, key)
+                    s3.upload_file(src, bucket, key)
                     count += 1
                 except Exception as e:
+                    failed += 1
                     log.warning("centralstore: failed to upload %s -> %s: %s", rel, key, e)
-        return count
+        return count, failed
+
+    def _upload_guacrecordings(self, s3, bucket, prefix, job_id, task_id):
+        """Ship Guacamole session recordings for this task. Recordings live in the
+        top-level storage/guacrecordings/ (NOT inside the analysis tree, so the walk
+        above never sees them) and are named '<task_id>_<session_id>' by the guac
+        consumer. They only exist when an analyst live-viewed the VM mid-detonation,
+        so this is usually a no-op; when present they upload under <job_id>/
+        guacrecordings/<name> so the central store has them before the worker purges.
+        """
+        base_real = os.path.realpath(self.analysis_path)
+        rec_root = os.path.join(os.path.dirname(os.path.dirname(base_real)), "guacrecordings")
+        if not task_id or not os.path.isdir(rec_root):
+            return 0, 0
+        count = 0
+        failed = 0
+        prefix_match = f"{task_id}_"
+        for fn in os.listdir(rec_root):
+            # exact '<task_id>' or '<task_id>_<session>' — never a different task that
+            # merely shares a leading digit (e.g. task 1 vs 15): require '_' boundary.
+            if fn != str(task_id) and not fn.startswith(prefix_match):
+                continue
+            full = os.path.join(rec_root, fn)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            key = f"{prefix}/{job_id}/guacrecordings/{fn}"
+            try:
+                s3.upload_file(full, bucket, key)
+                count += 1
+            except Exception as e:
+                failed += 1
+                log.warning("centralstore: failed to upload recording %s -> %s: %s", fn, key, e)
+        return count, failed
+
+    def _write_done_marker(self, cfg, job_id, uploaded):
+        """Write storage/analyses/<id>/.centralstore.done once the artifact tree is
+        fully in S3. cape-nvme-cleanup purges only analyses carrying this marker, so
+        it can never delete something that didn't reach the central stores."""
+        base = self.analysis_path
+        if not base or not os.path.isdir(base):
+            return
+        marker = os.path.join(base, ".centralstore.done")
+        try:
+            import json
+            import time
+            with open(marker, "w") as f:
+                json.dump({
+                    "job_id": job_id,
+                    "s3": "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id),
+                    "artifacts": uploaded,
+                    "ts": time.time(),
+                }, f)
+        except Exception as e:
+            log.warning("centralstore: could not write done marker %s: %s", marker, e)

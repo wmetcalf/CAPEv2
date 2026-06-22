@@ -7,7 +7,38 @@ gates the code-level behavior that has no conf today — the FS->S3 artifact sea
 and carries the S3 location. Parsing logic is split into the pure `_parse()` helper
 so it's unit-testable without importing the CAPE config machinery.
 """
+import os
 from dataclasses import dataclass
+
+
+def _within(realpath, root):
+    """True iff `realpath` is `root` itself or lives under it. Uses a separator-
+    terminated prefix so a sibling like storage/binaries-evil does NOT count as
+    inside storage/binaries (prefix-collision guard)."""
+    return realpath == root or realpath.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def upload_target_realpath(full, base_real, trusted_roots):
+    """Decide whether an analysis file may be shipped to the central store, and if
+    so, the on-disk path whose CONTENT to upload.
+
+    centralstore walks the analysis tree. Most entries are regular files inside the
+    tree. A few are symlinks INTO trusted content roots — `binary` -> storage/binaries/
+    <sha256> and any guacrecording symlinked from the analysis dir -> storage/
+    guacrecordings/. Those must ship (the read seam serves them), so we resolve and
+    upload their target content under the file's analysis-relative key.
+
+    But artifacts are partly sample-influenced: a planted symlink (e.g. binary ->
+    ~/.aws/credentials) would otherwise be read and exfiltrated to S3 (audit
+    CRITICAL). So we ALLOW a resolved path only when it stays within the analysis
+    tree itself or one of the trusted_roots; anything resolving elsewhere returns
+    None (skip). Pure (os.path only) so it is unit-testable without boto3/Django.
+    """
+    realpath = os.path.realpath(full)
+    for root in [base_real, *trusted_roots]:
+        if _within(realpath, root):
+            return realpath
+    return None
 
 
 def _as_bool(v, default=False):
