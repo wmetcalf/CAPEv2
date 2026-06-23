@@ -846,11 +846,20 @@ def status(request, task_id):
         "target": task.sample.sha256 if getattr(task, "sample") else task.target,
     }
     if web_conf.guacamole.enabled and get_options(task.options).get("interactive") == "1":
-        machine = db.view_machine_by_label(task.machine)
+        vm_label, guest_ip = task.machine, None
+        machine = db.view_machine_by_label(task.machine) if task.machine else None
         if machine:
             guest_ip = machine.ip
+        else:
+            # Central mode: the VM lives on a worker, so it's not in the central machines
+            # table — resolve the worker's VM label via the broker record + worker API.
+            from lib.cuckoo.common.central_guac import worker_vm_for_task
+            w_label, w_ip = worker_vm_for_task(task_id)
+            if w_label:
+                vm_label, guest_ip = w_label, (w_ip or "")
+        if vm_label:
             session_id = uuid3(NAMESPACE_DNS, task_id).hex[:16]
-            session_data = urlsafe_b64encode(f"{session_id}|{task.machine}|{guest_ip}".encode("utf8")).decode("utf8")
+            session_data = urlsafe_b64encode(f"{session_id}|{vm_label}|{guest_ip or ''}".encode("utf8")).decode("utf8")
             response["session_data"] = session_data
 
     return render(request, "submission/status.html", response)
