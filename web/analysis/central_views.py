@@ -18,6 +18,29 @@ import os
 from django.shortcuts import render
 
 
+def central_job_id_for_task(task_id):
+    """Resolve the broker job_id for a central task from its RDS `custom` field
+    (the submit-bridge stamps custom='job_id=ui-<id>'). In the distributed topology
+    the worker assigns its OWN local info.id (collides across workers), so the
+    universal key for DocumentDB/S3 is info.job_id — NOT info.id. Returns None for a
+    non-bridged task (caller falls back to info.id keying for seeded/single-node docs)."""
+    try:
+        from analysis.views import db
+        t = db.view_task(int(task_id))
+        if t and getattr(t, "custom", None) and "job_id=" in t.custom:
+            return t.custom.split("job_id=", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def central_analysis_query(task_id):
+    """Mongo filter to fetch a task's analysis doc in central mode: by info.job_id for
+    a bridged task, else by info.id (seeded/single-node)."""
+    jid = central_job_id_for_task(task_id)
+    return {"info.job_id": jid} if jid else {"info.id": int(task_id)}
+
+
 def central_file_nl(request, category, task_id, dlfile):
     """Inline report assets: screenshots, bingraph, vba2graph (file_nl)."""
     from django.http import Http404

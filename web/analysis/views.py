@@ -2754,9 +2754,19 @@ def report(request, task_id):
             for service in CUSTOM_SERVICES:
                 projection[service] = 1
 
+        # Central mode: a bridged (broker-dispatched) task's DocumentDB doc is keyed by
+        # info.job_id, not info.id (the worker assigns its own local info.id). Resolve the
+        # right filter; single-node/seeded falls back to info.id.
+        from lib.cuckoo.common.central_mode import central_mode_config
+        if central_mode_config().enabled:
+            from analysis.central_views import central_analysis_query
+            _analysis_q = central_analysis_query(task_id)
+        else:
+            _analysis_q = {"info.id": int(task_id)}
+
         report = mongo_find_one(
             "analysis",
-            {"info.id": int(task_id)},
+            _analysis_q,
             projection,
             sort=[("_id", -1)],
             max_time_ms=10000,
@@ -2767,7 +2777,7 @@ def report(request, task_id):
         # Bypass hooks here too
         existence = mongo_find_one(
             "analysis",
-            {"info.id": int(task_id)},
+            _analysis_q,
             {"sigma": 1, "sysmon": 1, "misp": 1, "classification": 1, "_id": 0},
             no_hooks=True,
         )
