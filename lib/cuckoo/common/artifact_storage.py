@@ -100,14 +100,16 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192, scop
     return resp
 
 
-def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
+def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/", "memory.dmp")):
     """Central mode: lazily materialize the S3 results/<job_id>/ tree into the local
     storage/analyses/<task_id>/ dir so the MANY report features that read the local
     filesystem (json report, evtx, ETW aux/*.json, sysmon, process.log, behavior
     feeds, dropped files, …) work centrally without rewriting each reader. Cached via
-    a .central_staged marker (subsequent calls are a cheap stat). Excludes large
-    on-demand artifacts (memory dumps) which stream via materialize_artifact instead.
-    No-op single-node. Best-effort: never raises into the view."""
+    a .central_staged marker (subsequent calls are a cheap stat). Excludes the large
+    on-demand memory dumps — both the per-process memory/ subtree AND the root
+    memory.dmp[.zip/.strings] full-RAM image (which would otherwise bloat every report
+    view by GBs) — they stage on explicit demand via ensure_local_memory / stream via
+    materialize_artifact instead. No-op single-node. Best-effort: never raises."""
     cfg = central_mode_config()
     if not cfg.enabled:
         return
@@ -158,6 +160,48 @@ def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
                 f.write(job_id)
     except Exception:
         # leave whatever was staged; the per-file seam still covers downloads
+        pass
+
+
+def ensure_local_memory(task_id, scope=None):
+    """Central mode: stage the memory dumps (the memory/ per-process subtree AND the
+    root memory.dmp[.zip/.strings] full-RAM image) — which ensure_local_analysis
+    EXCLUDES from the bulk stage because they are large — to the local analysis dir,
+    on EXPLICIT demand (the memory-download endpoints). Idempotent per-file (skips
+    files already present); not marker-gated. Best-effort: never raises."""
+    cfg = central_mode_config()
+    if not cfg.enabled:
+        return
+    try:
+        job_id = _job_id_for_task(task_id, scope)
+        if not job_id:
+            return
+        local = _local_analysis_path(task_id, "")
+        local_real = os.path.realpath(local)
+        s3 = _s3_client(cfg.s3_region)
+        prefix = f"{cfg.s3_prefix}/{job_id}/"
+        os.makedirs(local, exist_ok=True)
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=cfg.s3_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(prefix):]
+                if not rel or rel.endswith("/"):
+                    continue
+                if not (rel.startswith("memory/") or rel.startswith("memory.dmp")):
+                    continue
+                try:
+                    _safe_relpath(rel)
+                except Exception:
+                    continue
+                dest = os.path.join(local, rel)
+                dest_real = os.path.realpath(dest)
+                if dest_real != local_real and not dest_real.startswith(local_real + os.sep):
+                    continue
+                if os.path.exists(dest):
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                s3.download_file(cfg.s3_bucket, obj["Key"], dest)
+    except Exception:
         pass
 
 
