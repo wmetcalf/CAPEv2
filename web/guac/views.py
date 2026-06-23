@@ -65,11 +65,25 @@ def index(request, task_id, session_data):
             return _error(request, task_id, "Could not connect to hypervisor")
 
         try:
-            session_id, label, guest_ip = (
+            session_id, _claimed_label, guest_ip = (
                 urlsafe_b64decode(session_data).decode("utf8").split("|")
             )
         except Exception as e:
             return _error(request, task_id, str(e))
+
+        # SECURITY: the VM label MUST come from the authorized task, never from the
+        # attacker-controlled session_data path segment — otherwise a tenant who can
+        # view ONE of their own running tasks could pass another tenant's VM label and
+        # tunnel into that tenant's live analysis VM (cross-tenant takeover). Derive the
+        # authoritative label from the gated task: _task.machine (single-node) or the
+        # worker's VM (central mode). Ignore _claimed_label entirely.
+        label = _task.machine
+        if not label:
+            from lib.cuckoo.common.central_guac import worker_vm_for_task
+
+            label, _gip = worker_vm_for_task(int(task_id))
+        if not label:
+            return _error(request, task_id, "No VM is associated with this task")
 
         try:
             dom = conn.lookupByName(label)
