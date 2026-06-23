@@ -3354,9 +3354,16 @@ def file(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from analysis.central_views import central_file
+        from analysis.central_views import central_file, central_stage_local
 
-        return central_file(request, category, task_id, dlfile)
+        # Zip-on-the-fly bundles read the local analysis tree and archive it (pyzipper,
+        # optional password, download_all). Rather than duplicate that in the per-file S3
+        # seam, stage the S3 tree locally and fall through to the upstream zip path below
+        # unchanged. Single-file downloads keep the efficient per-file seam.
+        if category in zip_categories:
+            central_stage_local(request, task_id)
+        else:
+            return central_file(request, category, task_id, dlfile)
 
     file_name = dlfile
     cd = "application/octet-stream"

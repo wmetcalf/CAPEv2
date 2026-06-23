@@ -27,7 +27,8 @@ def _safe_relpath(relpath):
 
 def _job_id_for_task(task_id, scope=None):
     """Central mode keys S3 by the global job_id (the broker passes it in custom,
-    stamped into info.job_id at reporting). Resolve task_id -> job_id via mongo.
+    stamped into info.job_id at reporting; centralstore re-keys info.id to the unique
+    central task id). Resolve task_id -> job_id via mongo.
 
     `scope` is the requesting viewer's tenant filter (e.g. entitled_scope_filter):
     info.id is a per-worker sequence and collides across workers in a central

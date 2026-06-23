@@ -41,6 +41,20 @@ def central_analysis_query(task_id):
     return {"info.job_id": jid} if jid else {"info.id": int(task_id)}
 
 
+def central_stage_local(request, task_id):
+    """Stage the S3 analysis tree into the local FS so an upstream view that reads
+    storage/analyses/<task_id>/ directly works centrally without a per-file rewrite.
+    Used for the zip-on-the-fly download bundles (zip_categories) — re-implementing
+    CAPE's pyzipper/password/download_all archiving in the per-file S3 seam would be a
+    lot of duplicated fork code, so instead we materialize the tree and let the
+    upstream zip path below run byte-for-byte unchanged. Cached via the .central_staged
+    marker (cheap on repeat); best-effort (never raises into the view)."""
+    from dashboard.views import entitled_scope_filter
+    from lib.cuckoo.common.artifact_storage import ensure_local_analysis
+
+    ensure_local_analysis(task_id, scope=entitled_scope_filter(request.user))
+
+
 def central_file_nl(request, category, task_id, dlfile):
     """Inline report assets: screenshots, bingraph, vba2graph (file_nl)."""
     from django.http import Http404
