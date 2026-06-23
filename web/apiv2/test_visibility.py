@@ -68,16 +68,20 @@ def _all_task_views():
     import apiv2.views, apiv2.urls, analysis.views, analysis.urls
     import compare.views, compare.urls
     import guac.views, guac.urls
+    import submission.views, submission.urls
     from web import urls as web_urls
 
     # (urls module, views module the matched names resolve to, alias used there).
     # The root urlconf (web.urls) routes file/filereport/vtupload/full_memory*
     # into analysis.views under the `analysis_views` alias — historically unscanned.
+    # submission.urls routes task_id views too (resubmit index, status,
+    # remote_session) — also historically unscanned by this gate.
     specs = (
         (apiv2.urls, apiv2.views, "views"),
         (analysis.urls, analysis.views, "views"),
         (compare.urls, compare.views, "views"),
         (guac.urls, guac.views, "views"),
+        (submission.urls, submission.views, "views"),
         (web_urls, analysis.views, "analysis_views"),
     )
     cases = []

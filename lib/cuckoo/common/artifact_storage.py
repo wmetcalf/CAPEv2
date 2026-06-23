@@ -115,13 +115,26 @@ def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
         s3 = _s3_client(cfg.s3_region)
         prefix = f"{cfg.s3_prefix}/{job_id}/"
         os.makedirs(local, exist_ok=True)
+        local_real = os.path.realpath(local)
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=cfg.s3_bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 rel = obj["Key"][len(prefix):]
                 if not rel or rel.endswith("/") or any(rel.startswith(p) for p in exclude_prefixes):
                     continue
+                # Defence-in-depth: this is the ONLY seam path that turns an S3 key
+                # suffix into a LOCAL filesystem destination, so guard it exactly like
+                # the per-file seam guards its relpaths (_safe_relpath). centralstore
+                # only ever produces in-tree keys today, but a key with '..' / an
+                # absolute segment must never write outside the analysis dir.
+                try:
+                    _safe_relpath(rel)
+                except Exception:
+                    continue
                 dest = os.path.join(local, rel)
+                dest_real = os.path.realpath(dest)
+                if dest_real != local_real and not dest_real.startswith(local_real + os.sep):
+                    continue
                 if os.path.exists(dest):
                     continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
