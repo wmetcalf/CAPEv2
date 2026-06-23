@@ -77,6 +77,18 @@ class CentralStore(Report):
                 "centralstore: refusing unsafe job_id %r (must match %s)" % (job_id, _JOB_ID_RE.pattern))
         info["job_id"] = job_id  # carried into the DocumentDB doc; read seam keys S3 by it
 
+        # Align info.id to the CENTRAL task id when the broker assigned a
+        # "ui-<central_task_id>" job_id (the central-submit-bridge does this). The
+        # worker's local info.id is a per-worker sequence that collides across workers
+        # and is meaningless to the central UI, which addresses every analysis by its
+        # OWN task id. Rewriting info.id here (before mongodb.py at 9999 writes the doc)
+        # makes the central DocumentDB doc resolvable by the central task id natively —
+        # so the report view, all report-tab lookups, and the artifact seam work without
+        # touching ~25 info.id call sites in the upstream-synced views.py.
+        _m = re.match(r"^ui-(\d+)$", job_id)
+        if _m:
+            info["id"] = int(_m.group(1))
+
         try:
             import boto3
         except ImportError as e:
