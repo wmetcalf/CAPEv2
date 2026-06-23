@@ -38,7 +38,14 @@ def _job_id_for_task(task_id, scope=None):
     from dev_utils.mongodb import mongo_find_one
     from django.http import Http404
 
-    query = {"info.id": int(task_id)}
+    # filereport/full_memory routes capture task_id/analysis_number as \w+ (not \d+),
+    # so a non-numeric segment must raise Http404 (the views catch it -> clean error),
+    # not an uncaught ValueError -> HTTP 500.
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        raise Http404("invalid task id")
+    query = {"info.id": tid}
     if scope:
         query = {"$and": [query, scope]}
     doc = mongo_find_one("analysis", query, {"info.job_id": 1})
@@ -116,10 +123,17 @@ def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
         prefix = f"{cfg.s3_prefix}/{job_id}/"
         os.makedirs(local, exist_ok=True)
         local_real = os.path.realpath(local)
+        # centralstore writes .centralstore.done LAST, after the whole tree is uploaded.
+        # Only cache the stage (write .central_staged) once we've seen it — otherwise a
+        # listing taken mid-upload (or a partial/empty result) would be cached forever
+        # and the report would render permanently missing tabs.
+        complete = False
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=cfg.s3_bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 rel = obj["Key"][len(prefix):]
+                if rel == ".centralstore.done":
+                    complete = True
                 if not rel or rel.endswith("/") or any(rel.startswith(p) for p in exclude_prefixes):
                     continue
                 # Defence-in-depth: this is the ONLY seam path that turns an S3 key
@@ -139,8 +153,9 @@ def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
                     continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 s3.download_file(cfg.s3_bucket, obj["Key"], dest)
-        with open(marker, "w") as f:
-            f.write(job_id)
+        if complete:
+            with open(marker, "w") as f:
+                f.write(job_id)
     except Exception:
         # leave whatever was staged; the per-file seam still covers downloads
         pass
@@ -176,8 +191,10 @@ def materialize_artifact(task_id, relpath, scope=None):
 
     import tempfile
 
-    key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
     try:
+        # key build (_job_id_for_task / _safe_relpath) can raise Http404 — keep it INSIDE
+        # the try so the documented (None, False) contract holds instead of leaking Http404.
+        key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
         obj = _s3_client(cfg.s3_region).get_object(Bucket=cfg.s3_bucket, Key=key)
     except Exception:
         return (None, False)
@@ -205,8 +222,9 @@ def read_artifact_text(task_id, relpath, max_bytes=100000, scope=None):
         with open(path, "r", errors="replace") as f:
             data = f.read(max_bytes + 1)
     else:
-        key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
         try:
+            # key build can raise Http404 — keep INSIDE the try so the "" contract holds.
+            key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
             obj = _s3_client(cfg.s3_region).get_object(Bucket=cfg.s3_bucket, Key=key, Range=f"bytes=0-{max_bytes}")
             data = obj["Body"].read().decode("utf-8", errors="replace")
         except Exception:

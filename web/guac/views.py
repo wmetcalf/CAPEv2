@@ -65,23 +65,30 @@ def index(request, task_id, session_data):
             return _error(request, task_id, "Could not connect to hypervisor")
 
         try:
-            session_id, _claimed_label, guest_ip = (
+            session_id, _claimed_label, _claimed_ip = (
                 urlsafe_b64decode(session_data).decode("utf8").split("|")
             )
         except Exception as e:
             return _error(request, task_id, str(e))
 
-        # SECURITY: the VM label MUST come from the authorized task, never from the
-        # attacker-controlled session_data path segment — otherwise a tenant who can
-        # view ONE of their own running tasks could pass another tenant's VM label and
-        # tunnel into that tenant's live analysis VM (cross-tenant takeover). Derive the
-        # authoritative label from the gated task: _task.machine (single-node) or the
-        # worker's VM (central mode). Ignore _claimed_label entirely.
+        # SECURITY: BOTH the VM label AND the guest IP MUST come from the authorized
+        # task, never from the attacker-controlled session_data path segment. Trusting
+        # the label lets a tenant who can view ONE of their own running tasks tunnel into
+        # another tenant's live VM (cross-tenant takeover); trusting guest_ip lets them
+        # point the guacd RDP tunnel at an arbitrary host:3389 (SSRF — guest_host comes
+        # from this value in consumers.py). Derive both authoritatively from the gated
+        # task: _task.machine + its machine record (single-node) or the worker's VM
+        # (central mode). Ignore _claimed_label / _claimed_ip entirely.
         label = _task.machine
-        if not label:
+        guest_ip = ""
+        if label:
+            _m = db.view_machine_by_label(label)
+            guest_ip = getattr(_m, "ip", "") or ""
+        else:
             from lib.cuckoo.common.central_guac import worker_vm_for_task
 
-            label, _gip = worker_vm_for_task(int(task_id))
+            label, guest_ip = worker_vm_for_task(int(task_id))
+            guest_ip = guest_ip or ""
         if not label:
             return _error(request, task_id, "No VM is associated with this task")
 

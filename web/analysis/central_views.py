@@ -27,18 +27,77 @@ def central_job_id_for_task(task_id):
     try:
         from analysis.views import db
         t = db.view_task(int(task_id))
-        if t and getattr(t, "custom", None) and "job_id=" in t.custom:
-            return t.custom.split("job_id=", 1)[1].strip()
+        custom = getattr(t, "custom", None) if t else None
+        if custom:
+            # custom is comma-separated k=v pairs (matches centralstore.resolve_job_id);
+            # take ONLY the job_id= value, not everything to end-of-string — else a
+            # 'job_id=ui-5,foo=bar' custom yields 'ui-5,foo=bar' and never matches the
+            # S3 prefix / DocumentDB doc the artifacts were keyed under.
+            for part in str(custom).split(","):
+                part = part.strip()
+                if part.startswith("job_id="):
+                    v = part.split("=", 1)[1].strip()
+                    if v:
+                        return v
     except Exception:
         pass
     return None
 
 
-def central_analysis_query(task_id):
-    """Mongo filter to fetch a task's analysis doc in central mode: by info.job_id for
-    a bridged task, else by info.id (seeded/single-node)."""
+def central_analysis_query(task_id, scope=None):
+    """Mongo filter to fetch a task's analysis doc in central mode.
+
+    PRIMARY key is info.job_id (globally unique) for a bridged task. centralstore also
+    re-keys info.id to the unique central task id for every bridged job, so {info.id} is
+    likewise unique in a real central deployment (every task arrives via the bridge) —
+    which is why the report-tab loaders that query {info.id: task_id} resolve to exactly
+    the authorized task's doc, not a colliding worker-local one. The info.id FALLBACK
+    here (non-bridged / seeded / single-node docs, where a worker-local info.id can
+    collide across workers) is ANDed with the viewer's `scope` (entitled_scope_filter)
+    as defence-in-depth so a collision can't surface another tenant's doc (audit HIGH)."""
     jid = central_job_id_for_task(task_id)
-    return {"info.job_id": jid} if jid else {"info.id": int(task_id)}
+    q = {"info.job_id": jid} if jid else {"info.id": int(task_id)}
+    if scope:
+        q = {"$and": [q, scope]}
+    return q
+
+
+def _task_sample_sha256(request, task_id):
+    """The sha256 of THIS task's submitted sample (mongo target.file.sha256), scoped to
+    the viewer. central S3 stores only this binary (key <job_id>/binary), not a by-hash
+    store, so callers serving sample bytes must confirm the requested hash IS this."""
+    from dev_utils.mongodb import mongo_find_one
+    from dashboard.views import entitled_scope_filter
+
+    doc = mongo_find_one("analysis", central_analysis_query(task_id, scope=entitled_scope_filter(request.user)),
+                         {"target.file.sha256": 1, "_id": 0})
+    return ((((doc or {}).get("target") or {}).get("file") or {}).get("sha256") or "").lower()
+
+
+def central_stage_one(request, task_id, s3_relpath, dest_abspath):
+    """Materialize ONE S3 artifact (<job_id>/<s3_relpath>) to an exact local path so an
+    upstream zip path that reads that specific path works centrally. Used for memdumpzip
+    (memory/ is excluded from the bulk stage) and staticzip (reads the global binaries
+    store, OUTSIDE the analysis tree). Best-effort; never raises into the view."""
+    import shutil
+
+    from dashboard.views import entitled_scope_filter
+    from lib.cuckoo.common.artifact_storage import materialize_artifact
+
+    if os.path.exists(dest_abspath):
+        return
+    src, is_temp = materialize_artifact(task_id, s3_relpath, scope=entitled_scope_filter(request.user))
+    if not src:
+        return
+    try:
+        os.makedirs(os.path.dirname(dest_abspath), exist_ok=True)
+        (shutil.move if is_temp else shutil.copy)(src, dest_abspath)
+    except Exception:
+        if is_temp:
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
 
 
 def central_stage_local(request, task_id):
@@ -128,9 +187,16 @@ def central_file(request, category, task_id, dlfile):
 
     if category in ("sample", "static"):
         # by-hash sample download: enforce the SAME visible-task-referencing-the-sample
-        # boundary as single-node (audit CRITICAL). The analysis sample is uploaded as
-        # <job_id>/binary; dropped-by-hash is a documented follow-on (not served here).
+        # boundary as single-node (audit CRITICAL). In central S3 the ONLY binary stored
+        # for an analysis is THIS task's submitted sample (key <job_id>/binary) — it is
+        # NOT a content-addressed by-hash store like single-node's storage/binaries/.
+        # So serve <job_id>/binary only when the requested hash IS this task's sample;
+        # otherwise return not-found rather than streaming the WRONG file's bytes under
+        # the requested-hash name (review: wrong-artifact). dropped/related-by-hash from
+        # S3 is a documented follow-on.
         if not can_view_sample(request.user, sha256=dlfile):
+            return render(request, "error.html", {"error": "File not found"})
+        if _task_sample_sha256(request, task_id) != dlfile.lower():
             return render(request, "error.html", {"error": "File not found"})
         spec = ("binary", dlfile, OCTET)
     elif category == "dropped":
@@ -163,7 +229,9 @@ def central_file(request, category, task_id, dlfile):
     elif category == "sysmon":
         spec = ("sysmon/sysmon.data", "sysmon.data", OCTET)
     elif category == "evtx":
-        spec = ("evtx/evtx.zip", f"{task_id}_evtx.zip", "application/zip")
+        # fn is wrapped as f"{task_id}_{fn}" below, so don't prefix task_id here (else
+        # the download name doubles to "<id>_<id>_evtx.zip").
+        spec = ("evtx/evtx.zip", "evtx.zip", "application/zip")
     elif category == "mitmdump":
         spec = ("mitmdump/dump.har", "dump.har", "text/plain")
     else:
@@ -201,8 +269,20 @@ def central_open_procdump(request, task_id, origname):
     if not zpath:
         return None, None, None
     tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=settings.TEMP_PATH)
-    with zipfile.ZipFile(zpath, "r") as f:
-        extracted = f.extract(origname, path=tmpdir)
+    try:
+        with zipfile.ZipFile(zpath, "r") as f:
+            extracted = f.extract(origname, path=tmpdir)
+    except Exception:
+        # bad/corrupt zip or origname not a member: don't leak tmpdir (and the temp zip)
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if zt:
+            try:
+                os.unlink(zpath)
+            except OSError:
+                pass
+        return None, None, None
     if zt:
         try:
             os.unlink(zpath)
@@ -244,7 +324,8 @@ def central_vtupload(request, category, task_id, filename, dlfile):
         headers = {"x-apikey": integrations_cfg.virustotal.apikey}
         with open(path, "rb") as fh:
             response = requests.post(
-                "https://www.virustotal.com/api/v3/files", files={"file": (filename, fh)}, headers=headers
+                "https://www.virustotal.com/api/v3/files", files={"file": (filename, fh)}, headers=headers,
+                timeout=120,
             )
         if response.ok:
             vid = response.json().get("data", {}).get("id")
@@ -255,6 +336,10 @@ def central_vtupload(request, category, task_id, filename, dlfile):
                     {"permalink": "https://www.virustotal.com/gui/file/{id}".format(id=hashbytes.decode())},
                 )
         return render(request, "error.html", {"error": "Response code: {} - {}".format(response.status_code, response.reason)})
+    except Exception as e:
+        # network error / non-JSON VT response / malformed id: single-node vtupload wraps
+        # the whole flow in try/except; mirror that so it renders an error, not a 500.
+        return render(request, "error.html", {"error": "VirusTotal upload failed: {}".format(e)})
     finally:
         if is_temp:
             try:

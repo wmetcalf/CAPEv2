@@ -26,7 +26,15 @@ log = logging.getLogger(__name__)
 # traversal. The broker should stamp an authenticated job_id; this is the last
 # line of defence against a tenant-supplied `custom` poisoning another job's
 # prefix (audit CRITICAL-1). local-<int> fallback satisfies the allowlist.
-_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Must start with an alnum (no leading '.'/'-'/'_') AND contain no '..' run, so a
+# value like '.', '..', '.foo' or 'a..b' can never collapse 'results/<job_id>/' to a
+# parent ref ('results/../') in an S3 key or the local staging path. _is_safe_job_id
+# applies both rules (the regex alone permitted '.'/'..').
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _is_safe_job_id(job_id):
+    return bool(job_id) and _JOB_ID_RE.match(job_id) is not None and ".." not in job_id
 
 # Upload the whole analysis tree to S3 (the "heavy detail" tier): shots, dropped
 # files, pcap, procdump, AND reports/ (report.json/html/pdf are downloadable
@@ -71,10 +79,11 @@ class CentralStore(Report):
         info = results.setdefault("info", {})
         analysis_id = info.get("id")
         job_id = info.get("job_id") or resolve_job_id(info.get("custom"), analysis_id)
-        if not _JOB_ID_RE.match(job_id):
+        if not _is_safe_job_id(job_id):
             # Refuse a job_id that could escape/poison another job's S3 prefix.
             raise CuckooReportError(
-                "centralstore: refusing unsafe job_id %r (must match %s)" % (job_id, _JOB_ID_RE.pattern))
+                "centralstore: refusing unsafe job_id %r (must match %s and contain no '..')"
+                % (job_id, _JOB_ID_RE.pattern))
         info["job_id"] = job_id  # carried into the DocumentDB doc; read seam keys S3 by it
 
         # Align info.id to the CENTRAL task id when the broker assigned a

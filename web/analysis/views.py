@@ -1766,6 +1766,14 @@ def load_files(request, task_id, category):
     @param task_id: cuckoo task id
     """
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
+    # Central mode: several tab loaders below read the local analysis tree (bingraph /
+    # vba2graph svgs, evtx.zip, ETW aux/*.json). report() stages the S3 tree on first
+    # view, but a deep-link straight to a tab can arrive before any report view — stage
+    # here too so those tabs aren't blank (cheap no-op once .central_staged exists).
+    from lib.cuckoo.common.central_mode import central_mode_config
+    if central_mode_config().enabled:
+        from analysis.central_views import central_stage_local
+        central_stage_local(request, task_id)
     if is_ajax and category in (
         "CAPE",
         "dropped",
@@ -2784,7 +2792,8 @@ def report(request, task_id):
         from lib.cuckoo.common.central_mode import central_mode_config
         if central_mode_config().enabled:
             from analysis.central_views import central_analysis_query
-            _analysis_q = central_analysis_query(task_id)
+            from dashboard.views import entitled_scope_filter
+            _analysis_q = central_analysis_query(task_id, scope=entitled_scope_filter(request.user))
         else:
             _analysis_q = {"info.id": int(task_id)}
 
@@ -3354,7 +3363,7 @@ def file(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from analysis.central_views import central_file, central_stage_local
+        from analysis.central_views import central_file, central_stage_local, central_stage_one, _task_sample_sha256
 
         # Zip-on-the-fly bundles read the local analysis tree and archive it (pyzipper,
         # optional password, download_all). Rather than duplicate that in the per-file S3
@@ -3362,6 +3371,19 @@ def file(request, category, task_id, dlfile):
         # unchanged. Single-file downloads keep the efficient per-file seam.
         if category in zip_categories:
             central_stage_local(request, task_id)
+            # Two zip categories read paths the bulk stage does NOT populate: memdumpzip
+            # reads memory/ (excluded — large), staticzip reads the global binaries store
+            # (outside the analysis tree). Stage the one file each needs so the upstream
+            # zip path finds it instead of silently returning "File not found".
+            if category.startswith("memdumpzip"):
+                central_stage_one(request, task_id, f"memory/{dlfile}.dmp",
+                                  os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "memory", f"{dlfile}.dmp"))
+            elif category == "staticzip" and _task_sample_sha256(request, task_id) == str(dlfile).lower():
+                # only the task's OWN sample is in central S3 (<job_id>/binary); stage it
+                # to the binaries path upstream reads, gated to the task's sample hash so
+                # a non-matching hash can't be written under the wrong name (see S2).
+                central_stage_one(request, task_id, "binary",
+                                  os.path.join(CUCKOO_ROOT, "storage", "binaries", str(dlfile)))
         else:
             return central_file(request, category, task_id, dlfile)
 

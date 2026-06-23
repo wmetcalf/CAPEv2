@@ -25,8 +25,17 @@ def _job_id_for_task(task_id):
         from lib.cuckoo.core.database import Database
 
         t = Database().view_task(int(task_id))
-        if t and getattr(t, "custom", None) and "job_id=" in t.custom:
-            return t.custom.split("job_id=", 1)[1].strip()
+        custom = getattr(t, "custom", None) if t else None
+        if custom:
+            # comma-separated k=v pairs — take ONLY the job_id= value (not the rest of the
+            # string), matching centralstore.resolve_job_id; a trailing ',foo=bar' would
+            # otherwise corrupt the DynamoDB key / S3 prefix lookup.
+            for part in str(custom).split(","):
+                part = part.strip()
+                if part.startswith("job_id="):
+                    v = part.split("=", 1)[1].strip()
+                    if v:
+                        return v
     except Exception:
         pass
     try:
