@@ -92,6 +92,23 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192, scop
     return resp
 
 
+def artifact_exists(task_id, relpath, scope=None):
+    """True iff an analysis artifact exists — checked locally (single-node) or via an S3
+    HEAD (central mode). Used to gate optional UI download links (decrypted/mixed pcap,
+    tlskeys, mitmdump) that the worker may or may not have produced; a local-FS check
+    returns False for S3-backed artifacts in central mode, hiding links for files that
+    actually exist."""
+    cfg = central_mode_config()
+    if not cfg.enabled:
+        return os.path.exists(_local_analysis_path(task_id, relpath))
+    try:
+        key = f"{cfg.s3_prefix}/{_job_id_for_task(task_id, scope)}/{_safe_relpath(relpath)}"
+        _s3_client(cfg.s3_region).head_object(Bucket=cfg.s3_bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
+
 def materialize_artifact(task_id, relpath, scope=None):
     """Return (local_path, is_temp) for an artifact that a caller must open as a real
     file — random-access slicing (procdump), filtering/regeneration (pcap), or handing

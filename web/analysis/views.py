@@ -1968,18 +1968,30 @@ def load_files(request, task_id, category):
             ajax_response["suricata"] = data.get("suricata", {})
             ajax_response["cif"] = data.get("cif", [])
             ajax_response["pcapng"] = data.get("pcapng", {})
-            tls_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "tlsdump", "tlsdump.log")
-            if _path_safe(tls_path):
-                ajax_response["tlskeys_exists"] = _path_safe(tls_path)
-            mitmdump_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "mitmdump", "dump.har")
-            if _path_safe(mitmdump_path):
-                ajax_response["mitmdump_exists"] = _path_safe(mitmdump_path)
-            decrypted_pcap_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "dump_decrypted.pcap")
-            if _path_safe(decrypted_pcap_path):
-                ajax_response["decrypted_pcap_exists"] = True
-            mixed_pcap_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "dump_mixed.pcap")
-            if _path_safe(mixed_pcap_path):
-                ajax_response["mixed_pcap_exists"] = True
+            from lib.cuckoo.common.central_mode import central_mode_config
+            if central_mode_config().enabled:
+                # Central: artifacts live in S3, not the local FS — check existence there
+                # (a local check hides links for files the worker actually produced).
+                from lib.cuckoo.common.artifact_storage import artifact_exists
+                from dashboard.views import entitled_scope_filter
+                _sc = entitled_scope_filter(request.user)
+                ajax_response["tlskeys_exists"] = artifact_exists(task_id, "tlsdump/tlsdump.log", scope=_sc)
+                ajax_response["mitmdump_exists"] = artifact_exists(task_id, "mitmdump/dump.har", scope=_sc)
+                ajax_response["decrypted_pcap_exists"] = artifact_exists(task_id, "dump_decrypted.pcap", scope=_sc)
+                ajax_response["mixed_pcap_exists"] = artifact_exists(task_id, "dump_mixed.pcap", scope=_sc)
+            else:
+                tls_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "tlsdump", "tlsdump.log")
+                if _path_safe(tls_path):
+                    ajax_response["tlskeys_exists"] = _path_safe(tls_path)
+                mitmdump_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "mitmdump", "dump.har")
+                if _path_safe(mitmdump_path):
+                    ajax_response["mitmdump_exists"] = _path_safe(mitmdump_path)
+                decrypted_pcap_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "dump_decrypted.pcap")
+                if _path_safe(decrypted_pcap_path):
+                    ajax_response["decrypted_pcap_exists"] = True
+                mixed_pcap_path = os.path.join(ANALYSIS_BASE_PATH, "analyses", str(task_id), "dump_mixed.pcap")
+                if _path_safe(mixed_pcap_path):
+                    ajax_response["mixed_pcap_exists"] = True
         elif category == "behavior":
             ajax_response["detections2pid"] = data.get("detections2pid", {})
         return render(request, page, ajax_response)
