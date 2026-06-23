@@ -84,7 +84,7 @@ def central_file(request, category, task_id, dlfile):
 
     from dashboard.views import entitled_scope_filter
     from lib.cuckoo.common.artifact_storage import artifact_response
-    from web.analysis.views import can_view_sample, zip_categories
+    from analysis.views import can_view_sample, zip_categories
 
     OCTET = "application/octet-stream"
     PCAP = "application/vnd.tcpdump.pcap"
@@ -183,7 +183,7 @@ def central_vtupload(request, category, task_id, filename, dlfile):
 
     from dashboard.views import entitled_scope_filter
     from lib.cuckoo.common.artifact_storage import materialize_artifact
-    from web.analysis.views import can_view_sample, enabledconf, integrations_cfg
+    from analysis.views import can_view_sample, enabledconf, integrations_cfg
 
     if not (enabledconf["vtupload"] and integrations_cfg.virustotal.apikey):
         return render(request, "error.html", {"error": "VirusTotal upload is not enabled"})

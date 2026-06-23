@@ -3189,7 +3189,7 @@ def file_nl(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_file_nl
+        from analysis.central_views import central_file_nl
 
         return central_file_nl(request, category, task_id, dlfile)
 
@@ -3320,7 +3320,7 @@ def file(request, category, task_id, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_file
+        from analysis.central_views import central_file
 
         return central_file(request, category, task_id, dlfile)
 
@@ -3548,7 +3548,7 @@ def procdump(request, task_id, process_id, start, end, zipped=False):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_open_procdump
+        from analysis.central_views import central_open_procdump
 
         dumpfile, tmp_file_path, tmpdir = central_open_procdump(request, task_id, origname)
         if not dumpfile:
@@ -3683,7 +3683,7 @@ def full_memory_dump_file(request, analysis_number):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_full_memory_dump
+        from analysis.central_views import central_full_memory_dump
 
         return central_full_memory_dump(request, analysis_number, ("memory.dmp", "memory.dmp.zip"))
 
@@ -3711,7 +3711,7 @@ def full_memory_dump_strings(request, analysis_number):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_full_memory_dump
+        from analysis.central_views import central_full_memory_dump
 
         return central_full_memory_dump(request, analysis_number, ("memory.dmp.strings", "memory.dmp.strings.zip"))
 
@@ -3926,7 +3926,7 @@ def pcapstream(request, task_id, conntuple):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_pcapstream
+        from analysis.central_views import central_pcapstream
 
         return central_pcapstream(request)
 
@@ -4024,7 +4024,7 @@ def vtupload(request, category, task_id, filename, dlfile):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_vtupload
+        from analysis.central_views import central_vtupload
 
         return central_vtupload(request, category, task_id, filename, dlfile)
 
@@ -4130,7 +4130,7 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
     from lib.cuckoo.common.central_mode import central_mode_config
 
     if central_mode_config().enabled:
-        from web.analysis.central_views import central_on_demand
+        from analysis.central_views import central_on_demand
 
         return central_on_demand(request)
 
