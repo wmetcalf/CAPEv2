@@ -2728,6 +2728,18 @@ def report(request, task_id):
     if _task is None or not can_view_task(request.user, _task):
         return render(request, "error.html", {"error": "No analysis found with specified ID"})
     can_toggle_visibility = can_toggle_task(request.user, _task)
+
+    # Central mode: the analysis tree lives in S3, not on this node's disk. Stage it
+    # locally (once, cached, excluding huge memory dumps) so EVERY report feature that
+    # reads the local filesystem — json report, evtx, ETW aux/*.json, sysmon, behavior
+    # feeds, dropped files, etc. — renders against the original UI without porting each
+    # reader to S3. Loaded before the tab AJAX (load_files/load_evtx) fires.
+    from lib.cuckoo.common.central_mode import central_mode_config
+    if central_mode_config().enabled:
+        from lib.cuckoo.common.artifact_storage import ensure_local_analysis
+        from dashboard.views import entitled_scope_filter
+        ensure_local_analysis(task_id, scope=entitled_scope_filter(request.user))
+
     network_report = {}
     report = {}
     if enabledconf["mongodb"]:

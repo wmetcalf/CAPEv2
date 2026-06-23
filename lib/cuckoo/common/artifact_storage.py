@@ -92,6 +92,46 @@ def artifact_response(task_id, relpath, content_type, filename, chunk=8192, scop
     return resp
 
 
+def ensure_local_analysis(task_id, scope=None, exclude_prefixes=("memory/",)):
+    """Central mode: lazily materialize the S3 results/<job_id>/ tree into the local
+    storage/analyses/<task_id>/ dir so the MANY report features that read the local
+    filesystem (json report, evtx, ETW aux/*.json, sysmon, process.log, behavior
+    feeds, dropped files, …) work centrally without rewriting each reader. Cached via
+    a .central_staged marker (subsequent calls are a cheap stat). Excludes large
+    on-demand artifacts (memory dumps) which stream via materialize_artifact instead.
+    No-op single-node. Best-effort: never raises into the view."""
+    cfg = central_mode_config()
+    if not cfg.enabled:
+        return
+    local = _local_analysis_path(task_id, "")
+    marker = os.path.join(local, ".central_staged")
+    if os.path.exists(marker):
+        return
+    try:
+        job_id = _job_id_for_task(task_id, scope)
+        if not job_id:
+            return
+        s3 = _s3_client(cfg.s3_region)
+        prefix = f"{cfg.s3_prefix}/{job_id}/"
+        os.makedirs(local, exist_ok=True)
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=cfg.s3_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(prefix):]
+                if not rel or rel.endswith("/") or any(rel.startswith(p) for p in exclude_prefixes):
+                    continue
+                dest = os.path.join(local, rel)
+                if os.path.exists(dest):
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                s3.download_file(cfg.s3_bucket, obj["Key"], dest)
+        with open(marker, "w") as f:
+            f.write(job_id)
+    except Exception:
+        # leave whatever was staged; the per-file seam still covers downloads
+        pass
+
+
 def artifact_exists(task_id, relpath, scope=None):
     """True iff an analysis artifact exists — checked locally (single-node) or via an S3
     HEAD (central mode). Used to gate optional UI download links (decrypted/mixed pcap,
