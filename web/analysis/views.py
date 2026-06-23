@@ -192,7 +192,7 @@ if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
 
 db: TasksMixIn = Database()
 
-from users.tenancy import can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
+from users.tenancy import can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, can_ban_user
 
 
 def require_task_manage(view):
@@ -4355,7 +4355,9 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def ban_all_user_tasks(request, user_id: int):
-    if request.user.is_staff or request.user.is_superuser:
+    # Global staff/superuser (break-glass) ban anyone; a tenant-admin bans only a user
+    # in their OWN tenant (can_ban_user enforces the target's tenant == actor's).
+    if can_ban_user(request.user, user_id):
         db.ban_user_tasks(user_id)
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
     return render(request, "error.html", {"error": "Nice try! You don't have permission to ban user tasks"})
@@ -4363,7 +4365,9 @@ def ban_all_user_tasks(request, user_id: int):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def ban_user(request, user_id: int):
-    if request.user.is_staff or request.user.is_superuser:
+    # Global staff/superuser (break-glass) ban anyone; a tenant-admin bans only a user
+    # in their OWN tenant (can_ban_user enforces the target's tenant == actor's).
+    if can_ban_user(request.user, user_id):
         success = disable_user(user_id)
         if success:
             return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))

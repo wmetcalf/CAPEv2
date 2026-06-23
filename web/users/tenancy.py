@@ -103,6 +103,32 @@ def can_view_sample(user, *, sha256=None, sha1=None, md5=None, sample_id=None) -
     return bool(db.list_tasks(sample_id=sample.id, visible_to=viewer, limit=1))
 
 
+def can_ban_user(actor, target_user_id) -> bool:
+    """May `actor` ban/disable user `target_user_id` (and their pending tasks)?
+
+    - GLOBAL break-glass: a staff/superuser bans anyone, any tenant (preserves the
+      original is_staff/is_superuser gate AND single-node behavior — when MT is off
+      this is the ONLY path, since viewer_for would otherwise mark every principal
+      is_local_admin).
+    - TENANT delegation: a tenant-admin bans ONLY a target user in their OWN tenant.
+      Enforced here (the target's UserProfile.tenant_id must equal the actor's), so a
+      tenant-admin can't ban across tenants even with a forged user_id.
+    - Everyone else: denied.
+    """
+    if getattr(actor, "is_staff", False) or getattr(actor, "is_superuser", False):
+        return True
+    v = viewer_for(actor)
+    if not (v.is_tenant_admin and v.tenant_id is not None):
+        return False
+    from django.contrib.auth.models import User
+
+    try:
+        prof = User.objects.select_related("userprofile").get(pk=int(target_user_id)).userprofile
+    except Exception:
+        return False
+    return getattr(prof, "tenant_id", None) == v.tenant_id
+
+
 def submission_scope(request):
     """Resolve (tenant_id, visibility) for a new submission from the request.
 
