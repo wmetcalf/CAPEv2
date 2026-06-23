@@ -221,6 +221,97 @@ def test_submission_scope(mt_enabled, monkeypatch):
         ut.submission_scope(r3)
 
 
+def _mk_member(name, tenant=None, admin=False):
+    """Create a user + set their UserProfile tenant/admin, returning a FRESH user
+    (so request.user.userprofile reflects the saved tenant, as a real request would)."""
+    from users.models import UserProfile
+
+    u = User.objects.create_user(name, f"{name}@x.com", "x")
+    p = UserProfile.objects.get(user=u)  # auto-created by signal
+    p.tenant = tenant
+    p.is_tenant_admin = admin
+    p.save()
+    return User.objects.get(pk=u.pk)
+
+
+@pytest.mark.django_db
+def test_can_ban_user_tenant_admin_delegation(mt_enabled):
+    """ban delegation predicate (users.tenancy.can_ban_user): global staff/superuser
+    ban anyone; a tenant-admin bans ONLY a target in their OWN tenant; non-admins and
+    cross-tenant/tenant-less targets are denied."""
+    from users.models import Tenant
+    from users.tenancy import can_ban_user
+
+    acme = Tenant.objects.create(slug="acme", name="Acme")
+    globex = Tenant.objects.create(slug="globex", name="Globex")
+
+    superu = User.objects.create_superuser("root", "root@x.com", "x")
+    staff = User.objects.create_user("staff", "staff@x.com", "x"); staff.is_staff = True; staff.save()
+    staff = User.objects.get(pk=staff.pk)
+    admin_acme = _mk_member("aadm", acme, admin=True)
+    member_acme = _mk_member("amem", acme, admin=False)
+    target_acme = _mk_member("atgt", acme)
+    target_globex = _mk_member("gtgt", globex)
+    target_tenantless = _mk_member("ntgt", None)
+
+    # GLOBAL break-glass: staff/superuser ban across any tenant
+    assert can_ban_user(superu, target_acme.id) is True
+    assert can_ban_user(superu, target_globex.id) is True
+    assert can_ban_user(staff, target_globex.id) is True
+
+    # TENANT delegation: acme admin bans an acme target, NOT a globex/tenant-less one
+    assert can_ban_user(admin_acme, target_acme.id) is True
+    assert can_ban_user(admin_acme, target_globex.id) is False   # cross-tenant denied
+    assert can_ban_user(admin_acme, target_tenantless.id) is False
+
+    # non-admin member can't ban even within their own tenant
+    assert can_ban_user(member_acme, target_acme.id) is False
+    # nonexistent target -> denied (no crash)
+    assert can_ban_user(admin_acme, 99999999) is False
+
+
+@pytest.mark.django_db
+def test_can_ban_user_disabled_is_staff_only(monkeypatch):
+    """MT OFF (single-node): the gate stays exactly the legacy is_staff/is_superuser —
+    NOT the see-all is_local_admin viewer_for returns when disabled (which would let any
+    authenticated user ban). A plain member must NOT be able to ban when MT is off."""
+    from lib.cuckoo.common.tenancy import MTConfig
+    import users.tenancy as ut
+
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    staff = User.objects.create_user("s2", "s2@x.com", "x"); staff.is_staff = True; staff.save()
+    member = User.objects.create_user("m2", "m2@x.com", "x")
+    target = User.objects.create_user("t2", "t2@x.com", "x")
+    assert ut.can_ban_user(User.objects.get(pk=staff.pk), target.id) is True
+    assert ut.can_ban_user(member, target.id) is False  # MT-off does NOT grant ban to non-staff
+
+
+@pytest.mark.django_db
+def test_ban_user_view_is_tenant_scoped(mt_enabled, client):
+    """End-to-end via the ban_user view: an acme tenant-admin disables an acme user but
+    is denied a globex user (who stays active). Catches a regression that re-broadened
+    the gate back to is_staff-only or dropped the per-target tenant check."""
+    from django.urls import reverse
+    from users.models import Tenant
+
+    acme = Tenant.objects.create(slug="acme", name="Acme")
+    globex = Tenant.objects.create(slug="globex", name="Globex")
+    admin_acme = _mk_member("vaadm", acme, admin=True)
+    target_acme = _mk_member("vatgt", acme)
+    target_globex = _mk_member("vgtgt", globex)
+
+    client.force_login(admin_acme)
+    # same-tenant ban -> target disabled
+    client.get(reverse("ban_user", args=[target_acme.id]))
+    target_acme.refresh_from_db()
+    assert target_acme.is_active is False
+
+    # cross-tenant ban -> denied, target stays active
+    client.get(reverse("ban_user", args=[target_globex.id]))
+    target_globex.refresh_from_db()
+    assert target_globex.is_active is True
+
+
 def test_extract_groups_reads_userinfo_nested_claims():
     """REGRESSION (live-Keycloak e2e, 2026-06-15): allauth's openid_connect
     provider stores extra_data as {"id_token": ..., "userinfo": {...claims...}},
