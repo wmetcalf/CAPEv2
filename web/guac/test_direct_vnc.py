@@ -1,0 +1,89 @@
+"""Security tests for the direct-VNC console (upstream #3076 feat-vncclient), hardened
+for multi-tenancy. The direct console addresses VMs by NAME / host:port and mints a
+task_id=0 session the websocket consumer does NOT tenant-check, so it bypasses task-scoped
+access by design — it must be restricted to operators when MT is on (codex P1 / task #172)."""
+import ast
+import re
+
+import pytest
+from django.contrib.auth.models import User
+
+
+def _func_src(name):
+    import guac.views as v
+
+    text = open(v.__file__).read()
+    lines = text.splitlines()
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            return "\n".join(lines[start - 1: node.end_lineno])
+    return None
+
+
+def _direct_vnc_views():
+    import guac.urls
+
+    text = open(guac.urls.__file__).read()
+    return sorted(set(re.findall(r"views\.(direct_vnc_\w+)", text)))
+
+
+# ── SECURITY GATE: every by-name/host direct-VNC view must be operator-gated ──
+@pytest.mark.parametrize("name", _direct_vnc_views())
+def test_direct_vnc_view_is_operator_gated(name):
+    """Every direct_vnc_* view (routed by vm_name/host:port, which the task_id coverage
+    gate can't see) must consult _vnc_console_denied_reason — a new endpoint that only
+    checked is_vnc_console_enabled() would re-open the cross-tenant console hole."""
+    src = _func_src(name)
+    assert src is not None, f"guac.views.{name} not found"
+    assert "_vnc_console_denied_reason" in src, (
+        f"guac.views.{name} routes by VM name/host but doesn't call "
+        f"_vnc_console_denied_reason — direct-console cross-tenant risk (#172)"
+    )
+
+
+def test_direct_vnc_views_exist():
+    # guard against the route names silently changing out from under the gate above
+    assert "direct_vnc_vm" in _direct_vnc_views()
+
+
+# ── BEHAVIOURAL: the operator gate itself ──
+class _Req:
+    def __init__(self, user):
+        self.user = user
+
+
+@pytest.mark.django_db
+def test_vnc_console_denied_when_disabled(monkeypatch):
+    import guac.views as v
+
+    monkeypatch.setattr(v, "is_vnc_console_enabled", lambda: False)
+    assert v._vnc_console_denied_reason(_Req(User.objects.create_superuser("r", "r@x.com", "x"))) is not None
+
+
+@pytest.mark.django_db
+def test_vnc_console_allowed_single_node(monkeypatch):
+    """MT disabled (default/single-node): the console works for any authenticated user —
+    is_local_admin is True for everyone, so the operator gate is a no-op (back-compat)."""
+    import guac.views as v
+    from lib.cuckoo.common.tenancy import MTConfig
+    import users.tenancy as ut
+
+    monkeypatch.setattr(v, "is_vnc_console_enabled", lambda: True)
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    member = User.objects.create_user("vm", "vm@x.com", "x")
+    assert v._vnc_console_denied_reason(_Req(member)) is None
+
+
+@pytest.mark.django_db
+def test_vnc_console_operator_only_when_mt_enabled(monkeypatch, mt_enabled):
+    """MT enabled: a tenant member is DENIED the direct console; a break-glass operator
+    (local-admin) is allowed. This is the codex-P1 / #172 fix — without it any tenant could
+    drive another tenant's VM (or a live analysis) by name."""
+    import guac.views as v
+
+    monkeypatch.setattr(v, "is_vnc_console_enabled", lambda: True)
+    member = User.objects.create_user("vm2", "vm2@x.com", "x")          # tenant-less member
+    operator = User.objects.create_superuser("vroot", "vroot@x.com", "x")  # break-glass (mt_enabled: local_admins=True)
+    assert v._vnc_console_denied_reason(_Req(member)) is not None       # denied
+    assert v._vnc_console_denied_reason(_Req(operator)) is None          # operator allowed

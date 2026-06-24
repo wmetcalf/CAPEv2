@@ -46,6 +46,27 @@ def is_vnc_console_enabled():
     return bool(enabled)
 
 
+def _vnc_console_denied_reason(request):
+    """None if the direct-VNC console is allowed for this request, else a reason string.
+
+    The direct console addresses VMs by NAME / host:port and mints a task_id=0 session that
+    the websocket consumer does NOT tenant-check — it bypasses task-scoped access by design
+    (an operator tool). So on top of the [guacamole] vnc_console_enabled flag, restrict it to
+    local-admin operators whenever multitenancy is enabled; otherwise any tenant could drive
+    another tenant's VM — or a live analysis — by name (codex P1 / MT audit, task #172)."""
+    if not is_vnc_console_enabled():
+        return "VNC Console is disabled in configuration"
+    from users.tenancy import viewer_for
+
+    # Gate on is_local_admin: viewer_for marks EVERY principal is_local_admin when
+    # multitenancy is disabled (single-node operator console keeps working, back-compat),
+    # and only break-glass operators when MT is enabled — exactly the restriction we want,
+    # with no separate MT-enabled check.
+    if not viewer_for(request.user).is_local_admin:
+        return "VNC Console is restricted to operators"
+    return None
+
+
 def _error(request, task_id, msg):
     return render(request, "guac/error.html", {
         "error_msg": msg, "error": "remote session", "task_id": task_id,
@@ -129,8 +150,9 @@ def index(request, task_id, session_data):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_host_port(request, host, port):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     token = uuid.uuid4()
     try:
@@ -168,8 +190,9 @@ def direct_vnc_host_port(request, host, port):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm(request, vm_name):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -304,6 +327,27 @@ def direct_vnc_vm(request, vm_name):
             "snapshots": snapshot_names,
             "default_snapshot": default_snapshot,
         })
+
+    # SECURITY (codex P1 / MT audit, #172): a RUNNING VM locked by an active CAPE task is
+    # mid-analysis and OWNED by that task. Minting a direct task_id=0 session for it hands
+    # the caller a tunnel the websocket consumer does NOT tenant-check — bypassing the
+    # task-scoped /guac/<task_id>/ flow. Refuse; the not-running branch already guards this,
+    # but the running branch only checked for an existing GuacSession. Fail closed.
+    _machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+    if _machine and _machine.locked:
+        try:
+            from lib.cuckoo.core.data.task import Task
+            from lib.cuckoo.core.data.guests import Guest
+            from lib.cuckoo.common.constants import TASK_RUNNING
+
+            _sess = db.session()
+            _active = _sess.query(Task).filter(Task.machine_id == _machine.id, Task.status == TASK_RUNNING).first() \
+                or _sess.query(Guest).filter(Guest.label == vm_name, Guest.shutdown_on.is_(None)).first()
+        except Exception as _e:
+            logger.error("direct_vnc_vm: could not verify active task for %s: %s", vm_name, _e)
+            _active = True  # can't verify -> don't hand out a direct session
+        if _active:
+            return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
 
     token = uuid.uuid4()
     try:
@@ -558,8 +602,9 @@ sys.exit(res.returncode)
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_start(request, vm_name):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -669,8 +714,9 @@ def direct_vnc_vm_start(request, vm_name):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_shutdown(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -775,8 +821,9 @@ def get_route_params(route_name, routing, configured_vpns):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_route(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Invalid request method"}, status=405)
@@ -861,8 +908,9 @@ def direct_vnc_vm_route(request, vm_name):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshots_list(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -921,8 +969,9 @@ def direct_vnc_vm_snapshots_list(request, vm_name):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshot_create(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -1010,8 +1059,9 @@ def direct_vnc_vm_snapshot_create(request, vm_name):
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshot_delete(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
