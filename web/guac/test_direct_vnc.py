@@ -87,3 +87,26 @@ def test_vnc_console_operator_only_when_mt_enabled(monkeypatch, mt_enabled):
     operator = User.objects.create_superuser("vroot", "vroot@x.com", "x")  # break-glass (mt_enabled: local_admins=True)
     assert v._vnc_console_denied_reason(_Req(member)) is not None       # denied
     assert v._vnc_console_denied_reason(_Req(operator)) is None          # operator allowed
+
+
+def test_active_analysis_detected_without_machine_lock(cape_db):
+    """codex High / #172: the active-analysis guard MUST key off the active task/guest, NOT
+    machine.locked — CAPE marks a task TASK_RUNNING before it locks the machine, so a .locked
+    gate races (a live analysis runs while still unlocked). An active Guest for a VM whose
+    machine is NOT locked must still be detected. (Semantic check — codex noted the structural
+    grep above wouldn't catch a guard that stayed present but keyed off the wrong thing.)"""
+    import guac.views as v
+    from lib.cuckoo.core.database import Database
+    from lib.cuckoo.core.data.guests import Guest
+
+    db = Database()
+    assert v._vm_has_active_analysis("vm-idle") is False  # no analysis -> direct console allowed
+
+    # a task + an ACTIVE guest for 'vm-live' — NO machine lock involved anywhere
+    tid = db.add_url("http://example.com/")
+    sess = db.session()
+    g = Guest(name="vm-live", label="vm-live", platform="windows", manager="kvm", task_id=tid)
+    g.status = "running"  # non-null; the guard keys off label + shutdown_on, not status
+    sess.add(g)
+    sess.commit()
+    assert v._vm_has_active_analysis("vm-live") is True   # detected via active Guest, lock irrelevant

@@ -67,6 +67,31 @@ def _vnc_console_denied_reason(request):
     return None
 
 
+def _vm_has_active_analysis(vm_name):
+    """True if `vm_name` is currently hosting a live CAPE analysis — an active Guest
+    (label==vm, not yet shut down) OR a TASK_RUNNING task bound to its machine.
+
+    Keys off the active task/guest DIRECTLY, NOT machine.locked: CAPE marks a task
+    TASK_RUNNING BEFORE it locks the machine (analysis_manager), so a .locked check leaves a
+    race window where a live analysis is already running but the machine is still unlocked
+    (codex High, #172). FAILS CLOSED (returns True) if it can't determine the state — better
+    to refuse a direct console than hand one out for a possibly-live VM."""
+    try:
+        from lib.cuckoo.core.data.task import Task, TASK_RUNNING
+        from lib.cuckoo.core.data.guests import Guest
+
+        sess = db.session()
+        if sess.query(Guest).filter(Guest.label == vm_name, Guest.shutdown_on.is_(None)).first():
+            return True
+        machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+        if machine and sess.query(Task).filter(Task.machine_id == machine.id, Task.status == TASK_RUNNING).first():
+            return True
+        return False
+    except Exception as e:
+        logger.error("direct_vnc_vm: could not verify active analysis for %s: %s", vm_name, e)
+        return True  # fail closed
+
+
 def _error(request, task_id, msg):
     return render(request, "guac/error.html", {
         "error_msg": msg, "error": "remote session", "task_id": task_id,
@@ -288,8 +313,7 @@ def direct_vnc_vm(request, vm_name):
                 # Check if this lock belongs to a legitimate active CAPE analysis task
                 try:
                     from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
+                    from lib.cuckoo.core.data.task import Task, TASK_RUNNING
 
                     session = db.session()
                     active_task = session.query(Task).filter(
@@ -328,26 +352,13 @@ def direct_vnc_vm(request, vm_name):
             "default_snapshot": default_snapshot,
         })
 
-    # SECURITY (codex P1 / MT audit, #172): a RUNNING VM locked by an active CAPE task is
-    # mid-analysis and OWNED by that task. Minting a direct task_id=0 session for it hands
-    # the caller a tunnel the websocket consumer does NOT tenant-check — bypassing the
-    # task-scoped /guac/<task_id>/ flow. Refuse; the not-running branch already guards this,
-    # but the running branch only checked for an existing GuacSession. Fail closed.
-    _machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
-    if _machine and _machine.locked:
-        try:
-            from lib.cuckoo.core.data.task import Task
-            from lib.cuckoo.core.data.guests import Guest
-            from lib.cuckoo.common.constants import TASK_RUNNING
-
-            _sess = db.session()
-            _active = _sess.query(Task).filter(Task.machine_id == _machine.id, Task.status == TASK_RUNNING).first() \
-                or _sess.query(Guest).filter(Guest.label == vm_name, Guest.shutdown_on.is_(None)).first()
-        except Exception as _e:
-            logger.error("direct_vnc_vm: could not verify active task for %s: %s", vm_name, _e)
-            _active = True  # can't verify -> don't hand out a direct session
-        if _active:
-            return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
+    # SECURITY (codex P1+High / MT audit, #172): a VM hosting an active CAPE analysis is
+    # OWNED by that task. Minting a direct task_id=0 session for it hands the caller a tunnel
+    # the websocket consumer does NOT tenant-check — bypassing the task-scoped
+    # /guac/<task_id>/ flow. Refuse. _vm_has_active_analysis keys off the active task/guest
+    # DIRECTLY (not machine.locked, which races: CAPE sets TASK_RUNNING before locking).
+    if _vm_has_active_analysis(vm_name):
+        return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
 
     token = uuid.uuid4()
     try:
@@ -641,8 +652,7 @@ def direct_vnc_vm_start(request, vm_name):
             if machine.locked:
                 try:
                     from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
+                    from lib.cuckoo.core.data.task import Task, TASK_RUNNING
 
                     session = db.session()
                     active_task = session.query(Task).filter(
