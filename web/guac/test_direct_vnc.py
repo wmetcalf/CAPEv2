@@ -47,6 +47,20 @@ def test_direct_vnc_views_exist():
     assert "direct_vnc_vm" in _direct_vnc_views()
 
 
+@pytest.mark.parametrize("name", ["direct_vnc_vm", "direct_vnc_vm_start"])
+def test_active_analysis_guard_covers_get_and_post(name):
+    """codex P1: both the GET console (direct_vnc_vm) and the POST start/revert
+    (direct_vnc_vm_start) must refuse a VM hosting a live analysis — and direct_vnc_vm must
+    do it BEFORE the running/not-running branch (else a momentarily not-running busy VM falls
+    through to the start page). Assert both reference _vm_has_active_analysis."""
+    src = _func_src(name)
+    assert src is not None, f"guac.views.{name} not found"
+    assert "_vm_has_active_analysis" in src, (
+        f"guac.views.{name} must call _vm_has_active_analysis — direct console must not touch "
+        f"a VM owned by a live analysis (codex P1 / #172)"
+    )
+
+
 # ── BEHAVIOURAL: the operator gate itself ──
 class _Req:
     def __init__(self, user):

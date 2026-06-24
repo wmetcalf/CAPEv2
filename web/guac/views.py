@@ -281,6 +281,15 @@ def direct_vnc_vm(request, vm_name):
     if not vm_exists:
         return _error(request, 0, f"VM {vm_name} not found")
 
+    # SECURITY (codex P1 / MT audit, #172): refuse the direct console for ANY VM hosting a
+    # live CAPE analysis — BEFORE branching on running/not-running. libvirt can momentarily
+    # report a busy VM as not-running, which would otherwise fall through to the manual
+    # start page (and let an operator start/revert a VM owned by an active analysis).
+    # _vm_has_active_analysis keys off the active Guest/Task directly (race-free, not
+    # machine.locked); it returns False for a genuinely idle VM so the normal flow proceeds.
+    if _vm_has_active_analysis(vm_name):
+        return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
+
     # If the VM is running, check for an active Guacamole connection session
     override = request.GET.get("override") == "true"
     if is_running and not override:
@@ -357,14 +366,8 @@ def direct_vnc_vm(request, vm_name):
             "default_snapshot": default_snapshot,
         })
 
-    # SECURITY (codex P1+High / MT audit, #172): a VM hosting an active CAPE analysis is
-    # OWNED by that task. Minting a direct task_id=0 session for it hands the caller a tunnel
-    # the websocket consumer does NOT tenant-check — bypassing the task-scoped
-    # /guac/<task_id>/ flow. Refuse. _vm_has_active_analysis keys off the active task/guest
-    # DIRECTLY (not machine.locked, which races: CAPE sets TASK_RUNNING before locking).
-    if _vm_has_active_analysis(vm_name):
-        return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
-
+    # (active-analysis guard moved EARLIER — before the running/not-running branch — so it
+    # covers both the start page and the mint; see the _vm_has_active_analysis call above.)
     token = uuid.uuid4()
     try:
         guac_session = db.create_guac_session(
@@ -630,6 +633,12 @@ def direct_vnc_vm_start(request, vm_name):
 
     if request.method != "POST":
         return _error(request, 0, "Invalid request method")
+
+    # SECURITY (codex P1 / MT audit, #172): never start/revert a VM that's hosting a live
+    # CAPE analysis — that would clobber the running task. Mirror direct_vnc_vm's guard,
+    # keyed off the active Guest/Task directly (race-free, not machine.locked).
+    if _vm_has_active_analysis(vm_name):
+        return _error(request, 0, "This VM is running an active analysis — it can't be started/reverted from the direct console.")
 
     start_mode = request.POST.get("start_mode", "snapshot")
     selected_snapshot = request.POST.get("selected_snapshot")
