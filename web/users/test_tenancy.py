@@ -228,11 +228,11 @@ def test_extract_groups_reads_userinfo_nested_claims():
     + the login wiring must read it there — otherwise EVERY OIDC user resolves to
     no tenant (silent MT break). The direct reconcile_tenant unit tests pass a
     group set, so they never exercised the token-shape parsing that broke."""
-    from web.allauth_adapters import _extract_groups, _token_claims
+    from web.allauth_adapters import _extract_groups, _claims
 
     assert _extract_groups({"groups": ["acme"]}) == {"acme"}  # top-level (flat providers)
     # the real allauth openid_connect shape — groups nested under userinfo
     assert _extract_groups({"id_token": "x", "userinfo": {"groups": ["acme", "acme-admins"]}}) == {"acme", "acme-admins"}
     assert _extract_groups({"id_token": "x", "userinfo": {"sub": "1"}}) == set()  # absent -> fail-closed
-    # merged view surfaces nested claims (email + groups) for role/email reconciliation
-    assert _token_claims({"userinfo": {"email": "a@x", "groups": ["g"]}}).get("email") == "a@x"
+    # _claims flattens the openid_connect shape (id_token + userinfo) to the claim dict
+    assert _claims({"id_token": "x", "userinfo": {"email": "a@x", "groups": ["g"]}}).get("email") == "a@x"
