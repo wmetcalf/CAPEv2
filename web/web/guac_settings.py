@@ -175,8 +175,12 @@ logging.config.dictConfig(
 
 _db = init_database(exists_ok=True)
 
-# Create guac_sessions table if guacamole is enabled
-if _CapeConfig("web").guacamole.get("vnc_console_enabled", False):
+# Create guac_sessions table if EITHER guac feature is on: the task-based guac
+# (guacamole.enabled) AND the direct-VNC console (vnc_console_enabled) both use
+# guac_sessions. Gating solely on vnc_console_enabled (default off) breaks task-based
+# guac on a fresh deploy — its sessions can't be persisted (gemini review, PR #12).
+_guac_cfg = _CapeConfig("web").guacamole
+if _guac_cfg.get("enabled", False) or _guac_cfg.get("vnc_console_enabled", False):
     from lib.cuckoo.core.data.guac_session import GuacSession  # noqa: F401
     from lib.cuckoo.core.data.db_common import Base
     Base.metadata.create_all(_db.engine)

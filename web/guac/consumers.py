@@ -386,11 +386,18 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
 
                 if not is_running:
                     logger.info("VM %s is no longer running, unlocking and disconnecting", self.vm_label)
-                    db = Database()
-                    machine = await sync_to_async(db.view_machine_by_label)(self.vm_label)
-                    if machine and machine.locked:
-                        await sync_to_async(db.unlock_machine)(machine)
-                        await sync_to_async(db.session.commit)()
+                    # Consolidate fetch+unlock+commit into ONE sync call: separate
+                    # sync_to_async calls run on arbitrary pool threads, so the machine
+                    # would be fetched in one thread-local SQLAlchemy session and mutated
+                    # in another -> detached-instance error / lost commit (gemini review, PR #12).
+                    def _unlock_vm(label):
+                        db = Database()
+                        machine = db.view_machine_by_label(label)
+                        if machine and machine.locked:
+                            db.unlock_machine(machine)
+                            db.session.commit()
+
+                    await sync_to_async(_unlock_vm)(self.vm_label)
                     await self._close_websocket()
                     break
         except asyncio.CancelledError:

@@ -764,8 +764,12 @@ def get_route_params(route_name, routing, configured_vpns):
 
         return interface, rt_table, reject_segments, reject_hostports
     elif route_name in configured_vpns:
+        # routing.get(route_name) is None if the VPN section is absent from
+        # routing.conf — guard before .get() so a missing section doesn't crash the
+        # route change/shutdown with an AttributeError (gemini review, PR #12).
         vpn = routing.get(route_name)
-        return vpn.get("interface"), vpn.get("rt_table"), None, None
+        if vpn:
+            return vpn.get("interface"), vpn.get("rt_table"), None, None
     return None, None, None, None
 
 

@@ -1,7 +1,10 @@
+import logging
+
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
 
 web_cfg = Config("web")
+log = logging.getLogger("guac-session")
 
 
 def guac_vnc_console(request):
@@ -12,8 +15,14 @@ def guac_vnc_console(request):
     if not enabled:
         return {"vnc_console_enabled": False}
 
-    db = Database()
-    machines = [machine.label for machine in db.list_machines(include_reserved=True)]
+    # Runs on EVERY page render (context processor) — never let a DB hiccup 500 the
+    # whole site; fail to an empty machine list instead (gemini review, PR #12).
+    try:
+        db = Database()
+        machines = [machine.label for machine in db.list_machines(include_reserved=True)]
+    except Exception as e:
+        log.error("VNC console context processor: failed to list machines: %s", e)
+        machines = []
     new_tab = web_cfg.guacamole.get("vnc_console_new_tab", True)
     if isinstance(new_tab, str):
         new_tab = new_tab.lower() in ("yes", "true", "on", "1")
