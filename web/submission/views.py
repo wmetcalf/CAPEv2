@@ -876,13 +876,24 @@ def remote_session(request, task_id):
     session_data = ""
 
     if task.status == "running":
-        machine = db.view_machine_by_label(task.machine)
-        if not machine:
+        vm_label, guest_ip = task.machine, None
+        machine = db.view_machine_by_label(task.machine) if task.machine else None
+        if machine:
+            guest_ip = machine.ip
+        else:
+            # Central mode: the VM lives on a worker, so it's NOT in the central machines
+            # table (task.machine is empty) — resolve the worker's VM label via the broker
+            # record + worker API, mirroring status(). Without this every central interactive
+            # task errored "Machine is not set for this task."
+            from lib.cuckoo.common.central_guac import worker_vm_for_task
+            w_label, w_ip = worker_vm_for_task(task_id)
+            if w_label:
+                vm_label, guest_ip = w_label, (w_ip or "")
+        if not vm_label:
             return render(request, "error.html", {"error": "Machine is not set for this task."})
-        guest_ip = machine.ip
         machine_status = True
         session_id = uuid3(NAMESPACE_DNS, task_id).hex[:16]
-        session_data = urlsafe_b64encode(f"{session_id}|{machine.label}|{guest_ip}".encode("utf8")).decode("utf8")
+        session_data = urlsafe_b64encode(f"{session_id}|{vm_label}|{guest_ip or ''}".encode("utf8")).decode("utf8")
 
     return render(
         request,
