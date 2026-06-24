@@ -62,7 +62,12 @@ def _vnc_console_denied_reason(request):
     # multitenancy is disabled (single-node operator console keeps working, back-compat),
     # and only break-glass operators when MT is enabled — exactly the restriction we want,
     # with no separate MT-enabled check.
-    if not viewer_for(request.user).is_local_admin:
+    #
+    # request.user may be ABSENT when these views are served by the standalone Guacamole
+    # ASGI app (web.guac_settings has no AuthenticationMiddleware), so read it defensively;
+    # viewer_for(None) is is_local_admin=True when MT is off (single-node no-op) and a
+    # restricted anon viewer when MT is on (codex P2, #172).
+    if not viewer_for(getattr(request, "user", None)).is_local_admin:
         return "VNC Console is restricted to operators"
     return None
 

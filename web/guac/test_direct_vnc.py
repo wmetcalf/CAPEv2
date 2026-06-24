@@ -89,6 +89,24 @@ def test_vnc_console_operator_only_when_mt_enabled(monkeypatch, mt_enabled):
     assert v._vnc_console_denied_reason(_Req(operator)) is None          # operator allowed
 
 
+@pytest.mark.django_db
+def test_vnc_console_no_request_user_does_not_crash(monkeypatch):
+    """codex P2 / #172: when served by the standalone Guacamole ASGI app (web.guac_settings
+    has no AuthenticationMiddleware), the request has no .user. The gate must not
+    AttributeError; in single-node (MT off) it stays a no-op (allowed)."""
+    import guac.views as v
+    from lib.cuckoo.common.tenancy import MTConfig
+    import users.tenancy as ut
+
+    monkeypatch.setattr(v, "is_vnc_console_enabled", lambda: True)
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+
+    class NoUserReq:  # request object with NO .user attribute (standalone guac app)
+        pass
+
+    assert v._vnc_console_denied_reason(NoUserReq()) is None  # MT off -> allowed, no crash
+
+
 def test_active_analysis_detected_without_machine_lock(cape_db):
     """codex High / #172: the active-analysis guard MUST key off the active task/guest, NOT
     machine.locked — CAPE marks a task TASK_RUNNING before it locks the machine, so a .locked
