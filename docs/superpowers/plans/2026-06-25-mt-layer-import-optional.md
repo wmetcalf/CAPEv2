@@ -337,6 +337,14 @@ Expected: all pass (facade is a transparent pass-through when MT present). This 
 
 ## Task 4: Conditional INSTALLED_APPS + guarded ORM import
 
+> **IMPLEMENTATION NOTE (post-review, 2026-06-25):** the `CAPE_DISABLE_MT_APP` env flag below
+> was REPLACED by presence-detection — settings drops `users` from INSTALLED_APPS iff
+> `(BASE_DIR / "users").is_dir()` is false, the SAME import-availability signal the facades
+> use. The env flag diverged from the facades (flag set + files present → facades still imported
+> the real code → non-migrated-table errors). Single signal now: file presence. Runtime
+> single-tenant on a files-present deploy uses `[multitenancy] enabled = no` (existing toggle),
+> not app removal. allauth guard narrowed to `except ImportError` only (not `(ImportError, Exception)`).
+
 **Files:**
 - Modify: `web/web/settings.py` (~line 260)
 - Modify: `web/web/allauth_adapters.py` (~line 301)

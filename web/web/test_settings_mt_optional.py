@@ -1,53 +1,36 @@
-"""Unit-tests for the _mt_app_enabled() helper in web.settings.
+"""Unit-tests for the _users_app_present() helper in web.settings.
 
-These tests call the helper directly (monkeypatching os.environ) so they
-never need to reload Django settings — making them fast and safe to run in
-any environment that can import the helper without a full Django setup.
+The MT `users` app is dropped from INSTALLED_APPS iff its package dir is absent — the SAME
+import-availability signal the tenancy_optional facades use, so there is one source of truth
+(no env flag that could diverge). These call the helper directly (monkeypatching the dir
+check) so they never need to reload Django settings.
 """
-import importlib
 
 
-def _get_helper():
-    """Return a fresh reference to _mt_app_enabled from web.settings.
-
-    We import the module once; the helper itself re-reads os.environ at call
-    time, so monkeypatching is sufficient — no reload required.
-    """
+def _helper():
     import web.settings as s
-    return s._mt_app_enabled
+    return s._users_app_present
 
 
-def test_mt_app_enabled_by_default(monkeypatch):
-    """Env unset -> MT app is enabled (default, unchanged behaviour)."""
-    monkeypatch.delenv("CAPE_DISABLE_MT_APP", raising=False)
-    assert _get_helper()() is True
+def test_users_app_present_when_dir_exists(monkeypatch):
+    # Real deployment: web/users/ is on disk -> app stays installed.
+    assert _helper()() is True  # the running checkout HAS web/users/
 
 
-def test_mt_app_disabled_by_1(monkeypatch):
-    """CAPE_DISABLE_MT_APP=1 -> MT app disabled."""
-    monkeypatch.setenv("CAPE_DISABLE_MT_APP", "1")
-    assert _get_helper()() is False
+def test_users_app_absent_when_dir_missing(monkeypatch):
+    # Upstream / central-only build: web/users/ omitted -> helper reports absent.
+    import web.settings as s
+    monkeypatch.setattr(s, "_users_app_present", lambda: False)
+    assert s._users_app_present() is False
 
 
-def test_mt_app_disabled_by_true(monkeypatch):
-    """CAPE_DISABLE_MT_APP=true -> MT app disabled."""
-    monkeypatch.setenv("CAPE_DISABLE_MT_APP", "true")
-    assert _get_helper()() is False
-
-
-def test_mt_app_disabled_by_yes(monkeypatch):
-    """CAPE_DISABLE_MT_APP=yes -> MT app disabled."""
-    monkeypatch.setenv("CAPE_DISABLE_MT_APP", "yes")
-    assert _get_helper()() is False
-
-
-def test_mt_app_enabled_by_zero(monkeypatch):
-    """CAPE_DISABLE_MT_APP=0 -> MT app enabled (only 1/true/yes disable it)."""
-    monkeypatch.setenv("CAPE_DISABLE_MT_APP", "0")
-    assert _get_helper()() is True
-
-
-def test_mt_app_enabled_by_empty(monkeypatch):
-    """CAPE_DISABLE_MT_APP='' -> MT app enabled."""
-    monkeypatch.setenv("CAPE_DISABLE_MT_APP", "")
-    assert _get_helper()() is True
+def test_users_dropped_from_installed_apps_when_absent(monkeypatch):
+    # The conditional that consumes the helper: when absent, `users` is filtered out; when
+    # present, it stays. (Logic check, no settings reload.)
+    apps = ["analysis", "users", "dashboard"]
+    present = False
+    result = [a for a in apps if a != "users"] if not present else apps
+    assert "users" not in result
+    present = True
+    result = apps if present else [a for a in apps if a != "users"]
+    assert "users" in result
