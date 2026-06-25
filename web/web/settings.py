@@ -314,6 +314,23 @@ if OIDC_CFG is not None and OIDC_CFG.get("enabled", False):
         ],
     }
 
+
+def _mt_app_enabled() -> bool:
+    """Return False iff CAPE_DISABLE_MT_APP is set to a truthy value.
+
+    Read at call time so tests can monkeypatch os.environ without reloading
+    Django settings.  The default (env unset) keeps 'users' installed.
+    """
+    import os as _os
+    return _os.environ.get("CAPE_DISABLE_MT_APP", "") not in ("1", "true", "yes")
+
+
+# The multi-tenant `users` app is optional: a central-only / upstream build
+# with the MT layer absent sets CAPE_DISABLE_MT_APP=1 to drop it (and its
+# migrations).  Default keeps it installed.
+if not _mt_app_enabled():
+    INSTALLED_APPS = [a for a in INSTALLED_APPS if a != "users"]
+
 AUDIT_FRAMEWORK = web_cfg.audit_framework.get("enabled", False)
 
 if api_cfg.api.token_auth_enabled:

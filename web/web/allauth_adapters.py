@@ -298,7 +298,11 @@ def reconcile_tenant(user, user_groups: set) -> None:
     The caller skips this entirely when the groups claim is ABSENT (misconfig
     guard), mirroring role reconciliation; a present-but-empty claim is honoured.
     """
-    from users.models import Tenant, UserProfile
+    try:
+        from users.models import Tenant, UserProfile
+    except (ImportError, Exception):
+        # MT `users` app not installed -> nothing to reconcile (single-tenant deployment)
+        return
 
     matches = [t for t in Tenant.objects.filter(active=True) if user_groups & set(t.idp_groups or [])]
     prof, _ = UserProfile.objects.get_or_create(user=user)
