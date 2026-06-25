@@ -287,7 +287,7 @@ def test_can_ban_user_disabled_is_staff_only(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_ban_user_view_is_tenant_scoped(mt_enabled, client):
+def test_ban_user_view_is_tenant_scoped(mt_enabled, cape_db, client):
     """End-to-end via the ban_user view: an acme tenant-admin disables an acme user but
     is denied a globex user (who stays active). Catches a regression that re-broadened
     the gate back to is_staff-only or dropped the per-target tenant check."""
