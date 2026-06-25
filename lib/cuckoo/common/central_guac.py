@@ -4,9 +4,11 @@ Single-node: a task's live analysis VM is in local libvirt and guacd is on
 localhost. In the broker/autoscaling topology the VM runs on an ephemeral ASG
 worker, so the central guac consumer must target THAT worker's guacd + VM.
 
-worker_ip_for_task() resolves task_id (info.id) -> info.job_id (DocumentDB) ->
-the broker DynamoDB job record's sandbox_worker_ip (recorded by the dispatcher
-at dispatch time) -> the worker's private IP. Returns None for box-local /
+worker_ip_for_task() resolves task_id (info.id) -> info.job_id -> the broker job
+record's sandbox_worker_ip (recorded by the dispatcher at dispatch time) -> the
+worker's private IP. The job record is fetched via a pluggable JobDirectory
+(job_directory.py): DynamoDB by default, or the broker's HTTP status API — so the
+fork carries no hard DynamoDB/boto3 dependency. Returns None for box-local /
 single-node tasks (no broker record), so the consumer/view keep their localhost
 path unchanged when central mode is off or the task ran locally.
 """
@@ -50,23 +52,18 @@ def _job_id_for_task(task_id):
 def worker_ip_for_task(task_id):
     """Private IP of the worker hosting this task's live VM, or None (local)."""
     from lib.cuckoo.common.central_mode import central_mode_config
+    from lib.cuckoo.common.job_directory import get_job_directory
 
     cfg = central_mode_config()
-    if not cfg.enabled or not cfg.broker_table:
+    directory = get_job_directory(cfg)
+    if directory is None:
         return None
     try:
         job_id = _job_id_for_task(task_id)
         if not job_id:
             return None
-        import boto3
-
-        item = (
-            boto3.resource("dynamodb", region_name=cfg.s3_region)
-            .Table(cfg.broker_table)
-            .get_item(Key={"job_id": job_id})
-            .get("Item", {})
-        )
-        return item.get("sandbox_worker_ip") or None
+        loc = directory.lookup(job_id)
+        return loc.worker_ip if loc else None
     except Exception as e:
         log.warning("central guac: worker resolution failed for task %s: %s", task_id, e)
         return None
@@ -79,28 +76,24 @@ def worker_vm_for_task(task_id):
     record (job_id -> worker IP + the worker-local cape_task_id) then asks that worker's
     apiv2 for the task's machine. Returns (None, None) for non-bridged/local tasks."""
     from lib.cuckoo.common.central_mode import central_mode_config
+    from lib.cuckoo.common.job_directory import get_job_directory
 
     cfg = central_mode_config()
-    if not cfg.enabled or not cfg.broker_table:
+    directory = get_job_directory(cfg)
+    if directory is None:
         return (None, None)
     try:
         job_id = _job_id_for_task(task_id)
         if not job_id:
             return (None, None)
-        import boto3
-
-        item = (
-            boto3.resource("dynamodb", region_name=cfg.s3_region)
-            .Table(cfg.broker_table)
-            .get_item(Key={"job_id": job_id})
-            .get("Item", {})
-        )
-        worker_ip = item.get("sandbox_worker_ip")
-        cape_task_id = item.get("cape_task_id")
+        loc = directory.lookup(job_id)
+        if not loc:
+            return (None, None)
+        worker_ip = loc.worker_ip
+        cape_task_id = loc.cape_task_id
         if not worker_ip or cape_task_id is None:
             return (None, None)
 
-        import os
         import requests
 
         token = ""

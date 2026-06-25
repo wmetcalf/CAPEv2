@@ -12,6 +12,13 @@ from lib.cuckoo.common.storage_backend import (
     S3Store,
     get_artifact_store,
 )
+from lib.cuckoo.common.job_directory import (
+    BrokerHttpJobDirectory,
+    DynamoJobDirectory,
+    JobLocation,
+    get_job_directory,
+    loc_from_item,
+)
 
 
 def test_as_bool():
@@ -152,6 +159,63 @@ def test_s3store_is_lazy_no_client_on_construct():
     # touches the network); the client is built on first op.
     store = S3Store("bkt", "us-east-1")
     assert store._cli is None
+
+
+# ---- Phase 2: job->worker directory (interactive guac routing) ----
+
+def test_central_mode_job_directory_fields_parse():
+    d = _parse({})
+    assert d.job_directory == "dynamodb"  # default backend
+    assert d.broker_url == "" and d.broker_api_token == ""
+    c = _parse({
+        "enabled": "yes",
+        "job_directory": "BROKER_HTTP",  # normalized to lower
+        "broker_url": "https://broker.local",
+        "broker_api_token": "tok",
+    })
+    assert c.job_directory == "broker_http"
+    assert c.broker_url == "https://broker.local" and c.broker_api_token == "tok"
+
+
+def test_loc_from_item_maps_and_normalizes():
+    # the broker record (DynamoDB item OR broker HTTP status body) -> JobLocation
+    loc = loc_from_item({"sandbox_worker_ip": "10.0.0.5", "cape_task_id": 42, "status": "running"})
+    assert loc == JobLocation("10.0.0.5", 42)
+    # cape_task_id may legitimately be 0 (distinct from absent); worker_ip "" -> None
+    assert loc_from_item({"sandbox_worker_ip": "", "cape_task_id": 0}) == JobLocation(None, 0)
+    assert loc_from_item({}) == JobLocation(None, None)
+    assert loc_from_item(None) == JobLocation(None, None)
+
+
+def test_get_job_directory_off_returns_none():
+    assert get_job_directory(_parse({})) is None  # central mode off
+    # enabled but no broker_table and default backend -> None (matches pre-abstraction gate)
+    assert get_job_directory(_parse({"enabled": "yes"})) is None
+
+
+def test_get_job_directory_dynamodb_default():
+    d = get_job_directory(_parse({"enabled": "yes", "broker_table": "tbl", "s3_region": "eu-west-1"}))
+    assert isinstance(d, DynamoJobDirectory)
+    assert d.table == "tbl" and d.region == "eu-west-1"
+
+
+def test_get_job_directory_broker_http():
+    d = get_job_directory(_parse({
+        "enabled": "yes", "job_directory": "broker_http",
+        "broker_url": "https://broker.local/", "broker_api_token": "tok",
+    }))
+    assert isinstance(d, BrokerHttpJobDirectory)
+    assert d.broker_url == "https://broker.local"  # trailing slash stripped
+    assert d.token == "tok"
+
+
+def test_get_job_directory_broker_http_without_url_returns_none():
+    # broker_http selected but no broker_url -> None (caller keeps localhost path)
+    assert get_job_directory(_parse({"enabled": "yes", "job_directory": "broker_http"})) is None
+
+
+def test_broker_http_directory_no_url_lookup_none():
+    assert BrokerHttpJobDirectory("").lookup("job-1") is None
 
 
 def test_upload_target_realpath(tmp_path):
