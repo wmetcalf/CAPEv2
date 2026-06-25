@@ -40,7 +40,7 @@ def test_mt_absent_facades_see_all_and_base_views_import():
         assert W.can_view_sample(object(), sha256="x") is True
         assert W.viewer_for(object()).is_local_admin is True
         assert W.viewer_scope_filter(object()) is None
-        assert W.submission_scope(object()) is None
+        assert W.submission_scope(object()) == (None, W.PUBLIC)  # 2-tuple, not None (callers unpack)
 
         # the base view modules import with the MT layer absent (the core un-weave claim)
         for mod in ("analysis.views", "apiv2.views", "submission.views",

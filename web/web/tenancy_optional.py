@@ -84,10 +84,13 @@ def can_ban_user(actor, target_user_id):
 
 
 def submission_scope(request):
+    """Resolve (tenant_id, visibility) for a new submission. The real function returns a
+    2-tuple and every caller unpacks it (`_tid, _vis = submission_scope(request)`), so the
+    MT-absent fallback must ALSO be a 2-tuple — single-tenant: no tenant, public default."""
     try:
         from users.tenancy import submission_scope as real
     except ImportError:
-        return None
+        return (None, PUBLIC)
     return real(request)
 
 

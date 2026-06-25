@@ -27,10 +27,13 @@ def test_lib_facade_absent_is_see_all(monkeypatch):
 
 def test_web_facade_absent_is_see_all(monkeypatch):
     _hide(monkeypatch, "users.tenancy")
-    from web.tenancy_optional import can_view_task, can_view_sample, submission_scope, can_ban_user
+    from web.tenancy_optional import can_view_task, can_view_sample, submission_scope, can_ban_user, PUBLIC
     assert can_view_task(object(), object()) is True
     assert can_view_sample(object(), sha256="x") is True
-    assert submission_scope(object()) is None
+    # submission_scope MUST return a 2-tuple (callers unpack it); single-tenant -> (None, public)
+    assert submission_scope(object()) == (None, PUBLIC)
+    _tid, _vis = submission_scope(object())  # unpack like the real callers do
+    assert (_tid, _vis) == (None, "public")
     assert can_ban_user(object(), 1) is True
 
 

@@ -300,8 +300,11 @@ def reconcile_tenant(user, user_groups: set) -> None:
     """
     try:
         from users.models import Tenant, UserProfile
-    except (ImportError, Exception):
-        # MT `users` app not installed -> nothing to reconcile (single-tenant deployment)
+    except ImportError:
+        # MT `users` app not deployed -> nothing to reconcile (single-tenant deployment).
+        # Catch ImportError ONLY: a runtime error importing a DEPLOYED users app (e.g.
+        # AppRegistryNotReady, a real bug in the module) must propagate, not be swallowed
+        # into a silent skip that leaves tenant membership stale (fail-closed).
         return
 
     matches = [t for t in Tenant.objects.filter(active=True) if user_groups & set(t.idp_groups or [])]
