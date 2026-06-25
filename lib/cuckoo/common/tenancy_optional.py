@@ -11,7 +11,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Viewer:
-    """Fallback viewer used only when the MT layer is absent — see-all (is_local_admin)."""
+    """FALLBACK viewer, returned by viewer_for() ONLY when the MT layer is absent — see-all
+    (is_local_admin=True). When MT IS deployed, viewer_for() returns the REAL
+    lib.cuckoo.common.tenancy.Viewer, a DIFFERENT class. So do NOT
+    `isinstance(viewer_for(u), Viewer)` against this type — it's False in production. Treat
+    viewer_for()'s result structurally (.is_local_admin / .tenant_id), never by type."""
     user_id: int = 0
     tenant_id: int = 0
     is_tenant_admin: bool = False
@@ -20,6 +24,9 @@ class Viewer:
 
 @dataclass(frozen=True)
 class MTConfig:
+    """FALLBACK config, returned by multitenancy_config() ONLY when the MT layer is absent.
+    When MT is deployed the REAL lib.cuckoo.common.tenancy.MTConfig (a different class) is
+    returned — don't isinstance-check against this; read .enabled / .mode structurally."""
     enabled: bool = False
     mode: str = "shared"
     default_visibility: str = ""
