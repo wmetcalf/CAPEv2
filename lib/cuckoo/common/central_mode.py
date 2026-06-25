@@ -55,6 +55,20 @@ class CentralModeConfig:
     s3_bucket: str = ""
     s3_region: str = "us-east-1"
     s3_prefix: str = "results"  # results/<job_id>/...
+    # Artifact storage backend (when central mode is ON). "s3" = any S3-compatible object
+    # store (AWS S3, MinIO, Ceph RGW, …) via boto3; "local" = a shared local/NFS mount.
+    # Single-node (enabled=False) always uses the local storage/analyses tree regardless.
+    storage_backend: str = "s3"
+    # S3-compatible endpoint + creds. ALL OPTIONAL: empty s3_endpoint_url -> AWS's default
+    # endpoint; empty creds -> boto3's default chain (IAM role on AWS). Set them to point at
+    # MinIO/Ceph/etc. — this is the ONLY thing that made the artifact store AWS-locked.
+    s3_endpoint_url: str = ""
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    # For storage_backend="local" (central with a shared mount): the root the per-job
+    # artifact trees live under (results/<job_id>/...). Empty -> falls back to the local
+    # storage/analyses tree.
+    central_local_root: str = ""
     # Broker job-tracking DynamoDB table — lets the central node resolve a live
     # job to the worker hosting its VM (interactive Guacamole worker routing).
     broker_table: str = ""
@@ -72,6 +86,11 @@ def _parse(sec) -> "CentralModeConfig":
         s3_bucket=str(get("s3_bucket", "") or ""),
         s3_region=str(get("s3_region", "us-east-1") or "us-east-1"),
         s3_prefix=str(get("s3_prefix", "results") or "results"),
+        storage_backend=str(get("storage_backend", "s3") or "s3").strip().lower(),
+        s3_endpoint_url=str(get("s3_endpoint_url", "") or ""),
+        s3_access_key=str(get("s3_access_key", "") or ""),
+        s3_secret_key=str(get("s3_secret_key", "") or ""),
+        central_local_root=str(get("central_local_root", "") or ""),
         broker_table=str(get("broker_table", "") or ""),
     )
 

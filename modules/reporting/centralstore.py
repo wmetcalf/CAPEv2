@@ -19,6 +19,7 @@ import re
 from lib.cuckoo.common.abstracts import Report
 from lib.cuckoo.common.central_mode import central_mode_config, upload_target_realpath
 from lib.cuckoo.common.exceptions import CuckooReportError
+from lib.cuckoo.common.storage_backend import get_artifact_store
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +74,20 @@ class CentralStore(Report):
         if not cfg.enabled:
             return  # single-node: no-op, behavior byte-for-byte unchanged
 
-        if not cfg.s3_bucket:
-            raise CuckooReportError("centralstore: central_mode enabled but [central_mode] s3_bucket unset")
+        store, _is_central = get_artifact_store(cfg)
+        # Validate the configured backend's prerequisites up front so a misconfig fails
+        # with one clean CuckooReportError, not N per-file upload failures (which would
+        # leave the job retained-but-never-done). The S3 path (default storage_backend)
+        # needs a bucket + boto3; the shared-mount path (storage_backend=local +
+        # central_local_root) needs neither.
+        using_local_mount = cfg.storage_backend == "local" and bool(cfg.central_local_root)
+        if not using_local_mount:
+            if not cfg.s3_bucket:
+                raise CuckooReportError("centralstore: central_mode enabled but [central_mode] s3_bucket unset")
+            try:
+                import boto3  # noqa: F401
+            except ImportError as e:
+                raise CuckooReportError("centralstore: central mode requires boto3") from e
 
         info = results.setdefault("info", {})
         analysis_id = info.get("id")
@@ -98,22 +111,21 @@ class CentralStore(Report):
         if _m:
             info["id"] = int(_m.group(1))
 
-        try:
-            import boto3
-        except ImportError as e:
-            raise CuckooReportError("centralstore: central mode requires boto3") from e
-
-        s3 = boto3.client("s3", region_name=cfg.s3_region)
-        uploaded, failed = self._upload_tree(s3, cfg.s3_bucket, cfg.s3_prefix, job_id)
+        # The per-analysis container the read seam resolves to (artifact_storage.
+        # _store_and_container builds the same "<prefix>/<job_id>"). The raw object I/O
+        # is the pluggable store (S3-compatible or shared mount); the symlink-exfil
+        # guard + job_id keying stay here.
+        container = f"{cfg.s3_prefix}/{job_id}"
+        uploaded, failed = self._upload_tree(store, container)
         # Guac recordings live outside the analysis tree (top-level storage/
         # guacrecordings/), so they need their own pass. Fold their counts in so the
         # done marker — the cleanup purge gate — only fires once EVERYTHING this job
-        # produced (tree + binaries + any recording) is confirmed in S3.
-        rec_up, rec_failed = self._upload_guacrecordings(s3, cfg.s3_bucket, cfg.s3_prefix, job_id, analysis_id)
+        # produced (tree + binaries + any recording) is confirmed in the central store.
+        rec_up, rec_failed = self._upload_guacrecordings(store, container, analysis_id)
         uploaded += rec_up
         failed += rec_failed
-        log.info("centralstore: uploaded %d artifacts (%d recordings) to s3://%s/%s/%s/ (%d failed)",
-                 uploaded, rec_up, cfg.s3_bucket, cfg.s3_prefix, job_id, failed)
+        log.info("centralstore: uploaded %d artifacts (%d recordings) to %s/ (%d failed)",
+                 uploaded, rec_up, container, failed)
 
         # Stamp a local marker ONLY when the whole tree is confirmed in S3. The worker's
         # cape-nvme-cleanup gate keys off this file: present => artifacts are durable in
@@ -137,7 +149,7 @@ class CentralStore(Report):
             os.path.realpath(os.path.join(storage_root, "guacrecordings")),
         ]
 
-    def _upload_tree(self, s3, bucket, prefix, job_id):
+    def _upload_tree(self, store, container):
         base = self.analysis_path
         if not base or not os.path.isdir(base):
             log.warning("centralstore: analysis_path missing or not a dir: %s", base)
@@ -162,16 +174,15 @@ class CentralStore(Report):
                     log.warning("centralstore: skipping out-of-tree/untrusted artifact %s", full)
                     continue
                 rel = os.path.relpath(full, base)
-                key = f"{prefix}/{job_id}/{rel}"
                 try:
-                    s3.upload_file(src, bucket, key)
+                    store.put_file(src, container, rel)
                     count += 1
                 except Exception as e:
                     failed += 1
-                    log.warning("centralstore: failed to upload %s -> %s: %s", rel, key, e)
+                    log.warning("centralstore: failed to upload %s -> %s/%s: %s", rel, container, rel, e)
         return count, failed
 
-    def _upload_guacrecordings(self, s3, bucket, prefix, job_id, task_id):
+    def _upload_guacrecordings(self, store, container, task_id):
         """Ship Guacamole session recordings for this task. Recordings live in the
         top-level storage/guacrecordings/ (NOT inside the analysis tree, so the walk
         above never sees them) and are named '<task_id>_<session_id>' by the guac
@@ -194,13 +205,13 @@ class CentralStore(Report):
             full = os.path.join(rec_root, fn)
             if os.path.islink(full) or not os.path.isfile(full):
                 continue
-            key = f"{prefix}/{job_id}/guacrecordings/{fn}"
+            rel = f"guacrecordings/{fn}"
             try:
-                s3.upload_file(full, bucket, key)
+                store.put_file(full, container, rel)
                 count += 1
             except Exception as e:
                 failed += 1
-                log.warning("centralstore: failed to upload recording %s -> %s: %s", fn, key, e)
+                log.warning("centralstore: failed to upload recording %s -> %s/%s: %s", fn, container, rel, e)
         return count, failed
 
     def _write_done_marker(self, cfg, job_id, uploaded):
@@ -211,13 +222,19 @@ class CentralStore(Report):
         if not base or not os.path.isdir(base):
             return
         marker = os.path.join(base, ".centralstore.done")
+        # Backend-aware location string: s3://bucket/... for the S3 path, or the shared
+        # mount's <root>/<prefix>/<job_id>/ for the local path. Informational only.
+        if cfg.storage_backend == "local" and cfg.central_local_root:
+            location = os.path.join(cfg.central_local_root, cfg.s3_prefix, job_id) + os.sep
+        else:
+            location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
         try:
             import json
             import time
             with open(marker, "w") as f:
                 json.dump({
                     "job_id": job_id,
-                    "s3": "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id),
+                    "location": location,
                     "artifacts": uploaded,
                     "ts": time.time(),
                 }, f)
