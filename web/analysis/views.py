@@ -192,7 +192,7 @@ if enabledconf["mongodb"] or enabledconf["elasticsearchdb"]:
 
 db: TasksMixIn = Database()
 
-from users.tenancy import can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, can_ban_user
+from web.tenancy_optional import can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, can_ban_user
 
 
 def require_task_manage(view):

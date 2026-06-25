@@ -30,7 +30,7 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from users.tenancy import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
+from web.tenancy_optional import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
 from lib.cuckoo.common.tenancy import VISIBILITIES
 
 

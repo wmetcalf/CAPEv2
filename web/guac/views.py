@@ -11,7 +11,7 @@ from django.shortcuts import render, redirect
 
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
-from users.tenancy import can_view_task
+from web.tenancy_optional import can_view_task
 
 logger = logging.getLogger("guac-session")
 
@@ -56,7 +56,7 @@ def _vnc_console_denied_reason(request):
     another tenant's VM — or a live analysis — by name (codex P1 / MT audit, task #172)."""
     if not is_vnc_console_enabled():
         return "VNC Console is disabled in configuration"
-    from users.tenancy import viewer_for
+    from web.tenancy_optional import viewer_for
 
     # Gate on is_local_admin: viewer_for marks EVERY principal is_local_admin when
     # multitenancy is disabled (single-node operator console keeps working, back-compat),

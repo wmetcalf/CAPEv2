@@ -15,7 +15,7 @@ from contextlib import suppress
 
 from django.conf import settings
 
-from users.tenancy import submission_scope, can_view_task, can_view_sample, viewer_for
+from web.tenancy_optional import submission_scope, can_view_task, can_view_sample, viewer_for
 from lib.cuckoo.common.tenancy import multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import redirect, render

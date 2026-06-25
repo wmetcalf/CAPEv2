@@ -15,7 +15,7 @@ sys.path.append(settings.CUCKOO_PATH)
 
 from lib.cuckoo.core.database import Database
 from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_REPORTED
-import users.tenancy as _ut
+import web.tenancy_optional as _ut
 
 
 # Conditional decorator for web authentication

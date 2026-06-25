@@ -14,7 +14,7 @@ sys.path.append(settings.CUCKOO_PATH)
 import lib.cuckoo.common.compare as compare
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
-from users.tenancy import can_view_task
+from web.tenancy_optional import can_view_task
 
 enabledconf = {}
 confdata = Config("reporting").get_config()
