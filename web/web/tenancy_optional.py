@@ -13,12 +13,32 @@ from lib.cuckoo.common.tenancy_optional import (  # noqa: F401
     VISIBILITIES,
     Viewer,
     default_visibility,
-    multitenancy_config,
     scope_match,
-    viewer_for,
     viewer_scope_es_filter,
     viewer_scope_match,
 )
+
+
+# viewer_for and multitenancy_config are delegated to users.tenancy (NOT the lib facade):
+# the web layer historically imported these from users.tenancy, whose own viewer_for resolves
+# multitenancy_config in the users.tenancy namespace. Routing them through the lib module would
+# read a different binding (e.g. test fixtures patch users.tenancy.multitenancy_config), silently
+# changing scoping. In production both bindings point at the same object; this preserves the
+# web layer's exact resolution.
+def viewer_for(user):
+    try:
+        from users.tenancy import viewer_for as real
+    except ImportError:
+        return Viewer()
+    return real(user)
+
+
+def multitenancy_config():
+    try:
+        from users.tenancy import multitenancy_config as real
+    except ImportError:
+        return MTConfig()
+    return real()
 
 
 def can_view_task(user, task):
