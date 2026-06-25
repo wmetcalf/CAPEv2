@@ -67,9 +67,9 @@ def _task_sample_sha256(request, task_id):
     the viewer. central S3 stores only this binary (key <job_id>/binary), not a by-hash
     store, so callers serving sample bytes must confirm the requested hash IS this."""
     from dev_utils.mongodb import mongo_find_one
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
 
-    doc = mongo_find_one("analysis", central_analysis_query(task_id, scope=entitled_scope_filter(request.user)),
+    doc = mongo_find_one("analysis", central_analysis_query(task_id, scope=viewer_scope(request.user)),
                          {"target.file.sha256": 1, "_id": 0})
     return ((((doc or {}).get("target") or {}).get("file") or {}).get("sha256") or "").lower()
 
@@ -81,12 +81,12 @@ def central_stage_one(request, task_id, s3_relpath, dest_abspath):
     store, OUTSIDE the analysis tree). Best-effort; never raises into the view."""
     import shutil
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import materialize_artifact
 
     if os.path.exists(dest_abspath):
         return
-    src, is_temp = materialize_artifact(task_id, s3_relpath, scope=entitled_scope_filter(request.user))
+    src, is_temp = materialize_artifact(task_id, s3_relpath, scope=viewer_scope(request.user))
     if not src:
         return
     try:
@@ -108,22 +108,22 @@ def central_stage_local(request, task_id):
     lot of duplicated fork code, so instead we materialize the tree and let the
     upstream zip path below run byte-for-byte unchanged. Cached via the .central_staged
     marker (cheap on repeat); best-effort (never raises into the view)."""
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import ensure_local_analysis
 
-    ensure_local_analysis(task_id, scope=entitled_scope_filter(request.user))
+    ensure_local_analysis(task_id, scope=viewer_scope(request.user))
 
 
 def central_file_nl(request, category, task_id, dlfile):
     """Inline report assets: screenshots, bingraph, vba2graph (file_nl)."""
     from django.http import Http404
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import artifact_response
 
     # tenant-scope the S3/DocumentDB lookup as defence-in-depth against task_id
     # collisions across workers (audit HIGH).
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     if category == "screenshot":
         cands = [(os.path.join("shots", dlfile + ext), dlfile + ext, cd) for ext, cd in ((".jpg", "image/jpeg"), (".png", "image/png"))]
     elif category == "bingraph":
@@ -144,10 +144,10 @@ def central_filereport(request, task_id, fname):
     """Full analysis report download (filereport); fname is the resolved report file."""
     from django.http import Http404
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import artifact_response
 
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     try:
         return artifact_response(task_id, f"reports/{fname}", "application/octet-stream", f"{task_id}_{fname}", scope=scope)
     except Http404:
@@ -158,10 +158,10 @@ def central_full_memory_dump(request, analysis_number, names):
     """Full memory dump / its strings (whole-file); names = candidate relpaths."""
     from django.http import Http404
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import artifact_response
 
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     for name in names:
         try:
             return artifact_response(analysis_number, name, "application/octet-stream", name, scope=scope)
@@ -178,9 +178,9 @@ def central_file(request, category, task_id, dlfile):
     clear central-mode error rather than a silent 404."""
     from django.http import Http404
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope, viewer_can_view_sample
     from lib.cuckoo.common.artifact_storage import artifact_response
-    from analysis.views import can_view_sample, zip_categories
+    from analysis.views import zip_categories
 
     OCTET = "application/octet-stream"
     PCAP = "application/vnd.tcpdump.pcap"
@@ -194,7 +194,7 @@ def central_file(request, category, task_id, dlfile):
         # otherwise return not-found rather than streaming the WRONG file's bytes under
         # the requested-hash name (review: wrong-artifact). dropped/related-by-hash from
         # S3 is a documented follow-on.
-        if not can_view_sample(request.user, sha256=dlfile):
+        if not viewer_can_view_sample(request.user, sha256=dlfile):
             return render(request, "error.html", {"error": "File not found"})
         if _task_sample_sha256(request, task_id) != dlfile.lower():
             return render(request, "error.html", {"error": "File not found"})
@@ -239,7 +239,7 @@ def central_file(request, category, task_id, dlfile):
             "error": f"'{category}' is not yet available in central mode (server-side bundle/generated artifact)"})
 
     relpath, fn, cd = spec
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     try:
         return artifact_response(task_id, relpath, cd, f"{task_id}_{fn}", scope=scope)
     except Http404:
@@ -257,10 +257,10 @@ def central_open_procdump(request, task_id, origname):
 
     from django.conf import settings
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope
     from lib.cuckoo.common.artifact_storage import materialize_artifact
 
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     dumpfile, is_temp = materialize_artifact(task_id, f"memory/{origname}", scope=scope)
     if dumpfile:
         return dumpfile, (dumpfile if is_temp else None), None
@@ -298,15 +298,15 @@ def central_vtupload(request, category, task_id, filename, dlfile):
 
     import requests
 
-    from dashboard.views import entitled_scope_filter
+    from analysis.central_scope import viewer_scope, viewer_can_view_sample
     from lib.cuckoo.common.artifact_storage import materialize_artifact
-    from analysis.views import can_view_sample, enabledconf, integrations_cfg
+    from analysis.views import enabledconf, integrations_cfg
 
     if not (enabledconf["vtupload"] and integrations_cfg.virustotal.apikey):
         return render(request, "error.html", {"error": "VirusTotal upload is not enabled"})
 
     if category in ("sample", "static"):
-        if not can_view_sample(request.user, sha256=dlfile):
+        if not viewer_can_view_sample(request.user, sha256=dlfile):
             return render(request, "error.html", {"error": "File not found"})
         relpath = "binary"
     elif category == "dropped":
@@ -316,7 +316,7 @@ def central_vtupload(request, category, task_id, filename, dlfile):
     else:
         return render(request, "error.html", {"error": "Category not defined"})
 
-    scope = entitled_scope_filter(request.user)
+    scope = viewer_scope(request.user)
     path, is_temp = materialize_artifact(task_id, relpath, scope=scope)
     if not path:
         return render(request, "error.html", {"error": "File not found"})

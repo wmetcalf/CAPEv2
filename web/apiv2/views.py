@@ -118,9 +118,9 @@ def _central_stage(request, task_id, include_memory=False):
         if not central_mode_config().enabled:
             return
         from lib.cuckoo.common.artifact_storage import ensure_local_analysis, ensure_local_memory
-        from dashboard.views import entitled_scope_filter
+        from analysis.central_scope import viewer_scope
 
-        scope = entitled_scope_filter(request.user)
+        scope = viewer_scope(request.user)
         ensure_local_analysis(task_id, scope=scope)
         if include_memory:
             ensure_local_memory(task_id, scope=scope)
