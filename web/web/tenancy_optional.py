@@ -5,7 +5,20 @@ Same contract as the lib facade: delegate when the MT layer is importable, fall 
 MT-disabled-equivalent value when it raises ImportError, FAIL-CLOSED on runtime errors. Re-
 exports the lib-level facade symbols so a view needs a single import.
 """
-from lib.cuckoo.common.tenancy_optional import MTConfig, Viewer, multitenancy_config, scope_match, viewer_for  # noqa: F401
+from lib.cuckoo.common.tenancy_optional import (  # noqa: F401
+    MTConfig,
+    PRIVATE,
+    PUBLIC,
+    TENANT,
+    VISIBILITIES,
+    Viewer,
+    default_visibility,
+    multitenancy_config,
+    scope_match,
+    viewer_for,
+    viewer_scope_es_filter,
+    viewer_scope_match,
+)
 
 
 def can_view_task(user, task):

@@ -30,8 +30,7 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from web.tenancy_optional import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for
-from lib.cuckoo.common.tenancy import VISIBILITIES
+from web.tenancy_optional import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, VISIBILITIES
 
 
 def _deny_if_hidden(request, task):

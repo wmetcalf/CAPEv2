@@ -1393,8 +1393,8 @@ def _build_es_user_filter(privs: bool, user_id: int):
 # The viewer-scope query builders live in the pure tenancy module (single source
 # of truth, shared with cape_utils & co); keep the _-prefixed local aliases so the
 # in-module callers (perform_search, top_detections) are unchanged.
-from lib.cuckoo.common.tenancy import viewer_scope_match as _viewer_scope_match  # noqa: E402
-from lib.cuckoo.common.tenancy import viewer_scope_es_filter as _viewer_scope_es_filter  # noqa: E402
+from lib.cuckoo.common.tenancy_optional import viewer_scope_match as _viewer_scope_match  # noqa: E402
+from lib.cuckoo.common.tenancy_optional import viewer_scope_es_filter as _viewer_scope_es_filter  # noqa: E402
 
 
 def perform_search(

@@ -321,8 +321,8 @@ def static_config_parsers(cape_name: str, file_path: str, file_data: bytes) -> d
 
 
 # Shared, single-source-of-truth scope builders (avoid drift with web_utils).
-from lib.cuckoo.common.tenancy import viewer_scope_match as _config_lookup_scope  # noqa: E402
-from lib.cuckoo.common.tenancy import viewer_scope_es_filter as _config_lookup_es_filter  # noqa: E402
+from lib.cuckoo.common.tenancy_optional import viewer_scope_match as _config_lookup_scope  # noqa: E402
+from lib.cuckoo.common.tenancy_optional import viewer_scope_es_filter as _config_lookup_es_filter  # noqa: E402
 
 
 def static_config_lookup(file_path: str, sha256: str = False, viewer=None) -> dict:

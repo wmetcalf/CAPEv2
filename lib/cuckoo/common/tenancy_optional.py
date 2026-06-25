@@ -48,3 +48,42 @@ def scope_match(scope, viewer):
     except ImportError:
         return None
     return real(scope, viewer)
+
+
+# Visibility constants — stable contract values. Present -> the real module's values;
+# absent -> the same literals so callers comparing/storing visibility still work.
+try:
+    from lib.cuckoo.common.tenancy import PUBLIC, PRIVATE, TENANT, VISIBILITIES  # noqa: F401
+except ImportError:
+    PUBLIC, TENANT, PRIVATE = "public", "tenant", "private"
+    VISIBILITIES = (PUBLIC, TENANT, PRIVATE)
+
+
+def default_visibility(cfg):
+    """Submit-time default visibility for the configured mode (see-all path -> PUBLIC)."""
+    try:
+        from lib.cuckoo.common.tenancy import default_visibility as real
+    except ImportError:
+        if getattr(cfg, "default_visibility", "") in VISIBILITIES:
+            return cfg.default_visibility
+        return PUBLIC if getattr(cfg, "mode", "shared") == "shared" else TENANT
+    return real(cfg)
+
+
+def viewer_scope_match(viewer):
+    """Mongo $match restricting a query to the viewer's entitled scopes, or None (no
+    filter / see-all) when MT is disabled or the layer is absent."""
+    try:
+        from lib.cuckoo.common.tenancy import viewer_scope_match as real
+    except ImportError:
+        return None
+    return real(viewer)
+
+
+def viewer_scope_es_filter(viewer):
+    """Elasticsearch bool-filter analogue of viewer_scope_match, or None (see-all)."""
+    try:
+        from lib.cuckoo.common.tenancy import viewer_scope_es_filter as real
+    except ImportError:
+        return None
+    return real(viewer)

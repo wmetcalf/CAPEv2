@@ -72,7 +72,7 @@ def entitled_scope_filter(user):
     scopes = entitled_scopes(user)
     if "global" in scopes:
         return None
-    from lib.cuckoo.common.tenancy import scope_match
+    from lib.cuckoo.common.tenancy_optional import scope_match
 
     v = _ut.viewer_for(user)
     clauses = []
