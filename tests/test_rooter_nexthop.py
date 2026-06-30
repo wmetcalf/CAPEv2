@@ -100,3 +100,37 @@ def test_nexthop_fail_closed_argv(rec):
         ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
         ("ip", "rule", "add", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 5: nexthop_teardown + nexthop_configure
+# ---------------------------------------------------------------------------
+
+def test_nexthop_teardown_sweeps_policy_routing(rec, monkeypatch):
+    # Make `ip rule show` return two in-band per-task rules + one out-of-band rule.
+    def fake_run(*args):
+        rec["run"].append(tuple(str(a) for a in args))
+        if args[:3] == ("ip", "rule", "show"):
+            return ("10042: from 192.168.100.42 lookup 201\n"
+                    "10043: from 192.168.100.43 lookup 202\n"
+                    "32766: from all lookup main\n", "")
+        return ("", "")
+    monkeypatch.setattr(rooter, "run", fake_run)
+
+    rooter.nexthop_teardown("201,202", "192.168.100.0/24", "250", "30000", "10000", "10255")
+
+    assert ("ip", "route", "flush", "table", "201") in rec["run"]
+    assert ("ip", "route", "flush", "table", "202") in rec["run"]
+    assert ("ip", "route", "del", "blackhole", "default", "table", "250") in rec["run"]
+    assert ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000") in rec["run"]
+    # in-band per-task rules swept; the 32766 main rule untouched
+    assert ("ip", "rule", "del", "priority", "10042") in rec["run"]
+    assert ("ip", "rule", "del", "priority", "10043") in rec["run"]
+    assert ("ip", "rule", "del", "priority", "32766") not in rec["run"]
+
+
+def test_nexthop_configure_sets_globals(rec):
+    rooter.nexthop_configure("201,202", "192.168.100.0/24", "250", "30000", "10000", "10255")
+    assert rooter.GATEWAY_TABLES_CSV == "201,202"
+    assert rooter.NEXTHOP_VM_NET == "192.168.100.0/24"
+    assert rooter.NEXTHOP_FAIL_TABLE == "250"
