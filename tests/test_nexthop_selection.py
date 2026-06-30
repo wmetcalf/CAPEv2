@@ -131,8 +131,10 @@ def test_gwx_loader_populates_and_coerces(monkeypatch):
 
 def test_nexthop_default_route_boots_without_vpn(monkeypatch):
     import lib.cuckoo.core.startup as startup
-    # Seed gateways so "gw1" is known
-    monkeypatch.setattr(core_rooter, "gateways", {"gw1": _FakeGw1()}, raising=False)
+    # Seed gateways so "gw1" is known. validate_default_route reads the module-global
+    # `gateways` in startup's namespace (bound via `from ... import gateways`), so patch
+    # THAT binding — patching core_rooter.gateways would be invisible to startup.
+    monkeypatch.setattr(startup, "gateways", {"gw1": _FakeGw1()})
     # routing.route = "gw1", nexthop enabled, vpn disabled -> must NOT raise
     startup.validate_default_route(_FakeRouting(route="gw1"))
 
@@ -140,7 +142,7 @@ def test_nexthop_default_route_boots_without_vpn(monkeypatch):
 def test_unknown_gateway_default_route_raises(monkeypatch):
     import lib.cuckoo.core.startup as startup
     from lib.cuckoo.common.exceptions import CuckooStartupError
-    # gateways is empty — "gw9" is unknown
-    monkeypatch.setattr(core_rooter, "gateways", {}, raising=False)
+    # gateways is empty — "gw9" is unknown (patch startup's binding, not core_rooter's)
+    monkeypatch.setattr(startup, "gateways", {})
     with pytest.raises(CuckooStartupError):
         startup.validate_default_route(_FakeRouting(route="gw9"))
