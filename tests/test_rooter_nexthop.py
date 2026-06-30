@@ -134,3 +134,6 @@ def test_nexthop_configure_sets_globals(rec):
     assert rooter.GATEWAY_TABLES_CSV == "201,202"
     assert rooter.NEXTHOP_VM_NET == "192.168.100.0/24"
     assert rooter.NEXTHOP_FAIL_TABLE == "250"
+    assert rooter.NEXTHOP_PRIORITY_LOW == "30000"
+    assert rooter.NEXTHOP_BAND_LO == "10000"
+    assert rooter.NEXTHOP_BAND_HI == "10255"

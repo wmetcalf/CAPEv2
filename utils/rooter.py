@@ -44,7 +44,7 @@ class ServicePaths:
 # ---------------------------------------------------------------------------
 GATEWAY_TABLES_CSV = ""
 NEXTHOP_VM_NET = "255.255.255.255/32"   # matches nothing if mis-fired before configure
-NEXTHOP_FAIL_TABLE = "250"
+NEXTHOP_FAIL_TABLE = "250"   # best-effort del is a no-op; table 250 is not kernel-reserved
 NEXTHOP_PRIORITY_LOW = "30000"
 NEXTHOP_BAND_LO = "10000"
 NEXTHOP_BAND_HI = "10255"
