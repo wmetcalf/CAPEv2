@@ -56,7 +56,7 @@ from lib.cuckoo.core.database import Database
 from lib.cuckoo.core.data.task import TASK_FAILED_ANALYSIS, TASK_RUNNING
 from lib.cuckoo.core.log import init_logger
 from lib.cuckoo.core.plugins import import_package, import_plugin, list_plugins
-from lib.cuckoo.core.rooter import rooter, socks5s, vpns
+from lib.cuckoo.core.rooter import gateways, rooter, socks5s, vpns
 
 log = logging.getLogger()
 
@@ -66,6 +66,67 @@ routing = Config("routing")
 repconf = Config("reporting")
 auxconf = Config("auxiliary")
 dist_conf = Config("distributed")
+
+# ---------------------------------------------------------------------------
+# Next-hop egress primitive — constants used by loader + SIGTERM path
+# ---------------------------------------------------------------------------
+NEXTHOP_FAIL_TABLE = "250"
+NEXTHOP_PRIORITY_LOW = "30000"
+NEXTHOP_BAND_LO = "10000"
+NEXTHOP_BAND_HI = "10255"
+_RESERVED_ROUTE_NAMES = {"none", "internet", "tor", "inetsim", "drop", "false"}
+
+
+def load_nexthop_profiles(routing_cfg):
+    """Parse [nexthop]/[gwX] sections into the rooter.gateways global, sweep stale
+    policy-routing state, then arm fail-closed.  No-op when [nexthop] is absent
+    or disabled (review M4 hasattr guard)."""
+    if not hasattr(routing_cfg, "nexthop") or not routing_cfg.nexthop.enabled:
+        return
+    tables = []
+    for name in routing_cfg.nexthop.gateways.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if name in _RESERVED_ROUTE_NAMES or name in vpns or name in socks5s or name[:3] == "tun":
+            raise CuckooStartupError(f"nexthop gateway id '{name}' collides with a reserved/route name")
+        if not hasattr(routing_cfg, name):
+            raise CuckooStartupError(f"nexthop gateway '{name}' has no [{name}] section in routing.conf")
+        entry = routing_cfg.get(name)
+        entry.rt_table = str(entry.rt_table)   # coerce: config may produce int (review B3)
+        gateways[name] = entry
+        tables.append(entry.rt_table)
+        rooter("nexthop_init", str(entry.rt_table), str(entry.interface), str(entry.next_hop))
+    vm_net = str(routing_cfg.nexthop.vm_net)
+    tables_csv = ",".join(tables)
+    # Tell the rooter what to sweep on SIGTERM, then idempotent re-arm:
+    # teardown BEFORE arm so a restart does not stack duplicate rules (review B2).
+    rooter("nexthop_configure", tables_csv, vm_net, NEXTHOP_FAIL_TABLE,
+           NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
+    rooter("nexthop_teardown", tables_csv, vm_net, NEXTHOP_FAIL_TABLE,
+           NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
+    if routing_cfg.nexthop.fail_closed:
+        rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW)
+
+
+def validate_default_route(routing_cfg):
+    """Check that the configured default route is valid.  Accepts gateway ids
+    (from gateways global) when nexthop is enabled, bypassing the vpn.enabled gate.
+    Extracted from init_routing so it is independently unit-testable (review H3)."""
+    route = routing_cfg.routing.route
+    if route in ("none", "internet", "tor", "inetsim"):
+        return
+    nexthop_on = hasattr(routing_cfg, "nexthop") and routing_cfg.nexthop.enabled
+    if nexthop_on and route in gateways:
+        return  # gateway default route is valid; skip the vpn.enabled gate
+    if not routing_cfg.vpn.enabled:
+        raise CuckooStartupError(
+            "A VPN has been configured as default routing interface for VMs, but VPNs have not been enabled in routing.conf"
+        )
+    if route not in vpns and route not in socks5s:
+        raise CuckooStartupError(
+            "The VPN/Socks5 defined as default routing target has not been configured in routing.conf. You should use name field"
+        )
 
 
 def check_python_version():
@@ -449,12 +510,15 @@ def init_rooter():
     connect to it."""
 
     # The default configuration doesn't require the rooter to be ran.
+    # A nexthop-only node still needs the rooter for forward_drop() + fail-closed arm.
+    _nexthop_enabled = hasattr(routing, "nexthop") and routing.nexthop.enabled
     if (
         not routing.vpn.enabled
         and not routing.tor.enabled
         and not routing.inetsim.enabled
         and not routing.socks5.enabled
         and routing.routing.route == "none"
+        and not _nexthop_enabled
     ):
         return
 
@@ -573,21 +637,15 @@ def init_routing():
                 rooter("flush_rttable", entry.rt_table)
                 rooter("init_rttable", entry.rt_table, entry.interface)
 
+    # Load [gwX] next-hop egress profiles, arm fail-closed (no-op when [nexthop] absent/disabled).
+    load_nexthop_profiles(routing)
+
     # If we are storage and webgui only but using as default route one of the workers exitnodes
     if dist_conf.distributed.master_storage_only:
         return
 
-    # Check whether the default VPN exists if specified.
-    if routing.routing.route not in ("none", "internet", "tor", "inetsim"):
-        if not routing.vpn.enabled:
-            raise CuckooStartupError(
-                "A VPN has been configured as default routing interface for VMs, but VPNs have not been enabled in routing.conf"
-            )
-
-        if routing.routing.route not in vpns and routing.routing.route not in socks5s:
-            raise CuckooStartupError(
-                "The VPN/Socks5 defined as default routing target has not been configured in routing.conf. You should use name field"
-            )
+    # Check whether the default VPN/gateway exists if specified.
+    validate_default_route(routing)
 
     # Check whether the dirty line exists if it has been defined.
     if routing.routing.internet != "none":
