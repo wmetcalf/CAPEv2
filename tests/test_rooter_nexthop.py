@@ -87,3 +87,16 @@ def test_nexthop_disable_argv(rec):
         ("-t", "nat", "-D", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
         ("-D", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 4: nexthop_fail_closed_enable
+# ---------------------------------------------------------------------------
+
+def test_nexthop_fail_closed_argv(rec):
+    rooter.nexthop_fail_closed_enable("192.168.100.0/24", "250", "30000")
+    assert rec["run"] == [
+        ("ip", "route", "replace", "blackhole", "default", "table", "250"),
+        ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
+        ("ip", "rule", "add", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
+    ]
