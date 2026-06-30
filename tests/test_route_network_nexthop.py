@@ -116,3 +116,26 @@ def test_no_regress_vpn_and_none(mgr, monkeypatch):
     mgr.nexthop_id = None
     _route(mgr, route="none", nexthop_enabled=False)
     assert "nexthop_enable" not in [c for c, _ in mgr._calls]
+
+
+def test_unroute_mirrors_persisted_tuple(mgr, monkeypatch):
+    prof = type("P", (), {"name": "gw1", "interface": "ens6", "rt_table": "201", "priority": 0})()
+    monkeypatch.setattr(am, "_select_gateway", lambda r: prof, raising=False)
+    monkeypatch.setattr(am, "gateways", {"gw1": prof}, raising=False)
+    _route(mgr, route="gw1", nexthop_enabled=True)
+    enable_args = next(a for c, a in mgr._calls if c == "nexthop_enable")
+    mgr._calls.clear()
+    mgr._unroute_nexthop()  # extracted helper called from unroute_network
+    disable_args = next(a for c, a in mgr._calls if c == "nexthop_disable")
+    # disable deletes EXACTLY what enable created (vm_ip, interface, rt_table, priority).
+    # The selector is NOT re-run: the persisted self.nexthop_* tuple is used (review M5).
+    assert disable_args == ("192.168.100.42", "ens6", "201", "10042")
+    assert disable_args == enable_args
+
+
+def test_unroute_noop_when_not_nexthop(mgr):
+    # no nexthop_id => _unroute_nexthop must issue nothing (legacy paths untouched,
+    # and the generic disable block is skipped because self.interface is None).
+    mgr.nexthop_id = None
+    mgr._unroute_nexthop()
+    assert [c for c, _ in mgr._calls if c == "nexthop_disable"] == []

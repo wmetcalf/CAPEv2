@@ -588,6 +588,20 @@ class AnalysisManager(threading.Thread):
         )
         self._rooter_response_check()
 
+    def _unroute_nexthop(self):
+        """Mirror-teardown the per-task bind with the PERSISTED self.nexthop_* tuple;
+        never re-run the selector (review M5). No-op unless bound to a gateway."""
+        if not self.nexthop_id:
+            return
+        self.rooter_response = rooter(
+            "nexthop_disable",
+            str(self.machine.ip),
+            self.nexthop_interface,
+            self.nexthop_rt_table,
+            self.nexthop_priority,
+        )
+        self._rooter_response_check()
+
     def route_network(self):
         """Enable network routing if desired."""
         # Determine the desired routing strategy (none, internet, VPN).
@@ -818,6 +832,10 @@ class AnalysisManager(threading.Thread):
         elif self.route[:3] == "tun":
             self.log.info("Disable tunnel interface: %s", self.interface)
             self.rooter_response = rooter("interface_route_tun_disable", self.machine.ip, self.route, str(self.task.id))
+
+        # nexthop teardown with the PERSISTED tuple (the generic disable block above
+        # was skipped because self.interface is None). No-op unless bound (review M5).
+        self._unroute_nexthop()
 
         self._rooter_response_check()
 
