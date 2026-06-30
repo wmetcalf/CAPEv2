@@ -53,3 +53,21 @@ def test_nexthop_init_via(rec):
         ("ip", "route", "flush", "table", "202"),
         ("ip", "route", "replace", "default", "via", "10.30.72.1", "dev", "ens7", "table", "202"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 2: nexthop_enable
+# ---------------------------------------------------------------------------
+
+def test_nexthop_enable_argv(rec):
+    rooter.nexthop_enable("192.168.100.42", "ens6", "201", "10042")
+    # iproute2 + conntrack go through run(); nat/filter through run_iptables()
+    assert rec["run"] == [
+        ("conntrack", "-D", "-s", "192.168.100.42"),                                  # pre-bind flush
+        ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),  # idempotent pre-clean
+        ("ip", "rule", "add", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
+    ]
+    assert rec["iptables"] == [
+        ("-t", "nat", "-A", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
+        ("-A", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+    ]

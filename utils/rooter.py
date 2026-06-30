@@ -676,6 +676,56 @@ def nexthop_init(rt_table, egress_if, next_hop):
         run(settings.ip, "route", "replace", "default", "via", next_hop, "dev", egress_if, "table", rt_table)
 
 
+def nexthop_enable(vm_ip, egress_if, rt_table, priority):
+    """Per task: source-route the VM into its profile table and SNAT onto egress_if.
+    run() never raises, so the pre-clean deletes are safe idempotent no-ops when absent."""
+    run("conntrack", "-D", "-s", vm_ip)  # drop stale flows so a recycled IP starts clean (best-effort)
+    run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)  # idempotent
+    run(settings.ip, "rule", "add", "from", vm_ip, "lookup", rt_table, "priority", priority)
+    run_iptables("-t", "nat", "-A", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
+    run_iptables("-A", "FORWARD", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+
+
+def nexthop_disable(vm_ip, egress_if, rt_table, priority):
+    """Mirror-delete the per-task state from nexthop_enable, then flush conntrack."""
+    run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)
+    run_iptables("-t", "nat", "-D", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
+    run_iptables("-D", "FORWARD", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    run("conntrack", "-D", "-s", vm_ip)
+
+
+def nexthop_fail_closed_enable(vm_net, fail_table, priority_low):
+    """Arm once at startup: any guest-subnet source with no higher-priority per-task rule
+    is blackholed (dropped), never routed by main out the control-plane NIC.
+    `route replace` is idempotent; the rule is del+add'd so a restart does not stack duplicates."""
+    run(settings.ip, "route", "replace", "blackhole", "default", "table", fail_table)
+    run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
+    run(settings.ip, "rule", "add", "from", vm_net, "lookup", fail_table, "priority", priority_low)
+
+
+def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, band_hi):
+    """Remove ALL nexthop policy-routing state (cleanup_rooter only sweeps iptables).
+    gateway_tables: comma-joined table ids. Idempotent; every step is a best-effort run()."""
+    for rt in [t for t in gateway_tables.split(",") if t]:
+        run(settings.ip, "route", "flush", "table", rt)
+    run(settings.ip, "route", "del", "blackhole", "default", "table", fail_table)
+    run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
+    lo, hi = int(band_lo), int(band_hi)
+    stdout, _ = run(settings.ip, "rule", "show")
+    for line in stdout.splitlines():
+        head = line.split(":", 1)[0].strip()
+        if head.isdigit() and lo <= int(head) <= hi:
+            run(settings.ip, "rule", "del", "priority", head)
+
+
+def nexthop_configure(tables_csv, vm_net, fail_table, prio_low, band_lo, band_hi):
+    """Called by the [gwX] loader to set the module globals that nexthop_teardown sweeps."""
+    global GATEWAY_TABLES_CSV, NEXTHOP_VM_NET, NEXTHOP_FAIL_TABLE
+    global NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI
+    GATEWAY_TABLES_CSV, NEXTHOP_VM_NET, NEXTHOP_FAIL_TABLE = tables_csv, vm_net, fail_table
+    NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI = prio_low, band_lo, band_hi
+
+
 def dns_forward(action, vm_ip, dns_ip, dns_port="53"):
     """Route DNS requests from the VM to a custom DNS on a separate network."""
     run_iptables(
@@ -1140,6 +1190,11 @@ handlers = {
     "sslproxy_enable": sslproxy_enable,
     "sslproxy_disable": sslproxy_disable,
     "nexthop_init": nexthop_init,
+    "nexthop_enable": nexthop_enable,
+    "nexthop_disable": nexthop_disable,
+    "nexthop_fail_closed_enable": nexthop_fail_closed_enable,
+    "nexthop_teardown": nexthop_teardown,
+    "nexthop_configure": nexthop_configure,
 }
 
 if __name__ == "__main__":
@@ -1220,6 +1275,9 @@ if __name__ == "__main__":
         server.shutdown(socket.SHUT_RDWR)
         server.close()
         cleanup_rooter()
+        # remove nexthop policy-routing state (cleanup_rooter is iptables-only)
+        nexthop_teardown(GATEWAY_TABLES_CSV, NEXTHOP_VM_NET, NEXTHOP_FAIL_TABLE,
+                         NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
