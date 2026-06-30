@@ -71,3 +71,19 @@ def test_nexthop_enable_argv(rec):
         ("-t", "nat", "-A", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
         ("-A", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 3: nexthop_disable
+# ---------------------------------------------------------------------------
+
+def test_nexthop_disable_argv(rec):
+    rooter.nexthop_disable("192.168.100.42", "ens6", "201", "10042")
+    assert rec["run"] == [
+        ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
+        ("conntrack", "-D", "-s", "192.168.100.42"),
+    ]
+    assert rec["iptables"] == [
+        ("-t", "nat", "-D", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
+        ("-D", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+    ]
