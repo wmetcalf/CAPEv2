@@ -39,6 +39,17 @@ class ServicePaths:
     ip = None
 
 
+# ---------------------------------------------------------------------------
+# nexthop primitive — module-level state (loader sets these via nexthop_configure)
+# ---------------------------------------------------------------------------
+GATEWAY_TABLES_CSV = ""
+NEXTHOP_VM_NET = "255.255.255.255/32"   # matches nothing if mis-fired before configure
+NEXTHOP_FAIL_TABLE = "250"
+NEXTHOP_PRIORITY_LOW = "30000"
+NEXTHOP_BAND_LO = "10000"
+NEXTHOP_BAND_HI = "10255"
+
+
 def run(*args):
     """Wrapper to subprocess.run."""
     log.debug("Running command: %s", " ".join(args))
@@ -650,6 +661,21 @@ def srcroute_disable(rt_table, ipaddr):
     run(settings.ip, "route", "flush", "cache")
 
 
+# ---------------------------------------------------------------------------
+# nexthop primitive — argv builders
+# ---------------------------------------------------------------------------
+
+def nexthop_init(rt_table, egress_if, next_hop):
+    """Idempotently build a next-hop profile's routing table: one forced default route.
+    next_hop == 'onlink' => default dev egress_if onlink; else default via next_hop dev egress_if.
+    NOTE: deliberately does NOT call init_rttable (that copies main's per-interface routes)."""
+    run(settings.ip, "route", "flush", "table", rt_table)
+    if next_hop == "onlink":
+        run(settings.ip, "route", "replace", "default", "dev", egress_if, "onlink", "table", rt_table)
+    else:
+        run(settings.ip, "route", "replace", "default", "via", next_hop, "dev", egress_if, "table", rt_table)
+
+
 def dns_forward(action, vm_ip, dns_ip, dns_port="53"):
     """Route DNS requests from the VM to a custom DNS on a separate network."""
     run_iptables(
@@ -1113,6 +1139,7 @@ handlers = {
     "libvirt_fwo_disable": libvirt_fwo_disable,
     "sslproxy_enable": sslproxy_enable,
     "sslproxy_disable": sslproxy_disable,
+    "nexthop_init": nexthop_init,
 }
 
 if __name__ == "__main__":
