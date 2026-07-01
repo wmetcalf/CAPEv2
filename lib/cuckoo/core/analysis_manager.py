@@ -570,7 +570,10 @@ class AnalysisManager(threading.Thread):
         self.nexthop_id = profile.name
         self.nexthop_interface = str(profile.interface)
         self.nexthop_rt_table = str(profile.rt_table)
-        # deterministic per-task priority: 10000 + last octet of the VM IP (review M6)
+        # deterministic per-task priority: 10000 + last octet of the VM IP (review M6).
+        # Unique within one guest /24 (the shipped vm_net); across multiple /24s two VMs
+        # could share a priority number but keep distinct `from <vm_ip>` selectors, so no
+        # leak — teardown's by-priority band sweep still clears them all.
         self.nexthop_priority = str(10000 + int(self.machine.ip.rsplit(".", 1)[1]))
         return True
 

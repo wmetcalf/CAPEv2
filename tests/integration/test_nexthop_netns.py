@@ -115,14 +115,11 @@ def netns():
 
     created_ns = []
     created_links = []
-    created_rules = []      # (from_addr_or_subnet, table, priority) tuples
     created_tables = []     # table ids with content to flush
 
     def _cleanup():
-        # Best-effort teardown; each step is independent so we collect errors.
-        errors = []
+        # Best-effort teardown; each step is independent.
         # flush source rules in the per-task band (10000-10255) and fail-closed
-        out, _ = subprocess.run([_IP, "rule", "show"], capture_output=True, text=True).stdout, ""
         out = subprocess.run([_IP, "rule", "show"], capture_output=True, text=True).stdout
         for line in out.splitlines():
             head = line.split(":", 1)[0].strip()
