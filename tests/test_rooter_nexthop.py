@@ -97,6 +97,10 @@ def test_nexthop_fail_closed_argv(rec):
     rooter.nexthop_fail_closed_enable("192.168.100.0/24", "250", "30000")
     assert rec["run"] == [
         ("ip", "route", "replace", "blackhole", "default", "table", "250"),
+        # intra-subnet exception (priority just above the blackhole) so host<->guest
+        # (agent init + ResultServer) and guest<->guest stay on main and aren't dropped.
+        ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999"),
+        ("ip", "rule", "add", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999"),
         ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
         ("ip", "rule", "add", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
     ]
@@ -123,6 +127,8 @@ def test_nexthop_teardown_sweeps_policy_routing(rec, monkeypatch):
     assert ("ip", "route", "flush", "table", "202") in rec["run"]
     assert ("ip", "route", "del", "blackhole", "default", "table", "250") in rec["run"]
     assert ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000") in rec["run"]
+    # intra-subnet exception rule also removed on teardown
+    assert ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999") in rec["run"]
     # in-band per-task rules swept; the 32766 main rule untouched
     assert ("ip", "rule", "del", "priority", "10042") in rec["run"]
     assert ("ip", "rule", "del", "priority", "10043") in rec["run"]

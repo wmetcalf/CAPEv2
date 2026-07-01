@@ -697,8 +697,18 @@ def nexthop_disable(vm_ip, egress_if, rt_table, priority):
 def nexthop_fail_closed_enable(vm_net, fail_table, priority_low):
     """Arm once at startup: any guest-subnet source with no higher-priority per-task rule
     is blackholed (dropped), never routed by main out the control-plane NIC.
-    `route replace` is idempotent; the rule is del+add'd so a restart does not stack duplicates."""
+    `route replace` is idempotent; rules are del+add'd so a restart does not stack duplicates.
+
+    INTRA-SUBNET EXCEPTION (priority just above the blackhole): vm_net includes the host's
+    own guest-bridge IP, so `from vm_net lookup <blackhole>` would also drop the host's own
+    traffic to the guests -- breaking the guest-agent init and the ResultServer (host<->guest,
+    guest<->guest). Keep intra-subnet traffic on the main table so analyses can initialise;
+    only genuinely external guest egress falls through to the per-task nexthop rule or the
+    blackhole."""
     run(settings.ip, "route", "replace", "blackhole", "default", "table", fail_table)
+    intra_prio = str(int(priority_low) - 1)
+    run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
+    run(settings.ip, "rule", "add", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
     run(settings.ip, "rule", "add", "from", vm_net, "lookup", fail_table, "priority", priority_low)
 
@@ -710,6 +720,7 @@ def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, 
         run(settings.ip, "route", "flush", "table", rt)
     run(settings.ip, "route", "del", "blackhole", "default", "table", fail_table)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
+    run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", str(int(priority_low) - 1))
     lo, hi = int(band_lo), int(band_hi)
     stdout, _ = run(settings.ip, "rule", "show")
     for line in stdout.splitlines():
