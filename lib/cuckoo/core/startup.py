@@ -83,7 +83,8 @@ def load_nexthop_profiles(routing_cfg):
     or disabled (review M4 hasattr guard)."""
     if not hasattr(routing_cfg, "nexthop") or not routing_cfg.nexthop.enabled:
         return
-    tables = []
+    # Pass 1: parse + validate + register profiles (no rooter side effects yet).
+    profiles = []
     for name in routing_cfg.nexthop.gateways.split(","):
         name = name.strip()
         if not name:
@@ -95,16 +96,19 @@ def load_nexthop_profiles(routing_cfg):
         entry = routing_cfg.get(name)
         entry.rt_table = str(entry.rt_table)   # coerce: config may produce int (review B3)
         gateways[name] = entry
-        tables.append(entry.rt_table)
-        rooter("nexthop_init", str(entry.rt_table), str(entry.interface), str(entry.next_hop))
+        profiles.append(entry)
     vm_net = str(routing_cfg.nexthop.vm_net)
-    tables_csv = ",".join(tables)
-    # Tell the rooter what to sweep on SIGTERM, then idempotent re-arm:
-    # teardown BEFORE arm so a restart does not stack duplicate rules (review B2).
+    tables_csv = ",".join(p.rt_table for p in profiles)
+    # Record sweep state for SIGTERM, then sweep any STALE state from a prior run
+    # BEFORE building fresh tables. nexthop_teardown flushes the gateway tables, so it
+    # MUST run before nexthop_init (which builds them) or it wipes the just-built routes.
     rooter("nexthop_configure", tables_csv, vm_net, NEXTHOP_FAIL_TABLE,
            NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
     rooter("nexthop_teardown", tables_csv, vm_net, NEXTHOP_FAIL_TABLE,
            NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
+    # Pass 2: build fresh profile tables, then arm fail-closed.
+    for entry in profiles:
+        rooter("nexthop_init", str(entry.rt_table), str(entry.interface), str(entry.next_hop))
     if routing_cfg.nexthop.fail_closed:
         rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW)
 

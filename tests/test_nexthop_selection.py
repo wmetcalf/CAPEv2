@@ -122,7 +122,16 @@ def test_gwx_loader_populates_and_coerces(monkeypatch):
     assert startup.gateways["gw1"].rt_table == "201"   # coerced to str
     assert ("nexthop_init", ("201", "ens6", "onlink")) in recorded
     assert any(c == "nexthop_fail_closed_enable" for c, _ in recorded)
-    assert any(c == "nexthop_teardown" for c, _ in recorded)   # re-arm sweep before arm
+    assert any(c == "nexthop_teardown" for c, _ in recorded)
+    # ORDER MATTERS: nexthop_teardown flushes the gateway tables, so it must run
+    # BEFORE nexthop_init (which builds them) — otherwise it wipes the fresh routes.
+    # And fail-closed arms last. (Regression guard for the loader ordering bug found
+    # in the live FakeNet detonation on 2026-07-01.)
+    cmds = [c for c, _ in recorded]
+    assert cmds.index("nexthop_teardown") < cmds.index("nexthop_init"), \
+        f"teardown must precede init, got order: {cmds}"
+    assert cmds.index("nexthop_init") < cmds.index("nexthop_fail_closed_enable"), \
+        f"init must precede fail_closed arm, got order: {cmds}"
 
 
 # ---------------------------------------------------------------------------
