@@ -95,6 +95,12 @@ def load_nexthop_profiles(routing_cfg):
             raise CuckooStartupError(f"nexthop gateway '{name}' has no [{name}] section in routing.conf")
         entry = routing_cfg.get(name)
         entry.rt_table = str(entry.rt_table)   # coerce: config may produce int (review B3)
+        # [gwX] sections carry no `name =` field (unlike [vpnX]/[socks5]), so config
+        # Dictionary.__getattr__ returns None for entry.name. Carry the section header as
+        # the profile id: analysis_manager._resolve_nexthop reads profile.name into
+        # self.nexthop_id, and a None id makes _dispatch_nexthop silently no-op (the
+        # per-task rule never installs and every task fails closed). Verified live.
+        entry.name = name
         gateways[name] = entry
         profiles.append(entry)
     vm_net = str(routing_cfg.nexthop.vm_net)

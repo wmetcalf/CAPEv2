@@ -134,6 +134,44 @@ def test_gwx_loader_populates_and_coerces(monkeypatch):
         f"init must precede fail_closed arm, got order: {cmds}"
 
 
+class _DictSection(dict):
+    """Faithful stand-in for CAPE's config Dictionary: attribute access maps to dict
+    keys and a MISSING key returns None (not AttributeError). This is exactly how a
+    real [gwX] section behaves for the absent `name` field."""
+    def __getattr__(self, k):
+        return self.get(k)
+
+    def __setattr__(self, k, v):
+        self[k] = v
+
+
+def test_gwx_loader_stamps_profile_name_from_section_header(monkeypatch):
+    """Regression (live FakeNet detonation, 2026-07-01): [gwX] sections carry no `name =`
+    field (unlike [vpnX]/[socks5]), so config Dictionary.__getattr__ returns None for
+    entry.name. The loader MUST stamp the section header as the profile id — otherwise
+    analysis_manager._resolve_nexthop sets self.nexthop_id = profile.name = None, and
+    _dispatch_nexthop's `if not self.nexthop_id: return` silently no-ops: the per-task
+    source rule never installs and every real task falls through to the fail-closed
+    blackhole. Unit tests missed it because the fakes hard-coded .name; the real config
+    does not."""
+    import lib.cuckoo.core.startup as startup
+
+    class _NamelessRouting(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            # a [gw1] section with NO `name` key — the real routing.conf shape
+            self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=201)
+
+    routing = _NamelessRouting()
+    # precondition: the section reports no name (mimics config Dictionary -> None)
+    assert routing.gw1.name is None
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda cmd, *a, **k: {}, raising=False)
+    startup.load_nexthop_profiles(routing)
+    # postcondition: loader stamped the id so nexthop_id resolves to a real value
+    assert startup.gateways["gw1"].name == "gw1"
+
+
 # ---------------------------------------------------------------------------
 # T8: validate_default_route — gateway route accepted; unknown raises
 # ---------------------------------------------------------------------------
