@@ -103,9 +103,8 @@ def test_all_nexthop_args_are_str(mgr, monkeypatch):
     assert found
 
 
-def test_no_regress_vpn_and_none(mgr, monkeypatch):
+def test_no_regress_vpn_and_none(mgr):
     # nexthop DISABLED -> _resolve_nexthop must never run; route=vpn0/none unchanged.
-    monkeypatch.setattr(am, "_nexthop_enabled", lambda routing: False, raising=False)
     # vpn0 path
     _route(mgr, route="vpn0", nexthop_enabled=False)
     assert mgr.nexthop_id is None
