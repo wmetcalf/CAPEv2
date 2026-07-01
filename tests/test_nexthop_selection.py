@@ -146,3 +146,17 @@ def test_unknown_gateway_default_route_raises(monkeypatch):
     monkeypatch.setattr(startup, "gateways", {})
     with pytest.raises(CuckooStartupError):
         startup.validate_default_route(_FakeRouting(route="gw9"))
+
+
+# ---------------------------------------------------------------------------
+# T11: no-regress — disabled [nexthop] is a no-op (empty gateways, no rooter calls)
+# ---------------------------------------------------------------------------
+
+def test_nexthop_disabled_is_noop(monkeypatch):
+    import lib.cuckoo.core.startup as startup
+    import lib.cuckoo.core.rooter as core_rooter
+    monkeypatch.setattr(core_rooter, "gateways", {}, raising=False)
+    called = []
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: called.append(a) or {}, raising=False)
+    startup.load_nexthop_profiles(_FakeRouting(nexthop_enabled=False))
+    assert core_rooter.gateways == {} and called == []
