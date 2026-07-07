@@ -48,8 +48,10 @@ def test_roundrobin_threadsafe(monkeypatch):
         with lock:
             out.append(p.name)
     threads = [threading.Thread(target=worker) for _ in range(300)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     # even distribution across 3 live gateways, no crash
     assert all(out.count(n) == 100 for n in ("gw1", "gw2", "gw3"))
 
