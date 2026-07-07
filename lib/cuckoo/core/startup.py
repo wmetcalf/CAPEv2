@@ -83,6 +83,12 @@ def load_nexthop_profiles(routing_cfg):
     or disabled (review M4 hasattr guard)."""
     if not hasattr(routing_cfg, "nexthop") or not routing_cfg.nexthop.enabled:
         return
+    # [nexthop] is enabled: it MUST define gateways + vm_net (gemini #14 MEDIUM). CAPE's config
+    # Dictionary returns None (not AttributeError) for a missing key, so without this a missing
+    # option slips through as None and misbehaves downstream — fail with a clear error instead.
+    for opt in ("gateways", "vm_net"):
+        if getattr(routing_cfg.nexthop, opt, None) is None:
+            raise CuckooStartupError(f"[nexthop] is enabled but missing the required '{opt}' option in routing.conf")
     # Pass 1: parse + validate + register profiles (no rooter side effects yet).
     profiles = []
     for name in routing_cfg.nexthop.gateways.split(","):
@@ -94,6 +100,12 @@ def load_nexthop_profiles(routing_cfg):
         if not hasattr(routing_cfg, name):
             raise CuckooStartupError(f"nexthop gateway '{name}' has no [{name}] section in routing.conf")
         entry = routing_cfg.get(name)
+        # A [gwX] section MUST define interface/next_hop/rt_table (gemini #14 MEDIUM). Config
+        # Dictionary returns None for a missing key, so validate explicitly — otherwise None
+        # (or str(None)=="None") would slip into the rooter commands below.
+        for opt in ("interface", "next_hop", "rt_table"):
+            if getattr(entry, opt, None) is None:
+                raise CuckooStartupError(f"nexthop gateway '{name}' is missing the required '{opt}' option in [{name}]")
         entry.rt_table = str(entry.rt_table)   # coerce: config may produce int (review B3)
         # [gwX] sections carry no `name =` field (unlike [vpnX]/[socks5]), so config
         # Dictionary.__getattr__ returns None for entry.name. Carry the section header as

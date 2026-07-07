@@ -33,22 +33,27 @@ def mgr(monkeypatch):
     return m
 
 
-def _fake_routing(default_policy="roundrobin"):
-    """Minimal stand-in for Config('routing') exposing only .nexthop.* used here."""
+def _fake_routing(default_policy="roundrobin", default_route="nexthop"):
+    """Minimal stand-in for Config('routing') exposing .nexthop.* and .routing.route
+    (the configured default route — _resolve_nexthop only falls back to default_policy
+    when self.route equals it; a typo'd explicit route drops instead)."""
     return type(
         "R",
         (),
-        {"nexthop": type("NH", (), {"enabled": True, "default_policy": default_policy})()},
+        {
+            "nexthop": type("NH", (), {"enabled": True, "default_policy": default_policy})(),
+            "routing": type("RT", (), {"route": default_route})(),
+        },
     )()
 
 
-def _route(mgr, route, nexthop_enabled, default_policy="roundrobin"):
+def _route(mgr, route, nexthop_enabled, default_policy="roundrobin", default_route="nexthop"):
     """Replicate route_network's resolution + dispatch for the nexthop branch only.
 
     `nexthop_enabled` is the gate (mirrors _nexthop_enabled(routing)); when False the
     branch is never entered so the legacy paths are byte-for-byte unchanged.
     """
-    routing = _fake_routing(default_policy)
+    routing = _fake_routing(default_policy, default_route)
     mgr.route = route
     # resolution chain (only the nexthop branch is modeled here; a False return
     # forces route="drop" and skips the branch body, exactly like route_network).
@@ -88,6 +93,32 @@ def test_typo_gateway_fails_closed_to_drop(mgr, monkeypatch):
     assert mgr.route == "drop"
     assert mgr.nexthop_id is None
     assert mgr.interface is None  # not left on host default forwarding
+
+
+def test_typod_route_drops_even_when_a_gateway_is_live(mgr, monkeypatch):
+    # gemini #14 HIGH: a typo'd/foreign route (e.g. "vpn9") that is NOT a gateway id, NOT a
+    # policy token, and NOT the configured default route must DROP — it must never fall back
+    # to default_policy and silently egress via a live gateway (isolation-boundary bypass).
+    live = type("P", (), {"name": "gw1", "interface": "ens6", "rt_table": "201", "priority": 0})()
+    # _select_gateway WOULD return a live profile if reached — the fix must not reach it.
+    monkeypatch.setattr(am, "_select_gateway", lambda r: live, raising=False)
+    monkeypatch.setattr(am, "gateways", {"gw1": live}, raising=False)
+    _route(mgr, route="vpn9", nexthop_enabled=True, default_route="nexthop")
+    cmds = [c for c, _ in mgr._calls]
+    assert "drop_enable" in cmds and "nexthop_enable" not in cmds
+    assert mgr.route == "drop" and mgr.nexthop_id is None
+
+
+def test_configured_default_route_uses_default_policy(mgr, monkeypatch):
+    # When the task uses the node's CONFIGURED default route (self.route == routing.routing.route),
+    # fall back to default_policy (roundrobin/random) and pick from the live pool.
+    prof = type("P", (), {"name": "gw2", "interface": "ens7", "rt_table": "202", "priority": 0})()
+    monkeypatch.setattr(am, "_select_gateway", lambda r: prof if r in ("roundrobin", "random") else None, raising=False)
+    monkeypatch.setattr(am, "gateways", {"gw2": prof}, raising=False)
+    _route(mgr, route="nexthop", nexthop_enabled=True, default_policy="roundrobin", default_route="nexthop")
+    cmds = [c for c, _ in mgr._calls]
+    assert "nexthop_enable" in cmds and "drop_enable" not in cmds
+    assert mgr.nexthop_id == "gw2"
 
 
 def test_all_nexthop_args_are_str(mgr, monkeypatch):

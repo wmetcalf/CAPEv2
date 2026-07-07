@@ -207,3 +207,39 @@ def test_nexthop_disabled_is_noop(monkeypatch):
     monkeypatch.setattr(startup, "rooter", lambda *a, **k: called.append(a) or {}, raising=False)
     startup.load_nexthop_profiles(_FakeRouting(nexthop_enabled=False))
     assert core_rooter.gateways == {} and called == []
+
+
+# ---------------------------------------------------------------------------
+# gemini #14 MEDIUM: [nexthop]/[gwX] required-option validation (clear startup error)
+# ---------------------------------------------------------------------------
+
+def test_nexthop_missing_vm_net_raises(monkeypatch):
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _NexthopNoVmNet(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            # enabled + gateways set, but vm_net absent (config Dictionary -> None)
+            self.nexthop = _DictSection(enabled=True, gateways="gw1", default_policy="roundrobin", fail_closed=True)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_NexthopNoVmNet())
+
+
+def test_gwx_missing_interface_raises(monkeypatch):
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwNoInterface(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            # [gw1] with next_hop + rt_table but NO interface (config Dictionary -> None)
+            self.gw1 = _DictSection(next_hop="onlink", rt_table=201)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwNoInterface())

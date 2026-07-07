@@ -557,14 +557,23 @@ class AnalysisManager(threading.Thread):
         Always sets self.interface = None and self.rt_table = None so the generic
         forward/srcroute block is skipped (review H2 option b) regardless of outcome.
         """
-        # an explicit gateway id selects that profile; otherwise the default_policy
-        # token (roundrobin/random) picks from the live pool.
-        sel = self.route if self.route in gateways else routing.nexthop.default_policy
-        profile = _select_gateway(sel)
         self.interface = None  # nexthop owns enable/disable; skip the generic block
         self.rt_table = None
+        # Resolve the selector, FAILING CLOSED on a typo'd/unknown route (review B1 + gemini #14):
+        #  - an explicit gateway id, or a policy token (roundrobin/random), selects directly;
+        #  - ONLY the node's configured DEFAULT route falls back to default_policy;
+        #  - anything else (a typo'd/unconfigured id like "gw9"/"vpn9") DROPS rather than
+        #    silently egressing via some live gateway (that would be an isolation-boundary bypass).
+        if self.route in gateways or self.route in ("roundrobin", "random"):
+            sel = self.route
+        elif self.route == routing.routing.route:
+            sel = routing.nexthop.default_policy
+        else:
+            self.route = "drop"
+            return False
+        profile = _select_gateway(sel)
         if profile is None:
-            # unresolved/typo'd id or empty/all-down pool => FAIL CLOSED (review B1)
+            # empty/all-down pool => FAIL CLOSED (review B1)
             self.route = "drop"
             return False
         self.nexthop_id = profile.name

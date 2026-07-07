@@ -135,6 +135,16 @@ def test_nexthop_teardown_sweeps_policy_routing(rec, monkeypatch):
     assert ("ip", "rule", "del", "priority", "32766") not in rec["run"]
 
 
+def test_nexthop_teardown_skips_reserved_tables(rec):
+    # gemini #14 HIGH: even if a gateway profile is misconfigured with a reserved/system table
+    # id, teardown must NOT flush it — doing so (at startup + SIGTERM) would wipe the host's own
+    # routing and take the box offline. The real gateway table IS still flushed.
+    rooter.nexthop_teardown("main,254,201", "192.168.100.0/24", "250", "30000", "10000", "10255")
+    assert ("ip", "route", "flush", "table", "201") in rec["run"]
+    assert ("ip", "route", "flush", "table", "main") not in rec["run"]
+    assert ("ip", "route", "flush", "table", "254") not in rec["run"]
+
+
 def test_nexthop_configure_sets_globals(rec):
     rooter.nexthop_configure("201,202", "192.168.100.0/24", "250", "30000", "10000", "10255")
     assert rooter.GATEWAY_TABLES_CSV == "201,202"

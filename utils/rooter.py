@@ -717,6 +717,12 @@ def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, 
     """Remove ALL nexthop policy-routing state (cleanup_rooter only sweeps iptables).
     gateway_tables: comma-joined table ids. Idempotent; every step is a best-effort run()."""
     for rt in [t for t in gateway_tables.split(",") if t]:
+        # NEVER flush a reserved/system routing table: a misconfigured [gwX] rt_table of
+        # main/local/default (or their numeric ids) would otherwise wipe the host's own
+        # routing on startup + SIGTERM and take the box offline (gemini #14 HIGH).
+        if rt in ("local", "main", "default", "0", "253", "254", "255"):
+            log.error("nexthop_teardown refusing to flush reserved routing table %r (fix the [gwX] rt_table)", rt)
+            continue
         run(settings.ip, "route", "flush", "table", rt)
     run(settings.ip, "route", "del", "blackhole", "default", "table", fail_table)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
