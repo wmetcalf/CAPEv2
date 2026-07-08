@@ -101,8 +101,25 @@ def load_nexthop_profiles(routing_cfg):
     for opt in ("gateways", "vm_net"):
         if getattr(routing_cfg.nexthop, opt, None) is None:
             raise CuckooStartupError(f"[nexthop] is enabled but missing the required '{opt}' option in routing.conf")
+    # Routing tables already OWNED by another primitive -- a [gwX] must not reuse one. nexthop_init
+    # flush/replaces each gateway table, so a shared table silently clobbers (or is clobbered by) the
+    # other primitive's route, misrouting its traffic with no error. Two sources, both knowable now:
+    #   - VPN tables: init_routing builds vpns[*].rt_table BEFORE calling us, so nexthop_init would
+    #     wipe a just-built VPN table and point its default out the gateway NIC (VPN-isolation break).
+    #   - the [routing] dirty-line table (routing.routing.rt_table): its init_rttable runs AFTER us,
+    #     so it would repopulate a gateway table with the dirty-line interface.
+    # Coerce to str: a VPN rt_table (or the dirty-line one) may be an int or a name in config.
+    owned_tables = {}
+    for vname, ventry in vpns.items():
+        vrt = getattr(ventry, "rt_table", None)
+        if vrt is not None:
+            owned_tables[str(vrt)] = f"VPN '{vname}'"
+    dirty_rt = getattr(getattr(routing_cfg, "routing", None), "rt_table", None)
+    if dirty_rt is not None and str(dirty_rt):
+        owned_tables.setdefault(str(dirty_rt), "the [routing] dirty-line table")
     # Pass 1: parse + validate + register profiles (no rooter side effects yet).
     profiles = []
+    claimed_tables = {}   # rt_table -> gateway id, to reject duplicates (each [gwX] needs its own)
     for name in routing_cfg.nexthop.gateways.split(","):
         name = name.strip()
         if not name:
@@ -129,6 +146,35 @@ def load_nexthop_profiles(routing_cfg):
                 f"nexthop gateway '{name}' uses reserved routing table '{entry.rt_table}' in [{name}]; "
                 "pick a dedicated custom table id (e.g. 201)"
             )
+        # rt_table must not be the fail-closed table: nexthop_init builds the gateway default there,
+        # then nexthop_fail_closed_enable does `ip route replace blackhole default table <fail>`,
+        # overwriting that default with a blackhole -> every task bound to the gateway silently drops.
+        if entry.rt_table == NEXTHOP_FAIL_TABLE:
+            raise CuckooStartupError(
+                f"nexthop gateway '{name}' uses rt_table '{entry.rt_table}' in [{name}], which is the "
+                "reserved fail-closed table; the blackhole would overwrite the gateway's default route. "
+                "Pick a different custom table id."
+            )
+        # rt_table must not be owned by a VPN or the [routing] dirty-line (see owned_tables above):
+        # nexthop_init would clobber that primitive's table and silently misroute its traffic. This
+        # catches DIRECT string collisions; a name<->id alias (a VPN using the name "tun0" mapped to
+        # id 201 in /etc/iproute2/rt_tables while a [gwX] uses 201) resolves to the same kernel table
+        # but different config strings -- that stays the operator's "unique across the system"
+        # responsibility, as documented for VPN rt_table in routing.conf.
+        if entry.rt_table in owned_tables:
+            raise CuckooStartupError(
+                f"nexthop gateway '{name}' rt_table '{entry.rt_table}' in [{name}] collides with "
+                f"{owned_tables[entry.rt_table]}; each routing primitive needs a unique table id"
+            )
+        # rt_table must be UNIQUE across [gwX]: nexthop_init flush/replaces a single table per profile,
+        # so a shared table leaves the last gateway's default winning while the earlier gateway stays
+        # selectable -> its per-task rule looks up a table pointing at the wrong egress interface.
+        if entry.rt_table in claimed_tables:
+            raise CuckooStartupError(
+                f"nexthop gateways '{claimed_tables[entry.rt_table]}' and '{name}' both use rt_table "
+                f"'{entry.rt_table}'; each [gwX] needs a unique routing table id"
+            )
+        claimed_tables[entry.rt_table] = name
         # [gwX] sections carry no `name =` field (unlike [vpnX]/[socks5]), so config
         # Dictionary.__getattr__ returns None for entry.name. Carry the section header as
         # the profile id: analysis_manager._resolve_nexthop reads profile.name into

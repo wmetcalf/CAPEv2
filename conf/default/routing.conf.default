@@ -151,7 +151,11 @@ vm_net = 192.168.100.0/24
 interface = ens6
 # Next-hop gateway IP reachable via `interface`, or 'onlink'.
 next_hop = onlink
-# Policy routing table id (numeric, unique per profile).
+# Dedicated policy routing table id for this gateway. MUST be unique across the WHOLE system:
+# not a reserved table (main/local/default/253-255/0), not another [gwX]'s table, not a VPN's
+# rt_table, and not the [routing] dirty-line rt_table -- startup rejects those it can see. Note a
+# name<->id alias counts as the same table (e.g. do NOT use 201 here if a VPN uses a name mapped to
+# 201 in /etc/iproute2/rt_tables); keeping gateway tables to their own numeric range avoids this.
 rt_table = 201
 description = vpn-router-1
 

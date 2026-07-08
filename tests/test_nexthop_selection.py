@@ -319,6 +319,89 @@ def test_gwx_reserved_rt_table_raises(monkeypatch):
         assert "gw1" not in startup.gateways, f"reserved-table gw1 (rt={bad}) leaked into gateways"
 
 
+def test_gwx_rt_table_is_fail_table_raises(monkeypatch):
+    # codex P2: a [gwX] rt_table == NEXTHOP_FAIL_TABLE (250) is not a kernel-reserved table so it
+    # passes the reserved-table check, but nexthop_fail_closed_enable's `ip route replace blackhole
+    # default table 250` would overwrite the gateway's default with a blackhole → every task on that
+    # gateway silently drops. Reject it at load.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwFailTable(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=startup.NEXTHOP_FAIL_TABLE)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwFailTable())
+    assert "gw1" not in startup.gateways
+
+
+def test_gwx_duplicate_rt_table_raises(monkeypatch):
+    # codex P2: two [gwX] sharing an rt_table → nexthop_init flush/replaces the one table per profile
+    # so the last gateway's default wins, but the earlier gateway stays selectable with a per-task rule
+    # pointing at a table for the WRONG egress interface → misroute/drop. Fail startup on duplicates.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwDupTable(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.nexthop = _DictSection(enabled=True, gateways="gw1,gw2", default_policy="roundrobin",
+                                        fail_closed=True, vm_net="192.168.100.0/24")
+            self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=201)
+            self.gw2 = _DictSection(interface="ens7", next_hop="onlink", rt_table=201)  # same table -> reject
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwDupTable())
+
+
+def test_gwx_rt_table_collides_with_vpn_raises(monkeypatch):
+    # adversarial-review HIGH: a [gwX] rt_table equal to a configured VPN's rt_table would clobber the
+    # VPN's just-built routing table (nexthop_init flush/replace) -> VPN tasks silently egress the
+    # gateway NIC instead of the tunnel (VPN-isolation break). Reject at load. The VPN rt_table is an
+    # int here to prove the str-coercion works (config may give int or name).
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwVpnTable(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=201)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "vpns", {"vpn0": type("V", (), {"rt_table": 201})()}, raising=False)
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwVpnTable())
+    assert "gw1" not in startup.gateways
+
+
+def test_gwx_rt_table_collides_with_dirty_line_raises(monkeypatch):
+    # adversarial-review HIGH: a [gwX] rt_table equal to routing.routing.rt_table (the internet
+    # dirty-line table) would be clobbered by the dirty-line init_rttable that runs AFTER us ->
+    # gateway tasks egress the dirty line instead of the gateway egress_if. Reject at load.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwDirtyLineTable(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.routing = _DictSection(route="none", rt_table="201")  # dirty-line table == gw table
+            self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=201)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "vpns", {}, raising=False)
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwDirtyLineTable())
+    assert "gw1" not in startup.gateways
+
+
 def test_gateway_named_like_policy_token_raises(monkeypatch):
     # A [gwX] must not be named a pool-policy token (roundrobin/random): _select_gateway would
     # treat the name as the policy, not the id, so the profile could never be explicitly selected.
