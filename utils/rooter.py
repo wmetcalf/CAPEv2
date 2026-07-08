@@ -665,10 +665,21 @@ def srcroute_disable(rt_table, ipaddr):
 # nexthop primitive — argv builders
 # ---------------------------------------------------------------------------
 
+# Linux reserved/system routing tables that a [gwX] rt_table must never target — flushing any of
+# these would wipe the host's own routing and take the box offline. The startup loader rejects a
+# reserved rt_table up front (fail loud); these guards are defence-in-depth for the rooter path.
+# Kernel-fixed ids.
+RESERVED_RT_TABLES = ("local", "main", "default", "0", "253", "254", "255")
+
+
 def nexthop_init(rt_table, egress_if, next_hop):
     """Idempotently build a next-hop profile's routing table: one forced default route.
     next_hop == 'onlink' => default dev egress_if onlink; else default via next_hop dev egress_if.
     NOTE: deliberately does NOT call init_rttable (that copies main's per-interface routes)."""
+    # NEVER flush a reserved/system routing table (codex P1 / gemini critical). See RESERVED_RT_TABLES.
+    if rt_table in RESERVED_RT_TABLES:
+        log.error("nexthop_init refusing to flush reserved routing table %r (fix the [gwX] rt_table)", rt_table)
+        return
     run(settings.ip, "route", "flush", "table", rt_table)
     if next_hop == "onlink":
         run(settings.ip, "route", "replace", "default", "dev", egress_if, "onlink", "table", rt_table)
@@ -683,14 +694,20 @@ def nexthop_enable(vm_ip, egress_if, rt_table, priority):
     run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)  # idempotent
     run(settings.ip, "rule", "add", "from", vm_ip, "lookup", rt_table, "priority", priority)
     run_iptables("-t", "nat", "-A", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
-    run_iptables("-A", "FORWARD", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    # Accept the VM's forwarded egress via CAPE_ACCEPTED_SEGMENTS -- the chain FORWARD jumps to
+    # FIRST (cleanup_rooter) -- so it precedes any libvirt default `-i virbr* -j REJECT` still
+    # sitting in the raw FORWARD chain. A tail `-A FORWARD ... ACCEPT` would be shadowed by that
+    # reject on libvirt-backed guests (codex P1); the generic forward_enable uses this same chain.
+    # ACCEPT terminates traversal, so return traffic is covered by the ESTABLISHED,RELATED accept
+    # state_enable installs in the same chain -- no reverse rule needed here.
+    run_iptables("-I", "CAPE_ACCEPTED_SEGMENTS", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
 
 
 def nexthop_disable(vm_ip, egress_if, rt_table, priority):
     """Mirror-delete the per-task state from nexthop_enable, then flush conntrack."""
     run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)
     run_iptables("-t", "nat", "-D", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
-    run_iptables("-D", "FORWARD", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    run_iptables("-D", "CAPE_ACCEPTED_SEGMENTS", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
     run("conntrack", "-D", "-s", vm_ip)
 
 
@@ -717,10 +734,8 @@ def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, 
     """Remove ALL nexthop policy-routing state (cleanup_rooter only sweeps iptables).
     gateway_tables: comma-joined table ids. Idempotent; every step is a best-effort run()."""
     for rt in [t for t in gateway_tables.split(",") if t]:
-        # NEVER flush a reserved/system routing table: a misconfigured [gwX] rt_table of
-        # main/local/default (or their numeric ids) would otherwise wipe the host's own
-        # routing on startup + SIGTERM and take the box offline (gemini #14 HIGH).
-        if rt in ("local", "main", "default", "0", "253", "254", "255"):
+        # NEVER flush a reserved/system routing table (gemini #14 HIGH). See RESERVED_RT_TABLES.
+        if rt in RESERVED_RT_TABLES:
             log.error("nexthop_teardown refusing to flush reserved routing table %r (fix the [gwX] rt_table)", rt)
             continue
         run(settings.ip, "route", "flush", "table", rt)

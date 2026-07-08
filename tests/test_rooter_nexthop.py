@@ -55,6 +55,17 @@ def test_nexthop_init_via(rec):
     ]
 
 
+def test_nexthop_init_skips_reserved_table(rec):
+    # codex P1 / gemini critical: load_nexthop_profiles feeds each [gwX] rt_table straight into
+    # nexthop_init's flush at startup, so a misconfigured reserved table (main/254/...) must NOT
+    # be flushed — doing so would wipe the host's own routing. nexthop_teardown already guards
+    # this set; the init path must too. No ip command runs at all for a reserved table.
+    for bad in ("main", "local", "default", "254", "255", "253", "0"):
+        rec["run"].clear()
+        rooter.nexthop_init(bad, "ens6", "onlink")
+        assert rec["run"] == [], f"nexthop_init flushed reserved table {bad!r}: {rec['run']}"
+
+
 # ---------------------------------------------------------------------------
 # Task 2: nexthop_enable
 # ---------------------------------------------------------------------------
@@ -67,10 +78,15 @@ def test_nexthop_enable_argv(rec):
         ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),  # idempotent pre-clean
         ("ip", "rule", "add", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
     ]
+    # The forward ACCEPT goes into CAPE_ACCEPTED_SEGMENTS (jumped first in FORWARD), NOT a tail
+    # `-A FORWARD` rule — otherwise a libvirt default `-i virbr* -j REJECT` in front of it would
+    # shadow the accept on libvirt-backed guests (codex P1).
     assert rec["iptables"] == [
         ("-t", "nat", "-A", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
-        ("-A", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+        ("-I", "CAPE_ACCEPTED_SEGMENTS", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
+    # never a raw tail FORWARD append (regression guard for the shadowing bug)
+    assert not any(a[:2] == ("-A", "FORWARD") for a in rec["iptables"])
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +99,10 @@ def test_nexthop_disable_argv(rec):
         ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
         ("conntrack", "-D", "-s", "192.168.100.42"),
     ]
+    # mirror-delete from the same chain enable inserted into (CAPE_ACCEPTED_SEGMENTS)
     assert rec["iptables"] == [
         ("-t", "nat", "-D", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
-        ("-D", "FORWARD", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+        ("-D", "CAPE_ACCEPTED_SEGMENTS", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
 
 

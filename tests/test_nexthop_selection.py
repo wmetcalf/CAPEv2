@@ -196,6 +196,18 @@ def test_nexthop_default_route_boots_without_vpn(monkeypatch):
     startup.validate_default_route(_FakeRouting(route="gw1"))
 
 
+def test_nexthop_policy_token_default_route_boots_without_vpn(monkeypatch):
+    # codex P2: a pool-policy token (roundrobin/random) is a valid DEFAULT route when nexthop is
+    # on — _resolve_nexthop maps it to default_policy and picks from the live pool. validate must
+    # accept it WITHOUT a VPN, even though it is not a concrete gateway id; otherwise the
+    # documented pool default raises the vpn-not-enabled error at startup. (gateways empty on
+    # purpose to prove acceptance is by-token, not by-id.)
+    import lib.cuckoo.core.startup as startup
+    monkeypatch.setattr(startup, "gateways", {})
+    for tok in ("roundrobin", "random"):
+        startup.validate_default_route(_FakeRouting(route=tok))  # must NOT raise
+
+
 def test_unknown_gateway_default_route_raises(monkeypatch):
     import lib.cuckoo.core.startup as startup
     from lib.cuckoo.common.exceptions import CuckooStartupError
@@ -253,3 +265,64 @@ def test_gwx_missing_interface_raises(monkeypatch):
     monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
     with pytest.raises(CuckooStartupError):
         startup.load_nexthop_profiles(_GwNoInterface())
+
+
+def test_gwx_reserved_rt_table_raises(monkeypatch):
+    # ADVERSARIAL-REVIEW HIGH (2026-07-08): the nexthop_init reserved-table guard alone leaves a
+    # fail-OPEN — a [gwX] with rt_table=main is still registered/selectable, and its per-task rule
+    # `from vm_ip lookup main priority 100xx` (below the 30000 blackhole) routes the VM out the host
+    # default route. Reject a reserved rt_table at LOAD so the profile can never be dispatched.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    for bad in ("main", "local", "default", "254", "255", "253", "0"):
+        class _GwReservedTable(_FakeRouting):
+            def __init__(self, rt=bad):
+                super().__init__()
+                self.gw1 = _DictSection(interface="ens6", next_hop="onlink", rt_table=rt)
+
+        startup.gateways.clear()
+        monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+        with pytest.raises(CuckooStartupError):
+            startup.load_nexthop_profiles(_GwReservedTable())
+        assert "gw1" not in startup.gateways, f"reserved-table gw1 (rt={bad}) leaked into gateways"
+
+
+def test_gateway_named_like_policy_token_raises(monkeypatch):
+    # A [gwX] must not be named a pool-policy token (roundrobin/random): _select_gateway would
+    # treat the name as the policy, not the id, so the profile could never be explicitly selected.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    for tok in ("roundrobin", "random"):
+        class _GwPolicyName(_FakeRouting):
+            def __init__(self, name=tok):
+                super().__init__()
+                self.nexthop = _DictSection(enabled=True, gateways=name, default_policy="roundrobin",
+                                            fail_closed=True, vm_net="192.168.100.0/24")
+                setattr(self, name, _DictSection(interface="ens6", next_hop="onlink", rt_table=201))
+
+        startup.gateways.clear()
+        monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+        with pytest.raises(CuckooStartupError):
+            startup.load_nexthop_profiles(_GwPolicyName())
+
+
+def test_nexthop_enabled_empty_pool_raises(monkeypatch):
+    # gemini medium: [nexthop] enabled with an empty/blank gateways list parses zero profiles.
+    # Without a guard, every task would silently fall through to the fail-closed blackhole —
+    # so fail loudly at startup instead. `gateways = ""` passes the not-None required-option
+    # check (empty string != None) but yields no profiles.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _NexthopEmptyPool(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.nexthop = _DictSection(enabled=True, gateways="  ,  ", default_policy="roundrobin",
+                                        fail_closed=True, vm_net="192.168.100.0/24")
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_NexthopEmptyPool())
