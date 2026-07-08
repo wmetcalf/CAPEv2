@@ -121,6 +121,18 @@ def test_configured_default_route_uses_default_policy(mgr, monkeypatch):
     assert mgr.nexthop_id == "gw2"
 
 
+def test_reserved_route_never_resolves_to_gateway(mgr, monkeypatch):
+    # gemini #15 (security-critical): a reserved route (none/drop/false/internet/tor/inetsim) must
+    # DROP, never resolve to a gateway — even if it is the node's configured default route.
+    live = type("P", (), {"name": "gw1", "interface": "ens6", "rt_table": "201", "priority": 0})()
+    monkeypatch.setattr(am, "_select_gateway", lambda r: live, raising=False)  # would bind if reached
+    monkeypatch.setattr(am, "gateways", {"gw1": live}, raising=False)
+    _route(mgr, route="internet", nexthop_enabled=True, default_route="internet")
+    cmds = [c for c, _ in mgr._calls]
+    assert "drop_enable" in cmds and "nexthop_enable" not in cmds
+    assert mgr.route == "drop" and mgr.nexthop_id is None
+
+
 def test_all_nexthop_args_are_str(mgr, monkeypatch):
     prof = type("P", (), {"name": "gw1", "interface": "ens6", "rt_table": "201", "priority": 0})()
     monkeypatch.setattr(am, "_select_gateway", lambda r: prof, raising=False)

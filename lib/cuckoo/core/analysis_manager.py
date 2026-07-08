@@ -564,6 +564,12 @@ class AnalysisManager(threading.Thread):
         #  - ONLY the node's configured DEFAULT route falls back to default_policy;
         #  - anything else (a typo'd/unconfigured id like "gw9"/"vpn9") DROPS rather than
         #    silently egressing via some live gateway (that would be an isolation-boundary bypass).
+        # A reserved route (none/drop/false/internet/tor/inetsim) must NEVER resolve to a gateway
+        # even if it is the configured default — those are owned by earlier route_network branches;
+        # reaching here with one means drop, not gateway (gemini #15 security-critical).
+        if self.route in ("none", "drop", "false", "internet", "tor", "inetsim"):
+            self.route = "drop"
+            return False
         if self.route in gateways or self.route in ("roundrobin", "random"):
             sel = self.route
         elif self.route == routing.routing.route:

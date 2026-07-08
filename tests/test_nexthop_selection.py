@@ -56,6 +56,14 @@ def test_roundrobin_threadsafe(monkeypatch):
     assert all(out.count(n) == 100 for n in ("gw1", "gw2", "gw3"))
 
 
+def test_unknown_selector_fails_closed(monkeypatch):
+    # gemini #15: a value that is neither a known gateway id nor 'random'/'roundrobin' must NOT
+    # silently fall through to roundrobin — it fails closed (returns None so the caller drops).
+    _seed(monkeypatch)
+    assert core_rooter._select_gateway("bogus") is None
+    assert core_rooter._select_gateway("roundrobin").name in ("gw1", "gw2", "gw3")  # policy still works
+
+
 # ---------------------------------------------------------------------------
 # _FakeRouting helper shared by T7 and T8 tests
 # ---------------------------------------------------------------------------

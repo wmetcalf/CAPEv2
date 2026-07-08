@@ -87,7 +87,11 @@ def _select_gateway(route):
         return None
     if route == "random":
         return random.choice(live)
-    # roundrobin (default): advance the process-global cursor under the lock
+    if route != "roundrobin":
+        # not a gateway id, not 'random', not 'roundrobin' => unknown selector, FAIL CLOSED
+        # rather than silently treating it as roundrobin (gemini #15).
+        return None
+    # roundrobin: advance the process-global cursor under the lock
     with _gw_lock:
         p = live[_gw_cursor % len(live)]
         _gw_cursor += 1
