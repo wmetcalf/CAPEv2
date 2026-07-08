@@ -711,19 +711,29 @@ def nexthop_disable(vm_ip, egress_if, rt_table, priority):
     run("conntrack", "-D", "-s", vm_ip)
 
 
-def nexthop_fail_closed_enable(vm_net, fail_table, priority_low):
+def nexthop_fail_closed_enable(vm_net, fail_table, priority_low, band_lo):
     """Arm once at startup: any guest-subnet source with no higher-priority per-task rule
     is blackholed (dropped), never routed by main out the control-plane NIC.
     `route replace` is idempotent; rules are del+add'd so a restart does not stack duplicates.
 
-    INTRA-SUBNET EXCEPTION (priority just above the blackhole): vm_net includes the host's
-    own guest-bridge IP, so `from vm_net lookup <blackhole>` would also drop the host's own
-    traffic to the guests -- breaking the guest-agent init and the ResultServer (host<->guest,
-    guest<->guest). Keep intra-subnet traffic on the main table so analyses can initialise;
-    only genuinely external guest egress falls through to the per-task nexthop rule or the
-    blackhole."""
+    INTRA-SUBNET EXCEPTION: vm_net includes the host's own guest-bridge IP and sibling guests, so
+    `from vm_net lookup <blackhole>` would also drop the host's own traffic to the guests -- breaking
+    the guest-agent init and the ResultServer (host<->guest, guest<->guest). Keep intra-subnet
+    traffic on main; only genuinely external guest egress falls through to the per-task nexthop rule
+    or the blackhole.
+
+    This exception is installed at band_lo-1 -- i.e. JUST BELOW the per-task band (band_lo..band_hi),
+    NOT just below the blackhole. A bound VM's per-task rule is `from <vm_ip> lookup <gw_table>` at a
+    priority inside the band, and the gateway table holds only a default route; if the exception sat
+    above the band a bound VM's traffic to a vm_net address that is NOT the host-local bridge IP (a
+    sibling guest, or a ResultServer that is not the host itself) would be captured by the per-task
+    rule and SNAT'd out the gateway instead of staying on main (codex P1). Host-local ResultServer
+    already resolves via the kernel priority-0 local table; placing the exception below the band
+    covers the non-host-local + guest<->guest cases too, for bound and unbound VMs alike. External
+    egress is unaffected (the exception only matches `to vm_net`) and fail-closed still holds (an
+    unbound external flow matches no band rule and hits the blackhole)."""
     run(settings.ip, "route", "replace", "blackhole", "default", "table", fail_table)
-    intra_prio = str(int(priority_low) - 1)
+    intra_prio = str(int(band_lo) - 1)
     run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
     run(settings.ip, "rule", "add", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
@@ -741,7 +751,8 @@ def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, 
         run(settings.ip, "route", "flush", "table", rt)
     run(settings.ip, "route", "del", "blackhole", "default", "table", fail_table)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
-    run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", str(int(priority_low) - 1))
+    # intra-subnet exception is armed at band_lo-1 (just below the per-task band); mirror-delete it
+    run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", str(int(band_lo) - 1))
     lo, hi = int(band_lo), int(band_hi)
     stdout, _ = run(settings.ip, "rule", "show")
     for line in stdout.splitlines():

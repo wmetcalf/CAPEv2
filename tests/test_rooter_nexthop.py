@@ -111,16 +111,25 @@ def test_nexthop_disable_argv(rec):
 # ---------------------------------------------------------------------------
 
 def test_nexthop_fail_closed_argv(rec):
-    rooter.nexthop_fail_closed_enable("192.168.100.0/24", "250", "30000")
+    # band_lo=10000 => intra-subnet exception at band_lo-1 = 9999, BELOW the per-task band so it wins
+    # over a bound VM's `from <vm_ip> lookup <gw_table>` rule for intra-vm_net destinations (codex P1).
+    rooter.nexthop_fail_closed_enable("192.168.100.0/24", "250", "30000", "10000")
     assert rec["run"] == [
         ("ip", "route", "replace", "blackhole", "default", "table", "250"),
-        # intra-subnet exception (priority just above the blackhole) so host<->guest
-        # (agent init + ResultServer) and guest<->guest stay on main and aren't dropped.
-        ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999"),
-        ("ip", "rule", "add", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999"),
+        # intra-subnet exception at 9999 (band_lo-1, below the 10000-10255 per-task band) so
+        # host<->guest (agent init + ResultServer) and guest<->guest stay on main -- even for a
+        # BOUND VM whose per-task rule would otherwise capture intra-subnet traffic to the gateway.
+        ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "9999"),
+        ("ip", "rule", "add", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "9999"),
         ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
         ("ip", "rule", "add", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000"),
     ]
+    # ORDERING INVARIANT (codex P1): the intra-subnet exception MUST sit below the per-task band
+    # (10000), otherwise a bound VM's per-task rule shadows it and intra-vm_net traffic leaks to the
+    # gateway. `band_lo` was 10000, so the exception priority must be < 10000.
+    intra = [r for r in rec["run"] if r[:3] == ("ip", "rule", "add") and "to" in r]
+    assert intra, "no intra-subnet exception rule recorded"
+    assert all(int(r[-1]) < 10000 for r in intra), intra
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +154,7 @@ def test_nexthop_teardown_sweeps_policy_routing(rec, monkeypatch):
     assert ("ip", "route", "del", "blackhole", "default", "table", "250") in rec["run"]
     assert ("ip", "rule", "del", "from", "192.168.100.0/24", "lookup", "250", "priority", "30000") in rec["run"]
     # intra-subnet exception rule also removed on teardown
-    assert ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "29999") in rec["run"]
+    assert ("ip", "rule", "del", "from", "192.168.100.0/24", "to", "192.168.100.0/24", "lookup", "main", "priority", "9999") in rec["run"]
     # in-band per-task rules swept; the 32766 main rule untouched
     assert ("ip", "rule", "del", "priority", "10042") in rec["run"]
     assert ("ip", "rule", "del", "priority", "10043") in rec["run"]

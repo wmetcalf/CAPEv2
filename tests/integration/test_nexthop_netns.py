@@ -269,8 +269,9 @@ def test_unbound_source_is_blackholed(netns):
     VM_NET = "192.168.100.0/24"
     FAIL_TABLE = "250"
     PRIORITY_LOW = "30000"
+    BAND_LO = "10000"
 
-    rooter.nexthop_fail_closed_enable(VM_NET, FAIL_TABLE, PRIORITY_LOW)
+    rooter.nexthop_fail_closed_enable(VM_NET, FAIL_TABLE, PRIORITY_LOW, BAND_LO)
 
     # (a) Blackhole default is in table 250
     assert ip_route_table_has_blackhole(FAIL_TABLE), (

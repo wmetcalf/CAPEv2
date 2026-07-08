@@ -155,7 +155,7 @@ def load_nexthop_profiles(routing_cfg):
     for entry in profiles:
         rooter("nexthop_init", str(entry.rt_table), str(entry.interface), str(entry.next_hop))
     if routing_cfg.nexthop.fail_closed:
-        rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW)
+        rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO)
 
 
 def validate_default_route(routing_cfg):
