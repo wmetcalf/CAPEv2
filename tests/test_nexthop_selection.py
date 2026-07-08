@@ -208,6 +208,37 @@ def test_nexthop_policy_token_default_route_boots_without_vpn(monkeypatch):
         startup.validate_default_route(_FakeRouting(route=tok))  # must NOT raise
 
 
+def test_nexthop_sentinel_default_route_boots_without_vpn(monkeypatch):
+    # Copilot: `[routing] route = nexthop` is the documented pool default (maps to default_policy).
+    # validate_default_route must accept the sentinel WITHOUT a VPN, else the default_policy path is
+    # unreachable in production. gateways empty on purpose (sentinel is not a gateway id).
+    import lib.cuckoo.core.startup as startup
+    monkeypatch.setattr(startup, "gateways", {})
+    startup.validate_default_route(_FakeRouting(route="nexthop"))  # must NOT raise
+
+
+def test_gateway_named_nexthop_raises(monkeypatch):
+    # Copilot: "nexthop" is the pool sentinel, so a [gwX] must not be named it (ambiguous with the
+    # default-policy route). Rejected via _RESERVED_ROUTE_NAMES.
+    import lib.cuckoo.core.startup as startup
+    from lib.cuckoo.common.exceptions import CuckooStartupError
+
+    class _GwNamedNexthop(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.nexthop = _DictSection(enabled=True, gateways="nexthop", default_policy="roundrobin",
+                                        fail_closed=True, vm_net="192.168.100.0/24")
+            self.nexthop_section = _DictSection(interface="ens6", next_hop="onlink", rt_table=201)
+
+        def get(self, name):
+            return self.nexthop_section if name == "nexthop" else getattr(self, name)
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "rooter", lambda *a, **k: {}, raising=False)
+    with pytest.raises(CuckooStartupError):
+        startup.load_nexthop_profiles(_GwNamedNexthop())
+
+
 def test_unknown_gateway_default_route_raises(monkeypatch):
     import lib.cuckoo.core.startup as startup
     from lib.cuckoo.common.exceptions import CuckooStartupError

@@ -137,7 +137,9 @@ rt_table = tun0
 enabled = no
 # Comma list of [gwX] profile ids to load.
 gateways = gw1
-# Default selection when a task names no route: roundrobin | random | <gwX id>
+# Selection used when a task's route resolves to the pool. Set [routing] route = nexthop (the pool
+# sentinel) so tasks that name no route use this; roundrobin | random | <gwX id>. A task may also
+# name a route directly: a <gwX id>, roundrobin, random, or nexthop.
 default_policy = roundrobin
 # Drop guest egress when no live gateway (strongly recommended yes).
 fail_closed = yes

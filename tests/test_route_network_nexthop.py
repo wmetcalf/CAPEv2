@@ -47,22 +47,66 @@ def _fake_routing(default_policy="roundrobin", default_route="nexthop"):
     )()
 
 
-def _route(mgr, route, nexthop_enabled, default_policy="roundrobin", default_route="nexthop"):
-    """Replicate route_network's resolution + dispatch for the nexthop branch only.
+def _route(mgr, route, nexthop_enabled, default_policy="roundrobin", default_route="nexthop", tun_iface_exists=False):
+    """Replicate ONLY route_network's tunX + nexthop branches (the two the C1 reorder concerns).
 
-    `nexthop_enabled` is the gate (mirrors _nexthop_enabled(routing)); when False the
-    branch is never entered so the legacy paths are byte-for-byte unchanged.
+    This deliberately models just the tail of route_network's resolution chain: it captures the
+    RELATIVE ORDER of the tunX branch vs the nexthop branch and the nexthop-consumes-the-route
+    behaviour. It does NOT model the earlier legacy branches (none/inetsim/tor/internet/vpn/socks5)
+    or the post-resolution nic_available fallback -- in real route_network those legacy routes are
+    consumed by their own branches and never reach _resolve_nexthop. Tests that pass route="internet"
+    etc. here are exercising _resolve_nexthop's defensive reserved-DROP guard in isolation, not a
+    production route_network path.
+
+    The modelled invariants (Copilot fix): the tunX branch is checked BEFORE the nexthop branch,
+    because _resolve_nexthop rewrites self.route="drop" for any route it does not own and would
+    otherwise clobber an explicit tun route; and when [nexthop] is enabled its branch CONSUMES the
+    route (bind a gateway, or force drop) rather than an `and`-guarded pass, so a nexthop drop falls
+    into the none/drop/false dispatch below instead of a misleading "Unknown route" else.
+    `nexthop_enabled` False => the branch is never entered (legacy paths byte-for-byte unchanged).
     """
     routing = _fake_routing(default_policy, default_route)
     mgr.route = route
-    # resolution chain (only the nexthop branch is modeled here; a False return
-    # forces route="drop" and skips the branch body, exactly like route_network).
-    if nexthop_enabled and mgr._resolve_nexthop(routing):
-        pass
-    # dispatch chain: forced-drop is handled by the existing none/drop/false dispatch
+    # resolution chain: tun BEFORE nexthop
+    if str(mgr.route)[:3] == "tun" and tun_iface_exists:
+        mgr.interface = mgr.route
+    elif nexthop_enabled:
+        mgr._resolve_nexthop(routing)
+    # dispatch chain: forced-drop handled by the existing none/drop/false dispatch; tun by its own
     if str(mgr.route).lower() in ("none", "drop", "false"):
         am.rooter("drop_enable", mgr.machine.ip, "2042")
+    elif str(mgr.route)[:3] == "tun" and tun_iface_exists:
+        am.rooter("interface_route_tun_enable", mgr.machine.ip, mgr.route, "1")
     mgr._dispatch_nexthop()
+
+
+def test_tun_route_not_hijacked_when_nexthop_enabled(mgr, monkeypatch):
+    # Copilot: an explicit tunX route must be handled by the tun branch, NOT clobbered to drop by
+    # _resolve_nexthop, when [nexthop] is enabled. route_network checks tun BEFORE nexthop.
+    # _select_gateway WOULD bind a live profile if reached — the fix must not reach it for a tun route.
+    live = type("P", (), {"name": "gw1", "interface": "ens6", "rt_table": "201", "priority": 0})()
+    monkeypatch.setattr(am, "_select_gateway", lambda r: live, raising=False)
+    monkeypatch.setattr(am, "gateways", {"gw1": live}, raising=False)
+    _route(mgr, route="tun0", nexthop_enabled=True, tun_iface_exists=True)
+    cmds = [c for c, _ in mgr._calls]
+    assert mgr.route == "tun0"          # NOT rewritten to drop
+    assert mgr.interface == "tun0"      # handled by the tun branch
+    assert mgr.nexthop_id is None       # nexthop never bound it
+    assert "interface_route_tun_enable" in cmds
+    assert "drop_enable" not in cmds and "nexthop_enable" not in cmds
+
+
+def test_explicit_nexthop_sentinel_uses_default_policy(mgr, monkeypatch):
+    # Copilot: route="nexthop" (explicit) maps to default_policy pool selection regardless of the
+    # node's configured default route — this is what makes the documented pool default reachable.
+    prof = type("P", (), {"name": "gw2", "interface": "ens7", "rt_table": "202", "priority": 0})()
+    monkeypatch.setattr(am, "_select_gateway", lambda r: prof if r in ("roundrobin", "random") else None, raising=False)
+    monkeypatch.setattr(am, "gateways", {"gw2": prof}, raising=False)
+    # node default is a DIFFERENT gateway, proving the "nexthop" sentinel is honored on its own
+    _route(mgr, route="nexthop", nexthop_enabled=True, default_policy="roundrobin", default_route="gw2")
+    cmds = [c for c, _ in mgr._calls]
+    assert "nexthop_enable" in cmds and "drop_enable" not in cmds
+    assert mgr.nexthop_id == "gw2"
 
 
 def test_explicit_gateway_binds_and_skips_generic(mgr, monkeypatch):

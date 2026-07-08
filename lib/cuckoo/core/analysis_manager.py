@@ -572,7 +572,10 @@ class AnalysisManager(threading.Thread):
             return False
         if self.route in gateways or self.route in ("roundrobin", "random"):
             sel = self.route
-        elif self.route == routing.routing.route:
+        elif self.route == "nexthop" or self.route == routing.routing.route:
+            # the "nexthop" sentinel (explicit) OR the node's configured default route falls back
+            # to default_policy and picks from the live pool. "nexthop" is a reserved token (a
+            # [gwX] may not be named it), so this is not the gemini-#15 typo'd-route leak.
             sel = routing.nexthop.default_policy
         else:
             self.route = "drop"
@@ -649,15 +652,20 @@ class AnalysisManager(threading.Thread):
             self.rt_table = vpns[self.route].rt_table
         elif self.route in self.socks5s:
             self.interface = ""
-        elif _nexthop_enabled(routing) and self._resolve_nexthop(routing):
-            # _resolve_nexthop bound a gateway profile (set self.nexthop_* and
-            # self.interface=None so the generic forward/srcroute block is skipped).
-            # When it returns False (unresolved id) it has forced self.route="drop";
-            # the branch body is skipped so the existing drop dispatch fires (review B1).
-            pass
         elif self.route[:3] == "tun" and is_network_interface(self.route):
-            # tunnel interface starts with "tun" and interface exists on machine
+            # tunnel interface starts with "tun" and interface exists on machine. Checked BEFORE
+            # the nexthop branch: _resolve_nexthop rewrites self.route="drop" for any route it does
+            # not own, which would otherwise clobber an explicit tunX route into a drop when
+            # [nexthop] is enabled (Copilot). Legacy explicit routes win over nexthop resolution.
             self.interface = self.route
+        elif _nexthop_enabled(routing):
+            # When [nexthop] is enabled it OWNS every route not claimed by a legacy branch above:
+            # it binds a gateway profile (setting self.nexthop_* and self.interface=None so the
+            # generic forward/srcroute block is skipped) or, for an unresolved/typo'd id, forces
+            # self.route="drop". Consuming the route here (rather than an `and`-guarded `pass`)
+            # means a nexthop-dropped task falls into the none/drop/false dispatch below and fails
+            # closed cleanly, instead of the misleading "Unknown ... ignoring routing" else (Copilot).
+            self._resolve_nexthop(routing)
         else:
             self.log.warning("Unknown network routing destination specified, ignoring routing for this analysis: %s", self.route)
             self.interface = None

@@ -74,7 +74,10 @@ NEXTHOP_FAIL_TABLE = "250"
 NEXTHOP_PRIORITY_LOW = "30000"
 NEXTHOP_BAND_LO = "10000"
 NEXTHOP_BAND_HI = "10255"
-_RESERVED_ROUTE_NAMES = {"none", "internet", "tor", "inetsim", "drop", "false"}
+# Route keywords a [gwX] gateway id must never collide with. "nexthop" is the sentinel default
+# route that maps to [nexthop] default_policy (pool selection), so a gateway named "nexthop"
+# would be ambiguous — reserve it too (Copilot).
+_RESERVED_ROUTE_NAMES = {"none", "internet", "tor", "inetsim", "drop", "false", "nexthop"}
 # Pool-policy selector tokens: a task route of roundrobin/random means "pick from the live
 # pool", so a [gwX] must not be *named* one of these (it could never be explicitly selected
 # and would collide with the policy token in _resolve_nexthop/_select_gateway).
@@ -163,11 +166,12 @@ def validate_default_route(routing_cfg):
     if route in ("none", "internet", "tor", "inetsim"):
         return
     nexthop_on = hasattr(routing_cfg, "nexthop") and routing_cfg.nexthop.enabled
-    if nexthop_on and (route in gateways or route in _POLICY_TOKENS):
-        # A concrete gateway id OR a pool-policy token (roundrobin/random) is a valid default
-        # route when nexthop is on -- _resolve_nexthop maps the policy token to default_policy
-        # and picks from the live pool. Accept it here so the documented pool default works
-        # without a VPN; otherwise startup wrongly raises the vpn-not-enabled error (codex P2).
+    if nexthop_on and (route in gateways or route in _POLICY_TOKENS or route == "nexthop"):
+        # A concrete gateway id, a pool-policy token (roundrobin/random), or the "nexthop" sentinel
+        # is a valid default route when nexthop is on -- _resolve_nexthop maps the token/sentinel to
+        # default_policy and picks from the live pool. Accept it here so the documented pool default
+        # (route = nexthop) works without a VPN; otherwise startup wrongly raises the vpn-not-enabled
+        # error and the default_policy fallback is unreachable in production (codex P2 / Copilot).
         return  # skip the vpn.enabled gate
     if not routing_cfg.vpn.enabled:
         raise CuckooStartupError(

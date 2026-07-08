@@ -758,6 +758,19 @@ def nexthop_configure(tables_csv, vm_net, fail_table, prio_low, band_lo, band_hi
     NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI = prio_low, band_lo, band_hi
 
 
+def nexthop_teardown_if_configured():
+    """SIGTERM helper: remove nexthop policy-routing state ONLY if the [gwX] loader configured it
+    this session (nexthop_configure sets GATEWAY_TABLES_CSV; it is "" on a node that never enabled
+    [nexthop]). Skipping otherwise honours the disabled=no-op contract -- an unconfigured node must
+    not mutate host routing on shutdown, in particular must not sweep the 10000-10255 priority band
+    (which could delete an unrelated host rule). Module-level + importable so the contract is
+    CI-guarded (the SIGTERM handler itself lives inside __main__ and is not testable)."""
+    if not GATEWAY_TABLES_CSV:
+        return
+    nexthop_teardown(GATEWAY_TABLES_CSV, NEXTHOP_VM_NET, NEXTHOP_FAIL_TABLE,
+                     NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
+
+
 def dns_forward(action, vm_ip, dns_ip, dns_port="53"):
     """Route DNS requests from the VM to a custom DNS on a separate network."""
     run_iptables(
@@ -1307,9 +1320,10 @@ if __name__ == "__main__":
         server.shutdown(socket.SHUT_RDWR)
         server.close()
         cleanup_rooter()
-        # remove nexthop policy-routing state (cleanup_rooter is iptables-only)
-        nexthop_teardown(GATEWAY_TABLES_CSV, NEXTHOP_VM_NET, NEXTHOP_FAIL_TABLE,
-                         NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
+        # Remove nexthop policy-routing state (cleanup_rooter is iptables-only), but only when the
+        # [gwX] loader actually configured nexthop this session -- see nexthop_teardown_if_configured
+        # (extracted + CI-guarded so the disabled=no-op contract can't silently regress) (Copilot).
+        nexthop_teardown_if_configured()
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 

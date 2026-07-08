@@ -170,3 +170,32 @@ def test_nexthop_configure_sets_globals(rec):
     assert rooter.NEXTHOP_PRIORITY_LOW == "30000"
     assert rooter.NEXTHOP_BAND_LO == "10000"
     assert rooter.NEXTHOP_BAND_HI == "10255"
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM teardown gate — disabled node must be a no-op (Copilot C3)
+# ---------------------------------------------------------------------------
+
+def test_sigterm_teardown_noop_when_nexthop_never_configured(rec, monkeypatch):
+    # On a node that never enabled [nexthop], GATEWAY_TABLES_CSV is "" and the SIGTERM teardown
+    # helper must issue ZERO ip commands — no host policy-routing mutation, and crucially no
+    # 10000-10255 band sweep (which could delete an unrelated host rule). Guards the disabled=no-op
+    # contract, which is otherwise untestable (handle_sigterm lives inside __main__).
+    monkeypatch.setattr(rooter, "GATEWAY_TABLES_CSV", "", raising=False)
+    rooter.nexthop_teardown_if_configured()
+    assert rec["run"] == []
+    assert rec["iptables"] == []
+
+
+def test_sigterm_teardown_runs_when_configured(rec, monkeypatch):
+    # When the loader configured nexthop this session, the SIGTERM helper DOES tear down the
+    # gateway tables (positive control so the no-op test above can't pass by accident).
+    monkeypatch.setattr(rooter, "GATEWAY_TABLES_CSV", "201,202", raising=False)
+    monkeypatch.setattr(rooter, "NEXTHOP_VM_NET", "192.168.100.0/24", raising=False)
+    monkeypatch.setattr(rooter, "NEXTHOP_FAIL_TABLE", "250", raising=False)
+    monkeypatch.setattr(rooter, "NEXTHOP_PRIORITY_LOW", "30000", raising=False)
+    monkeypatch.setattr(rooter, "NEXTHOP_BAND_LO", "10000", raising=False)
+    monkeypatch.setattr(rooter, "NEXTHOP_BAND_HI", "10255", raising=False)
+    rooter.nexthop_teardown_if_configured()
+    assert ("ip", "route", "flush", "table", "201") in rec["run"]
+    assert ("ip", "route", "flush", "table", "202") in rec["run"]
