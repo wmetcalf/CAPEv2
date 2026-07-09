@@ -139,11 +139,10 @@ enabled = no
 gateways = gw1
 # Selection used when a task resolves to the pool: roundrobin | random | <gwX id>. Set
 # [routing] route = nexthop (the pool sentinel) as the node default so tasks that DON'T name a route
-# use this. A task may also name a route directly (a <gwX id>, roundrobin, random, or nexthop) via
-# the API/CLI (route=... on submit). NOTE: the web submission UI route selector does not yet list
-# gateway/nexthop routes, so from the GUI a nexthop-only node cannot pick the pool -- wiring the
-# submission selector + distributed exitnodes API is a follow-up; until then drive nexthop routes
-# via the node default or API/CLI/broker submissions.
+# use this. A task may also name a route directly -- a <gwX id>, roundrobin, random, or nexthop --
+# from the web submission UI route selector (which lists the nexthop pool + each configured [gwX])
+# or via API/CLI/broker submissions. (Advertising nexthop routes across a distributed multi-node
+# CAPE via the exitnodes API is a separate follow-up.)
 default_policy = roundrobin
 # Drop guest egress when no live gateway (strongly recommended yes).
 fail_closed = yes
