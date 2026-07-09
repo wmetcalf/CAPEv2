@@ -41,3 +41,14 @@ def test_empty_csv_denies_all():
 def test_whitespace_in_csv_tolerated():
     # a "gw1, gwG" style join (spaces after commas) must still match clean gateway ids
     assert _scope("gwG", "gw1, gwG", {"gw1", "gwG"}, {"gw1", "gwG"}) == "gwG"
+
+
+def test_allowed_slug_not_local_drops():
+    # a slug in the tenant's allowed set but NOT configured on THIS worker cannot be honored -> drop
+    # (fail-closed; prevents a node-default escalation to the global pool via _resolve_nexthop)
+    assert _scope("gwG", "gw1,gwG", {"gw1"}, {"gw1"}) == "drop"   # gwG allowed but absent locally
+
+
+def test_legacy_route_not_in_allowed_still_passes():
+    # a legacy route (not a gateway slug, not in allowed) still passes through even when restricted
+    assert _scope("tor", "gw1,gwG", {"gw1"}, {"gw1"}) == "tor"

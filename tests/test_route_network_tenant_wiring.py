@@ -93,3 +93,11 @@ def test_missing_allowed_exits_attr_passthrough(monkeypatch):
     m, calls, resolved = _drive(monkeypatch, "gw2", _MISSING, live={"gw1", "gw2", "gwG"})
     assert m.route == "gw2"           # getattr default None => passthrough (legacy tasks safe)
     assert resolved == [True]
+
+
+def test_pool_resolves_to_allowed_gateway(monkeypatch):
+    # a pool token with live allowed gateways resolves to a concrete allowed id and reaches _resolve_nexthop
+    m, calls, resolved = _drive(monkeypatch, "roundrobin", "gw1,gwG", live={"gw1", "gwG"})
+    assert m.route in {"gw1", "gwG"}   # never gw2 (not allowed); guard picked a concrete allowed+live exit
+    assert resolved == [True]          # flows into _resolve_nexthop to bind it
+    assert "drop_enable" not in calls

@@ -2726,6 +2726,22 @@ def exit_nodes_list(request):
 
 @csrf_exempt
 @api_view(["GET"])
+def tenant_exits_list(request):
+    """List the egress exits the caller's tenant may use (global + assigned, active) for the nexthop
+    [gwX] pool. Mirrors exit_nodes_list. Unrestricted callers (MT off/shared/local-admin) get the
+    full configured [nexthop] gateways= pool."""
+    allowed = allowed_exit_slugs(viewer_for(request.user))
+    if allowed is None:
+        try:
+            raw = str(getattr(routing_conf.nexthop, "gateways", "") or "")
+        except Exception:
+            raw = ""
+        allowed = {s.strip() for s in raw.split(",") if s.strip()}
+    return Response({"error": False, "data": sorted(allowed)})
+
+
+@csrf_exempt
+@api_view(["GET"])
 def machines_view(request, name=None):
     if not apiconf.machineview.get("enabled"):
         resp = {"error": True, "error_value": "Machine view API is disabled"}
@@ -3080,6 +3096,16 @@ def tasks_download_services(request):
     machine = request.POST.get("machine", "")
     opt_filename = get_user_filename(options, custom)
 
+    # Tenant egress ACL (API parity): validate the requested route + stamp the tenant's allowed set.
+    # download_from_3rdparty -> download_file re-parses route from request.POST, so validate that.
+    from submission.views import validate_and_scope_route
+    _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+    try:
+        validate_and_scope_route(request.POST.get("route") or "none", _allowed_exits)
+    except ValueError as exc:
+        return Response({"error": True, "error_value": str(exc)})
+    _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+
     details = {}
     task_machines = []
     vm_list = []
@@ -3124,6 +3150,7 @@ def tasks_download_services(request):
         "tenant_id": _tenant_id,
         "visibility": _visibility,
         "user_id": request.user.id or 0,
+        "allowed_exits": _allowed_exits_csv,
     }
 
     if opt_apikey:

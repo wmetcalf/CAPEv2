@@ -80,8 +80,12 @@ def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
         # global pool; doing RR here would need fork-side cursor state + a lock. random.choice is
         # stateless, thread-safe, and balances a small per-tenant exit set fine.)
         return random.choice(candidates)
-    if route in gateways:      # explicit gateway id
+    if route in gateways:      # explicit gateway id configured on THIS worker
         return route if (route in allowed and live_filter(route)) else "drop"
+    if route in allowed:       # an allowed exit slug NOT configured on this worker (config skew /
+        return "drop"          # global exit not present here) -- cannot honor it -> fail closed
+        # (prevents the case where such a slug == the node default route escalating via
+        # _resolve_nexthop's default_policy to a gateway outside the tenant's allowed set)
     return route               # legacy route (none/tor/vpnX/...) -- never gated
 
 
