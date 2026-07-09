@@ -140,6 +140,9 @@ class Task(Base):
     user_id: Mapped[Optional[int]] = mapped_column(nullable=True)
     tenant_id: Mapped[Optional[int]] = mapped_column(nullable=True)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False, server_default="private")
+    # CSV of egress exit slugs this task's tenant may use, stamped at submit from
+    # allowed_exit_slugs(viewer). NULL == unrestricted (MT off/shared, or legacy tasks).
+    allowed_exits: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
     # The Task is linked to one specific parent/child association event
     association: Mapped[Optional["SampleAssociation"]] = relationship(back_populates="task", cascade="all, delete-orphan")

@@ -130,6 +130,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
     ):
         """Add a task to database.
         @param obj: object to add (File or URL).
@@ -259,6 +260,7 @@ class TasksMixIn:
         task.user_id = user_id
         task.tenant_id = tenant_id
         task.visibility = visibility or "private"
+        task.allowed_exits = allowed_exits
 
         if parent_sample:
             association = SampleAssociation(
@@ -293,6 +295,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
         parent_sample = None,
     ):
         """Add a task to database from file path.
@@ -348,7 +351,7 @@ class TasksMixIn:
             route=route,
             cape=cape,
             tags_tasks=tags_tasks,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
             parent_sample=parent_sample,
         )
 
@@ -400,6 +403,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
         category=None,
     ):
         """
@@ -461,7 +465,7 @@ class TasksMixIn:
                 file_path=file_path,
                 priority=priority,
                 tlp=tlp,
-                user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
                 options=options,
                 package=package,
             )
@@ -500,7 +504,7 @@ class TasksMixIn:
                     file_path=file_path,
                     priority=priority,
                     tlp=tlp,
-                    user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                    user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
                     options=options,
                     package=package,
                     parent_sample=parent_sample,
@@ -522,7 +526,7 @@ class TasksMixIn:
                         config = static_extraction(file)
                 if config or only_extraction:
                     task_ids += self.add_static(
-                        file_path=file, priority=priority, tlp=tlp, user_id=user_id, tenant_id=tenant_id, visibility=visibility, options=options, parent_sample=parent_sample,
+                        file_path=file, priority=priority, tlp=tlp, user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits, options=options, parent_sample=parent_sample,
                     )
 
             if not config and not only_extraction:
@@ -571,7 +575,7 @@ class TasksMixIn:
                     route=route,
                     tags_tasks=tags_tasks,
                     cape=cape,
-                    user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                    user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
                     parent_sample=parent_sample,
                 )
                 package = None
@@ -603,6 +607,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
     ):
         return self.add(
             PCAP(file_path.decode()),
@@ -618,7 +623,7 @@ class TasksMixIn:
             enforce_timeout=enforce_timeout,
             clock=clock,
             tlp=tlp,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
         )
 
     def add_static(
@@ -640,6 +645,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
         parent_sample=None,
     ):
         extracted_files, demux_error_msgs = demux_sample(file_path, package, options)
@@ -677,7 +683,7 @@ class TasksMixIn:
                 tlp=tlp,
                 static=static,
                 parent_sample=parent_sample,
-                user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
             )
             if task_id:
                 task_ids.append(task_id)
@@ -705,6 +711,7 @@ class TasksMixIn:
         user_id=0,
         tenant_id=None,
         visibility="private",
+        allowed_exits=None,
     ):
         """Add a task to database from url.
         @param url: url.
@@ -751,7 +758,7 @@ class TasksMixIn:
             route=route,
             cape=cape,
             tags_tasks=tags_tasks,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id, tenant_id=tenant_id, visibility=visibility, allowed_exits=allowed_exits,
         )
 
     def set_vnc_port(self, task_id: int, port: int):
