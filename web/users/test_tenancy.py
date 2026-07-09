@@ -1,5 +1,6 @@
 import pytest
 from django.contrib.auth.models import User
+from django.test import TestCase
 
 
 @pytest.mark.django_db
@@ -327,3 +328,19 @@ def test_extract_groups_reads_userinfo_nested_claims():
     assert _extract_groups({"id_token": "x", "userinfo": {"sub": "1"}}) == set()  # absent -> fail-closed
     # _claims flattens the openid_connect shape (id_token + userinfo) to the claim dict
     assert _claims({"id_token": "x", "userinfo": {"email": "a@x", "groups": ["g"]}}).get("email") == "a@x"
+
+
+class ExitModelTests(TestCase):
+    def test_global_and_assigned_exits(self):
+        from users.models import Tenant, Exit
+
+        t = Tenant.objects.create(slug="acme", name="Acme")
+        Exit.objects.create(slug="gwGlobal", name="Shared", is_global=True)
+        d = Exit.objects.create(slug="gw1", name="Acme dedicated")
+        t.exits.add(d)
+        assert set(t.exits.values_list("slug", flat=True)) == {"gw1"}
+        assert set(Exit.objects.filter(is_global=True).values_list("slug", flat=True)) == {"gwGlobal"}
+        # inactive exits still stored but flagged
+        d.active = False
+        d.save()
+        assert Exit.objects.filter(active=True, is_global=False).count() == 0
