@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import queue
+import random
 import shutil
 import threading
 from typing import Any, Callable, Generator, MutableMapping, Optional, Tuple
@@ -56,6 +57,32 @@ def is_network_interface(intf: str):
 def _nexthop_enabled(routing):
     """True when the [nexthop] section exists and is enabled (review M4 hasattr guard)."""
     return hasattr(routing, "nexthop") and routing.nexthop.enabled
+
+
+# FORK-ONLY (tenant-egress-exits): NOT part of the upstream nexthop primitive. Keep out of the #3103 regen.
+_POOL_TOKENS = ("nexthop", "roundrobin", "random")
+
+
+def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
+    """FORK-ONLY tenant exit ACL, applied before the upstream nexthop branch resolves. Returns the
+    route to use: unchanged for legacy/unrestricted, a concrete allowed gateway id for a pool route,
+    or 'drop' (fail closed) when the requested exit is not in the tenant's live allowed set.
+    allowed_csv == None => unrestricted (MT off/shared)."""
+    if allowed_csv is None:
+        return route
+    allowed = {s for s in allowed_csv.split(",") if s}
+    if route in _POOL_TOKENS:
+        candidates = sorted(g for g in gateways if g in allowed and live_filter(g))
+        if not candidates:
+            return "drop"
+        # Tenant-scoped pool: balance across the tenant's live exits by random choice for BOTH
+        # roundrobin and random. (Strict round-robin ordering is an upstream-only nicety for the
+        # global pool; doing RR here would need fork-side cursor state + a lock. random.choice is
+        # stateless, thread-safe, and balances a small per-tenant exit set fine.)
+        return random.choice(candidates)
+    if route in gateways:      # explicit gateway id
+        return route if (route in allowed and live_filter(route)) else "drop"
+    return route               # legacy route (none/tor/vpnX/...) -- never gated
 
 
 class CuckooDeadMachine(Exception):
@@ -633,6 +660,17 @@ class AnalysisManager(threading.Thread):
 
         if self.task.route:
             self.route = self.task.route
+
+        # FORK: constrain the route to the task's tenant allowed exits (stamped at submit).
+        # No-op when allowed_exits is NULL (MT off/shared) or the route isn't a nexthop route.
+        # A returned "drop" flows into the none/drop/false dispatch below (fail closed); a concrete
+        # gateway id flows into the _nexthop_enabled branch and _resolve_nexthop binds it.
+        if _nexthop_enabled(routing):
+            from lib.cuckoo.core.rooter import gateways as _gws, _gw_live as _live
+            self.route = _tenant_scope_nexthop(
+                self.route, getattr(self.task, "allowed_exits", None), _gws,
+                lambda g: _live(_gws[g]),
+            )
 
         if self.route in ("none", "None", "drop", "false"):
             self.interface = None
