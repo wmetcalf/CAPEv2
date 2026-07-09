@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.models import User
 
-from .models import Tenant, UserProfile
+from .models import Exit, Tenant, UserProfile
 
 
 # Django 3.2
@@ -55,3 +55,11 @@ class TenantAdmin(admin.ModelAdmin):
     list_display = ("slug", "name", "active", "created_at")
     search_fields = ("slug", "name")
     list_filter = ("active",)
+    filter_horizontal = ("exits",)
+
+
+@admin.register(Exit)
+class ExitAdmin(admin.ModelAdmin):
+    list_display = ("slug", "name", "is_global", "active", "created_at")
+    search_fields = ("slug", "name")
+    list_filter = ("is_global", "active")
