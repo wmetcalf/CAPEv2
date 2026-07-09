@@ -292,6 +292,40 @@ def force_int(value):
         return value
 
 
+_POOL_TOKENS = ("nexthop", "roundrobin", "random")
+
+
+def _active_exit_slugs():
+    """Universe of egress-exit slugs (all active Exits, global + per-tenant), from the DB. In the
+    web process rooter.gateways is EMPTY (only the scheduler populates it -- the reason the
+    gateways_data block reads routing.nexthop.gateways from config, not the runtime dict), so the
+    DB Exit table is the authoritative 'is this route a gateway slug' source in the web tier."""
+    from web.users.models import Exit
+
+    return set(Exit.objects.filter(active=True).values_list("slug", flat=True))
+
+
+def validate_and_scope_route(route, allowed_slugs, known_slugs=None):
+    """Enforce the tenant exit ACL for a submitted route. `allowed_slugs` is the tenant's allowed
+    exit-slug set (from allowed_exit_slugs), or None (unrestricted: MT off/shared). `known_slugs` is
+    the universe of gateway slugs (defaults to all active Exit slugs; injectable for tests). Returns
+    the route unchanged if permitted; raises ValueError if the tenant may not use it. Only nexthop
+    routes (a gateway slug or a pool token) are gated -- legacy routes (none/internet/tor/inetsim/
+    vpnX/socks5) pass through. Defense-in-depth: the worker's route_network guard is the real
+    fail-closed boundary, so a route this layer lets slip is still dropped at routing time."""
+    if allowed_slugs is None:
+        return route
+    if route in _POOL_TOKENS:
+        if not allowed_slugs:
+            raise ValueError("tenant has no egress exits assigned")
+        return route
+    if known_slugs is None:
+        known_slugs = _active_exit_slugs()
+    if route in known_slugs and route not in allowed_slugs:
+        raise ValueError(f"exit '{route}' is not permitted for this tenant")
+    return route
+
+
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request, task_id=None, resubmit_hash=None):
     remote_console = False
