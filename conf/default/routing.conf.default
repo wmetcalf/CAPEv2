@@ -143,6 +143,13 @@ gateways = gw1
 # from the web submission UI route selector (which lists the nexthop pool + each configured [gwX])
 # or via API/CLI/broker submissions. (Advertising nexthop routes across a distributed multi-node
 # CAPE via the exitnodes API is a separate follow-up.)
+#
+# TENANT SCOPING (multitenancy locked-mode): per-tenant egress isolation is managed centrally in
+# the Django admin -- an `Exit` row per gateway (its `slug` MUST equal the [gwX] id below) plus a
+# `Tenant.exits` assignment (and `is_global` exits usable by every tenant). At submit the tenant's
+# allowed set (globals + assigned, active only) is validated and stamped onto task.allowed_exits;
+# the worker's route_network guard enforces it fail-closed (a foreign/inactive exit -> drop). This
+# is a no-op when multitenancy is off/shared -- the pool behaves exactly as documented above.
 default_policy = roundrobin
 # Drop guest egress when no live gateway (strongly recommended yes).
 fail_closed = yes
