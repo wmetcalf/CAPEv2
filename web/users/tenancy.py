@@ -150,3 +150,22 @@ def submission_scope(request):
     else:
         visibility = default_visibility(multitenancy_config())
     return v.tenant_id, visibility
+
+
+def allowed_exit_slugs(viewer):
+    """The set of egress exit slugs a viewer's tenant may use: global exits ∪ the tenant's
+    assigned exits (active only). Returns None (== UNRESTRICTED, today's behavior) when MT is
+    disabled, in shared mode, or the caller is a local admin — the SAME no-op conditions as
+    viewer_scope_match. THE single source of truth for the submit filter/validation and the
+    worker guard, so they cannot drift."""
+    from web.users.models import Exit
+
+    cfg = multitenancy_config()
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
+        return None
+    active = Exit.objects.filter(active=True)
+    slugs = set(active.filter(is_global=True).values_list("slug", flat=True))
+    tid = getattr(viewer, "tenant_id", None)
+    if tid is not None:
+        slugs |= set(active.filter(tenants__id=tid).values_list("slug", flat=True))
+    return slugs

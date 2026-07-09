@@ -1,6 +1,12 @@
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 from django.contrib.auth.models import User
 from django.test import TestCase
+
+from lib.cuckoo.common.tenancy import MTConfig
+from web.users.tenancy import allowed_exit_slugs
 
 
 @pytest.mark.django_db
@@ -344,3 +350,48 @@ class ExitModelTests(TestCase):
         d.active = False
         d.save()
         assert Exit.objects.filter(active=True, is_global=False).count() == 0
+
+
+def _viewer(tenant_id=None, is_local_admin=False):
+    return SimpleNamespace(tenant_id=tenant_id, is_local_admin=is_local_admin)
+
+
+class AllowedExitTests(TestCase):
+    def setUp(self):
+        from users.models import Tenant, Exit
+
+        self.t = Tenant.objects.create(slug="acme", name="Acme")
+        self.other = Tenant.objects.create(slug="globex", name="Globex")
+        Exit.objects.create(slug="gwGlobal", name="Shared", is_global=True)
+        self.dedic = Exit.objects.create(slug="gw1", name="Acme dedicated")
+        self.inactive = Exit.objects.create(slug="gwOld", name="Retired", active=False)
+        self.t.exits.add(self.dedic)
+        self.t.exits.add(self.inactive)
+
+    def _cfg(self, enabled=True, mode="locked"):
+        return MTConfig(enabled=enabled, mode=mode, default_visibility="", local_admins_manage_all_tenants=True)
+
+    def test_locked_tenant_gets_globals_plus_assigned(self):
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) == {"gwGlobal", "gw1"}
+
+    def test_tenant_without_assigned_gets_only_globals(self):
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.other.id)) == {"gwGlobal"}
+
+    def test_inactive_assigned_exit_excluded(self):
+        # gwOld is assigned to acme but inactive -> never offered
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert "gwOld" not in allowed_exit_slugs(_viewer(tenant_id=self.t.id))
+
+    def test_shared_mode_is_unrestricted(self):
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg(mode="shared")):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) is None
+
+    def test_mt_disabled_is_unrestricted(self):
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg(enabled=False)):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) is None
+
+    def test_local_admin_is_unrestricted(self):
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id, is_local_admin=True)) is None
