@@ -109,7 +109,7 @@ def test_gateways_picker_filtered_to_tenant(cape_db, mt_enabled, client, monkeyp
 def test_apiv2_tenant_exits_list_scoped(cape_db, mt_enabled):
     # The read endpoint lists the caller's usable exits: own assigned + global, never another tenant's.
     from rest_framework.test import APIRequestFactory, force_authenticate
-    import web.apiv2.views as av
+    import apiv2.views as av
     from users.models import Exit, Tenant
 
     acme = Tenant.objects.create(slug="acme", name="Acme")
