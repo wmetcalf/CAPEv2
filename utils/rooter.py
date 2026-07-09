@@ -711,31 +711,34 @@ def nexthop_disable(vm_ip, egress_if, rt_table, priority):
     run("conntrack", "-D", "-s", vm_ip)
 
 
-def nexthop_fail_closed_enable(vm_net, fail_table, priority_low, band_lo):
-    """Arm once at startup: any guest-subnet source with no higher-priority per-task rule
-    is blackholed (dropped), never routed by main out the control-plane NIC.
-    `route replace` is idempotent; rules are del+add'd so a restart does not stack duplicates.
+def nexthop_intra_exception_enable(vm_net, band_lo):
+    """Keep intra-vm_net traffic on the main table: `from vm_net to vm_net lookup main`.
 
-    INTRA-SUBNET EXCEPTION: vm_net includes the host's own guest-bridge IP and sibling guests, so
-    `from vm_net lookup <blackhole>` would also drop the host's own traffic to the guests -- breaking
-    the guest-agent init and the ResultServer (host<->guest, guest<->guest). Keep intra-subnet
-    traffic on main; only genuinely external guest egress falls through to the per-task nexthop rule
-    or the blackhole.
+    vm_net includes the host's own guest-bridge IP and sibling guests. A bound VM's per-task rule is
+    `from <vm_ip> lookup <gw_table>` and the gateway table holds only a default route, so without this
+    exception a bound VM's traffic to a vm_net address that is NOT the host-local bridge IP (a sibling
+    guest, or a ResultServer that is not the host itself) would be captured by the per-task rule and
+    SNAT'd out the gateway instead of staying on the guest network (codex). Host-local ResultServer
+    already resolves via the kernel priority-0 local table; this covers the non-host-local +
+    guest<->guest cases, for bound and unbound VMs alike.
 
-    This exception is installed at band_lo-1 -- i.e. JUST BELOW the per-task band (band_lo..band_hi),
-    NOT just below the blackhole. A bound VM's per-task rule is `from <vm_ip> lookup <gw_table>` at a
-    priority inside the band, and the gateway table holds only a default route; if the exception sat
-    above the band a bound VM's traffic to a vm_net address that is NOT the host-local bridge IP (a
-    sibling guest, or a ResultServer that is not the host itself) would be captured by the per-task
-    rule and SNAT'd out the gateway instead of staying on main (codex P1). Host-local ResultServer
-    already resolves via the kernel priority-0 local table; placing the exception below the band
-    covers the non-host-local + guest<->guest cases too, for bound and unbound VMs alike. External
-    egress is unaffected (the exception only matches `to vm_net`) and fail-closed still holds (an
-    unbound external flow matches no band rule and hits the blackhole)."""
-    run(settings.ip, "route", "replace", "blackhole", "default", "table", fail_table)
+    Installed at band_lo-1 -- JUST BELOW the per-task band (band_lo..band_hi) -- so it wins over a
+    bound VM's in-band per-task rule. It only matches `to vm_net`, so external egress is unaffected.
+    This is a CONNECTIVITY guarantee, installed whenever nexthop is enabled and independent of
+    fail_closed (which only governs the blackhole). Idempotent (del+add, no stacked duplicates)."""
     intra_prio = str(int(band_lo) - 1)
     run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
     run(settings.ip, "rule", "add", "from", vm_net, "to", vm_net, "lookup", "main", "priority", intra_prio)
+
+
+def nexthop_fail_closed_enable(vm_net, fail_table, priority_low):
+    """Arm once at startup (only when fail_closed=yes): any guest-subnet source with no
+    higher-priority per-task rule is blackholed (dropped), never routed by main out the control-plane
+    NIC. `route replace` is idempotent; the rule is del+add'd so a restart does not stack duplicates.
+    The intra-subnet exception is installed separately by nexthop_intra_exception_enable (always),
+    since keeping host<->guest / guest<->guest traffic on main is a connectivity concern, not a
+    fail-closed one -- an unbound external flow still matches no per-task rule and hits this blackhole."""
+    run(settings.ip, "route", "replace", "blackhole", "default", "table", fail_table)
     run(settings.ip, "rule", "del", "from", vm_net, "lookup", fail_table, "priority", priority_low)
     run(settings.ip, "rule", "add", "from", vm_net, "lookup", fail_table, "priority", priority_low)
 
@@ -754,11 +757,33 @@ def nexthop_teardown(gateway_tables, vm_net, fail_table, priority_low, band_lo, 
     # intra-subnet exception is armed at band_lo-1 (just below the per-task band); mirror-delete it
     run(settings.ip, "rule", "del", "from", vm_net, "to", vm_net, "lookup", "main", "priority", str(int(band_lo) - 1))
     lo, hi = int(band_lo), int(band_hi)
+    try:
+        vm_network = ipaddress.ip_network(vm_net, strict=False)
+    except ValueError:
+        vm_network = None
     stdout, _ = run(settings.ip, "rule", "show")
     for line in stdout.splitlines():
         head = line.split(":", 1)[0].strip()
-        if head.isdigit() and lo <= int(head) <= hi:
-            run(settings.ip, "rule", "del", "priority", head)
+        if not (head.isdigit() and lo <= int(head) <= hi):
+            continue
+        # Only sweep OUR per-task rules -- `from <vm_ip> ...` with vm_ip inside vm_net. Every nexthop
+        # per-task rule matches `from <vm_ip>`, so anything in the 10000-10255 band whose source is
+        # NOT in vm_net is an unrelated host admin rule; leave it alone (codex). Fail-safe: if vm_net
+        # is unparseable or the source can't be confirmed inside it, skip rather than delete.
+        toks = line.split()
+        if vm_network is None or "from" not in toks:
+            continue
+        try:
+            src = toks[toks.index("from") + 1]
+            if ipaddress.ip_address(src.split("/")[0]) not in vm_network:
+                continue
+        except (ValueError, IndexError):
+            continue
+        # Delete by the FULL selector (from <src> + priority), not by priority alone: iproute2 allows
+        # multiple rules at one priority, so `ip rule del priority N` could remove a host admin rule
+        # that happens to share this priority instead of ours. Matching on our confirmed vm_net source
+        # too targets exactly our per-task rule (codex).
+        run(settings.ip, "rule", "del", "from", src, "priority", head)
 
 
 def nexthop_configure(tables_csv, vm_net, fail_table, prio_low, band_lo, band_hi):
@@ -1248,6 +1273,7 @@ handlers = {
     "nexthop_init": nexthop_init,
     "nexthop_enable": nexthop_enable,
     "nexthop_disable": nexthop_disable,
+    "nexthop_intra_exception_enable": nexthop_intra_exception_enable,
     "nexthop_fail_closed_enable": nexthop_fail_closed_enable,
     "nexthop_teardown": nexthop_teardown,
     "nexthop_configure": nexthop_configure,

@@ -360,6 +360,27 @@ def test_gwx_duplicate_rt_table_raises(monkeypatch):
         startup.load_nexthop_profiles(_GwDupTable())
 
 
+def test_nexthop_intra_exception_installed_even_when_fail_closed_off(monkeypatch):
+    # codex P2: the intra-subnet exception is a CONNECTIVITY guarantee, separate from the blackhole.
+    # With [nexthop] fail_closed=no it MUST still be installed (else a bound VM's intra-vm_net traffic
+    # misroutes to the gateway), while the blackhole (nexthop_fail_closed_enable) must NOT be.
+    import lib.cuckoo.core.startup as startup
+    recorded = []
+
+    class _NexthopNoFailClosed(_FakeRouting):
+        def __init__(self):
+            super().__init__()
+            self.nexthop = _DictSection(enabled=True, gateways="gw1", default_policy="roundrobin",
+                                        fail_closed=False, vm_net="192.168.100.0/24")
+
+    startup.gateways.clear()
+    monkeypatch.setattr(startup, "vpns", {}, raising=False)
+    monkeypatch.setattr(startup, "rooter", lambda cmd, *a, **k: recorded.append(cmd) or {}, raising=False)
+    startup.load_nexthop_profiles(_NexthopNoFailClosed())
+    assert "nexthop_intra_exception_enable" in recorded
+    assert "nexthop_fail_closed_enable" not in recorded
+
+
 def test_gwx_rt_table_collides_with_vpn_raises(monkeypatch):
     # adversarial-review HIGH: a [gwX] rt_table equal to a configured VPN's rt_table would clobber the
     # VPN's just-built routing table (nexthop_init flush/replace) -> VPN tasks silently egress the

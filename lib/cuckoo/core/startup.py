@@ -197,11 +197,16 @@ def load_nexthop_profiles(routing_cfg):
            NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
     rooter("nexthop_teardown", tables_csv, vm_net, NEXTHOP_FAIL_TABLE,
            NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO, NEXTHOP_BAND_HI)
-    # Pass 2: build fresh profile tables, then arm fail-closed.
+    # Pass 2: build fresh profile tables, then arm the intra-subnet exception + (optionally) fail-closed.
     for entry in profiles:
         rooter("nexthop_init", str(entry.rt_table), str(entry.interface), str(entry.next_hop))
+    # The intra-subnet exception (keep guest<->host + guest<->guest vm_net traffic on main) is a
+    # CONNECTIVITY guarantee, independent of the blackhole -- install it whenever nexthop is enabled.
+    # Otherwise, with fail_closed=no, a bound VM's per-task rule would send its intra-vm_net traffic
+    # (siblings / non-host-local services) out the gateway instead of the guest network (codex P2).
+    rooter("nexthop_intra_exception_enable", vm_net, NEXTHOP_BAND_LO)
     if routing_cfg.nexthop.fail_closed:
-        rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW, NEXTHOP_BAND_LO)
+        rooter("nexthop_fail_closed_enable", vm_net, NEXTHOP_FAIL_TABLE, NEXTHOP_PRIORITY_LOW)
 
 
 def validate_default_route(routing_cfg):

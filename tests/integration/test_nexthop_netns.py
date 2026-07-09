@@ -271,7 +271,10 @@ def test_unbound_source_is_blackholed(netns):
     PRIORITY_LOW = "30000"
     BAND_LO = "10000"
 
-    rooter.nexthop_fail_closed_enable(VM_NET, FAIL_TABLE, PRIORITY_LOW, BAND_LO)
+    # intra-subnet exception is now a separate primitive (always installed); the blackhole is
+    # fail_closed_enable (3 args). Install both, as load_nexthop_profiles does when fail_closed=yes.
+    rooter.nexthop_intra_exception_enable(VM_NET, BAND_LO)
+    rooter.nexthop_fail_closed_enable(VM_NET, FAIL_TABLE, PRIORITY_LOW)
 
     # (a) Blackhole default is in table 250
     assert ip_route_table_has_blackhole(FAIL_TABLE), (
