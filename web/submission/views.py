@@ -16,7 +16,7 @@ from contextlib import suppress
 from django.conf import settings
 
 from web.tenancy_optional import (
-    submission_scope, can_view_task, can_view_sample, viewer_for,
+    submission_scope, can_view_task, can_view_sample, viewer_for, allowed_exit_slugs,
     multitenancy_config, default_visibility, PUBLIC, TENANT, PRIVATE,
 )
 from django.contrib.auth.decorators import login_required
@@ -295,24 +295,33 @@ def force_int(value):
 _POOL_TOKENS = ("nexthop", "roundrobin", "random")
 
 
-def _active_exit_slugs():
-    """Universe of egress-exit slugs (all active Exits, global + per-tenant), from the DB. In the
-    web process rooter.gateways is EMPTY (only the scheduler populates it -- the reason the
-    gateways_data block reads routing.nexthop.gateways from config, not the runtime dict), so the
-    DB Exit table is the authoritative 'is this route a gateway slug' source in the web tier."""
+def _known_gateway_slugs():
+    """The submit-tier gateway universe used to decide 'is this route a gateway (gate it) vs a
+    legacy route (pass it through)'. UNION of (a) the configured [nexthop] gateways= ids -- the SAME
+    set the worker's rooter loads (rooter.gateways is empty in the web process, so we read the
+    routing config, mirroring the gateways_data picker) -- and (b) every Exit slug in the DB
+    (active OR inactive). Gating on the union closes the fail-open gaps where a live [gwX] lacks an
+    active Exit row, or an Exit was deactivated but the [gwX] is still configured+live on workers."""
+    slugs = set()
+    try:
+        raw = str(getattr(routing.nexthop, "gateways", "") or "")
+        slugs |= {s.strip() for s in raw.split(",") if s.strip()}
+    except Exception:
+        pass
     from users.models import Exit
 
-    return set(Exit.objects.filter(active=True).values_list("slug", flat=True))
+    slugs |= set(Exit.objects.values_list("slug", flat=True))
+    return slugs
 
 
 def validate_and_scope_route(route, allowed_slugs, known_slugs=None):
     """Enforce the tenant exit ACL for a submitted route. `allowed_slugs` is the tenant's allowed
     exit-slug set (from allowed_exit_slugs), or None (unrestricted: MT off/shared). `known_slugs` is
-    the universe of gateway slugs (defaults to all active Exit slugs; injectable for tests). Returns
-    the route unchanged if permitted; raises ValueError if the tenant may not use it. Only nexthop
+    the gateway universe (defaults to _known_gateway_slugs(); injectable for tests). Returns the
+    route unchanged if permitted; raises ValueError if the tenant may not use it. Only nexthop
     routes (a gateway slug or a pool token) are gated -- legacy routes (none/internet/tor/inetsim/
-    vpnX/socks5) pass through. Defense-in-depth: the worker's route_network guard is the real
-    fail-closed boundary, so a route this layer lets slip is still dropped at routing time."""
+    vpnX/socks5) pass through. The worker's route_network guard is the authoritative fail-closed
+    boundary; this layer rejects early so the user gets a clear error instead of a silent drop."""
     if allowed_slugs is None:
         return route
     if route in _POOL_TOKENS:
@@ -320,7 +329,7 @@ def validate_and_scope_route(route, allowed_slugs, known_slugs=None):
             raise ValueError("tenant has no egress exits assigned")
         return route
     if known_slugs is None:
-        known_slugs = _active_exit_slugs()
+        known_slugs = _known_gateway_slugs()
     if route in known_slugs and route not in allowed_slugs:
         raise ValueError(f"exit '{route}' is not permitted for this tenant")
     return route
@@ -354,6 +363,17 @@ def index(request, task_id=None, resubmit_hash=None):
             route,
             cape,
         ) = parse_request_arguments(request)
+
+        # Tenant egress ACL: reject a route naming an exit this tenant may not use, and compute the
+        # allowed-exit set to stamp onto every task created below. _allowed_exits is None when
+        # unrestricted (MT off/shared/local-admin); "" (empty CSV) means the tenant has zero exits
+        # (fail-closed at the worker). Validated BEFORE the dlnexec pre-fetch, which egresses.
+        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        try:
+            route = validate_and_scope_route(route, _allowed_exits)
+        except ValueError as exc:
+            return render(request, "error.html", {"error": str(exc)})
+        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
 
         # This is done to remove spaces in options but not breaks custom paths
         options = ",".join(
@@ -455,6 +475,7 @@ def index(request, task_id=None, resubmit_hash=None):
             "user_id": request.user.id or 0,
             "tenant_id": _tenant_id,
             "visibility": _visibility,
+            "allowed_exits": _allowed_exits_csv,
             "package": package,
         }
         if opt_apikey:
@@ -635,7 +656,7 @@ def index(request, task_id=None, resubmit_hash=None):
 
         elif task_category == "static":
             for content, path, sha256 in list_of_tasks:
-                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
+                task_id = db.add_static(file_path=path, priority=priority, tlp=tlp, options=options, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility, allowed_exits=_allowed_exits_csv)
                 if not task_id:
                     return render(request, "error.html", {"error": "We don't have static extractor for this"})
                 details["task_ids"] += task_id
@@ -653,7 +674,7 @@ def index(request, task_id=None, resubmit_hash=None):
                         continue
 
                 task_id = db.add_pcap(file_path=path, priority=priority, tlp=tlp, user_id=request.user.id or 0,
-                                      tenant_id=_tenant_id, visibility=_visibility)
+                                      tenant_id=_tenant_id, visibility=_visibility, allowed_exits=_allowed_exits_csv)
                 if task_id:
                     details["task_ids"].append(task_id)
 
@@ -693,6 +714,7 @@ def index(request, task_id=None, resubmit_hash=None):
                         user_id=request.user.id or 0,
                         tenant_id=_tenant_id,
                         visibility=_visibility,
+                        allowed_exits=_allowed_exits_csv,
                     )
                     details["task_ids"].append(task_id)
 
@@ -830,13 +852,21 @@ def index(request, task_id=None, resubmit_hash=None):
         try:
             if getattr(routing.nexthop, "enabled", False):
                 nexthop_enabled = True
+                # Filter the picker to the tenant's allowed exits (global + assigned). None =>
+                # unrestricted (MT off/shared/local-admin) => show all, today's behavior.
+                _gw_allowed = allowed_exit_slugs(viewer_for(request.user))
                 for gw_name in str(getattr(routing.nexthop, "gateways", "") or "").split(","):
                     gw_name = gw_name.strip()
                     if not gw_name:
                         continue
+                    if _gw_allowed is not None and gw_name not in _gw_allowed:
+                        continue  # don't advertise an exit this tenant may not use
                     gw = routing.get(gw_name) if hasattr(routing, gw_name) else None
                     desc = getattr(gw, "description", None) if gw is not None else None
                     gateways_data.append({"name": gw_name, "description": desc or gw_name})
+                # A locked tenant with zero permitted exits cannot use the pool sentinel either.
+                if _gw_allowed is not None and not gateways_data:
+                    nexthop_enabled = False
         except Exception:
             nexthop_enabled, gateways_data = False, []
 

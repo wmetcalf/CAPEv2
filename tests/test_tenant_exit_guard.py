@@ -29,3 +29,15 @@ def test_unrestricted_passthrough():
 
 def test_legacy_route_untouched():
     assert _scope("tor", "gw1", {"gw1"}, {"gw1"}) == "tor"      # not a gateway/pool token
+
+
+def test_empty_csv_denies_all():
+    # "" (empty CSV) == zero allowed exits => fail-closed DENY-ALL, distinct from None (unrestricted).
+    # Guards against a future `if not allowed_csv: return route` regression flipping it to fail-open.
+    assert _scope("gw1", "", {"gw1", "gwG"}, {"gw1", "gwG"}) == "drop"       # explicit gateway dropped
+    assert _scope("nexthop", "", {"gw1", "gwG"}, {"gw1", "gwG"}) == "drop"   # pool token dropped
+
+
+def test_whitespace_in_csv_tolerated():
+    # a "gw1, gwG" style join (spaces after commas) must still match clean gateway ids
+    assert _scope("gwG", "gw1, gwG", {"gw1", "gwG"}, {"gw1", "gwG"}) == "gwG"

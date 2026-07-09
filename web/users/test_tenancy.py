@@ -369,6 +369,7 @@ class AllowedExitTests(TestCase):
         Exit.objects.create(slug="gwGlobal", name="Shared", is_global=True)
         self.dedic = Exit.objects.create(slug="gw1", name="Acme dedicated")
         self.inactive = Exit.objects.create(slug="gwOld", name="Retired", active=False)
+        Exit.objects.create(slug="gwGlobalOld", name="Retired global", is_global=True, active=False)
         self.t.exits.add(self.dedic)
         self.t.exits.add(self.inactive)
 
@@ -392,6 +393,11 @@ class AllowedExitTests(TestCase):
         # gwOld is assigned to acme but inactive -> never offered
         with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
             assert "gwOld" not in allowed_exit_slugs(_viewer(tenant_id=self.t.id))
+
+    def test_inactive_global_exit_excluded(self):
+        # gwGlobalOld is a global exit but inactive -> excluded (active guard on the global branch)
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert "gwGlobalOld" not in allowed_exit_slugs(_viewer(tenant_id=self.t.id))
 
     def test_shared_mode_is_unrestricted(self):
         with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg(mode="shared")):

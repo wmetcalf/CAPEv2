@@ -35,3 +35,20 @@ def test_non_nexthop_routes_untouched():
     # a legacy route (vpn/tor/none) is never gated by exit ACLs even when restricted
     assert validate_and_scope_route("tor", {"gw1"}, known_slugs=_KNOWN) == "tor"
     assert validate_and_scope_route("none", {"gw1"}, known_slugs=_KNOWN) == "none"
+
+
+@pytest.mark.django_db
+def test_default_known_slugs_from_db():
+    # Exercise the DEFAULT known_slugs path (_known_gateway_slugs -> Exit table union), the one that
+    # actually runs in production when index() calls the validator without an explicit universe.
+    from users.models import Exit
+
+    Exit.objects.create(slug="gw1", active=True)
+    Exit.objects.create(slug="gw2", active=True)
+    Exit.objects.create(slug="gwOld", active=False)
+    with pytest.raises(ValueError):
+        validate_and_scope_route("gw2", {"gw1"})        # foreign active exit rejected via the DB universe
+    with pytest.raises(ValueError):
+        validate_and_scope_route("gwOld", {"gw1"})      # deactivated exit is STILL gated (fail-closed)
+    assert validate_and_scope_route("gw1", {"gw1"}) == "gw1"
+    assert validate_and_scope_route("nonexit-legacy-route", {"gw1"}) == "nonexit-legacy-route"

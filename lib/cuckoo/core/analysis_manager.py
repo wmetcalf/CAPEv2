@@ -70,7 +70,7 @@ def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
     allowed_csv == None => unrestricted (MT off/shared)."""
     if allowed_csv is None:
         return route
-    allowed = {s for s in allowed_csv.split(",") if s}
+    allowed = {s.strip() for s in allowed_csv.split(",") if s.strip()}
     if route in _POOL_TOKENS:
         candidates = sorted(g for g in gateways if g in allowed and live_filter(g))
         if not candidates:

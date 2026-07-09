@@ -30,7 +30,7 @@ try:
 except ImportError:
     ApiKeyAuthentication = None
 
-from web.tenancy_optional import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, VISIBILITIES
+from web.tenancy_optional import submission_scope, can_view_task, can_toggle_task, can_manage_task, can_view_sample, viewer_for, allowed_exit_slugs, VISIBILITIES
 
 
 def _deny_if_hidden(request, task):
@@ -446,6 +446,16 @@ def tasks_create_file(request):
             cape,
         ) = parse_request_arguments(request, keyword="data")
 
+        # Tenant egress ACL (API parity with the web submit path): reject a foreign exit and
+        # stamp the tenant's allowed set onto every task created below.
+        from submission.views import validate_and_scope_route
+        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        try:
+            route = validate_and_scope_route(route, _allowed_exits)
+        except ValueError as exc:
+            return Response({"error": True, "error_value": str(exc)})
+        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+
         details = {
             "errors": [],
             "request": request,
@@ -460,6 +470,7 @@ def tasks_create_file(request):
             "user_id": request.user.id or 0,
             "tenant_id": _tenant_id,
             "visibility": _visibility,
+            "allowed_exits": _allowed_exits_csv,
         }
 
         task_machines = []
@@ -506,11 +517,11 @@ def tasks_create_file(request):
                     else:
                         details["error"].append({os.path.basename(tmp_path): "Failed to convert SAZ to PCAP"})
                         continue
-                task_id = db.add_pcap(file_path=tmp_path, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
+                task_id = db.add_pcap(file_path=tmp_path, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility, allowed_exits=_allowed_exits_csv)
                 details["task_ids"].append(task_id)
                 continue
             if static:
-                task_id = db.add_static(file_path=tmp_path, priority=priority, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility)
+                task_id = db.add_static(file_path=tmp_path, priority=priority, user_id=request.user.id or 0, tenant_id=_tenant_id, visibility=_visibility, allowed_exits=_allowed_exits_csv)
                 details["task_ids"].append(task_id)
                 continue
             if tmp_path:
@@ -589,6 +600,15 @@ def tasks_create_url(request):
             cape,
         ) = parse_request_arguments(request, keyword="data")
 
+        # Tenant egress ACL (API parity with the web submit path).
+        from submission.views import validate_and_scope_route
+        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        try:
+            route = validate_and_scope_route(route, _allowed_exits)
+        except ValueError as exc:
+            return Response({"error": True, "error_value": str(exc)})
+        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+
         task_ids = []
         task_machines = []
         vm_list = [vm.label for vm in db.list_machines()]
@@ -641,6 +661,7 @@ def tasks_create_url(request):
                 user_id=request.user.id or 0,
                 tenant_id=_tenant_id,
                 visibility=_visibility,
+                allowed_exits=_allowed_exits_csv,
             )
             if task_id:
                 task_ids.append(task_id)
@@ -699,6 +720,15 @@ def tasks_create_dlnexec(request):
             cape,
         ) = parse_request_arguments(request, keyword="data")
 
+        # Tenant egress ACL: validate BEFORE process_new_dlnexec_task, which fetches via the route.
+        from submission.views import validate_and_scope_route
+        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        try:
+            route = validate_and_scope_route(route, _allowed_exits)
+        except ValueError as exc:
+            return Response({"error": True, "error_value": str(exc)})
+        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+
         details = {}
         task_machines = []
         vm_list = [vm.label for vm in db.list_machines()]
@@ -741,6 +771,7 @@ def tasks_create_dlnexec(request):
             "user_id": request.user.id or 0,
             "tenant_id": _tenant_id,
             "visibility": _visibility,
+            "allowed_exits": _allowed_exits_csv,
         }
 
         status, tasks_details = download_file(**details)

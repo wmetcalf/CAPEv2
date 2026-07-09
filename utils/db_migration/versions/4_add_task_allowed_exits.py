@@ -22,7 +22,7 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("tasks", sa.Column("allowed_exits", sa.String(length=512), nullable=True))
+    op.add_column("tasks", sa.Column("allowed_exits", sa.Text(), nullable=True))
 
 
 def downgrade():
