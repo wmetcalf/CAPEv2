@@ -379,6 +379,11 @@ class AllowedExitTests(TestCase):
         with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
             assert allowed_exit_slugs(_viewer(tenant_id=self.other.id)) == {"gwGlobal"}
 
+    def test_locked_tenantless_gets_globals_only(self):
+        # tenant_id=None exercises the `tid is not None` guard: globals only, no M2M lookup
+        with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=None)) == {"gwGlobal"}
+
     def test_inactive_assigned_exit_excluded(self):
         # gwOld is assigned to acme but inactive -> never offered
         with mock.patch("web.users.tenancy.multitenancy_config", return_value=self._cfg()):
