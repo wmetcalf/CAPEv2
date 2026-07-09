@@ -300,7 +300,7 @@ def _active_exit_slugs():
     web process rooter.gateways is EMPTY (only the scheduler populates it -- the reason the
     gateways_data block reads routing.nexthop.gateways from config, not the runtime dict), so the
     DB Exit table is the authoritative 'is this route a gateway slug' source in the web tier."""
-    from web.users.models import Exit
+    from users.models import Exit
 
     return set(Exit.objects.filter(active=True).values_list("slug", flat=True))
 

@@ -1,6 +1,6 @@
 import pytest
 
-from web.submission.views import validate_and_scope_route
+from submission.views import validate_and_scope_route
 
 # The gateway-slug universe. Passed explicitly so these stay hermetic unit tests (no DB): in the
 # real web process it defaults to the active Exit slugs (rooter.gateways is empty in the web tier).

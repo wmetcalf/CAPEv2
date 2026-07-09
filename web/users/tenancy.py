@@ -158,7 +158,7 @@ def allowed_exit_slugs(viewer):
     disabled, in shared mode, or the caller is a local admin — the SAME no-op conditions as
     viewer_scope_match. THE single source of truth for the submit filter/validation and the
     worker guard, so they cannot drift."""
-    from web.users.models import Exit
+    from users.models import Exit
 
     cfg = multitenancy_config()
     if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
