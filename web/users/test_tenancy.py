@@ -253,7 +253,9 @@ def test_can_ban_user_tenant_admin_delegation(mt_enabled):
     globex = Tenant.objects.create(slug="globex", name="Globex")
 
     superu = User.objects.create_superuser("root", "root@x.com", "x")
-    staff = User.objects.create_user("staff", "staff@x.com", "x"); staff.is_staff = True; staff.save()
+    staff = User.objects.create_user("staff", "staff@x.com", "x")
+    staff.is_staff = True
+    staff.save()
     staff = User.objects.get(pk=staff.pk)
     admin_acme = _mk_member("aadm", acme, admin=True)
     member_acme = _mk_member("amem", acme, admin=False)
@@ -286,7 +288,9 @@ def test_can_ban_user_disabled_is_staff_only(monkeypatch):
     import users.tenancy as ut
 
     monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
-    staff = User.objects.create_user("s2", "s2@x.com", "x"); staff.is_staff = True; staff.save()
+    staff = User.objects.create_user("s2", "s2@x.com", "x")
+    staff.is_staff = True
+    staff.save()
     member = User.objects.create_user("m2", "m2@x.com", "x")
     target = User.objects.create_user("t2", "t2@x.com", "x")
     assert ut.can_ban_user(User.objects.get(pk=staff.pk), target.id) is True
