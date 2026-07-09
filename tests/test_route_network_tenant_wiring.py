@@ -28,7 +28,7 @@ def _routing():
         (),
         {
             "nexthop": type("NH", (), {"enabled": True, "default_policy": "roundrobin"})(),
-            "routing": type("RT", (), {"route": "none"})(),
+            "routing": type("RT", (), {"route": "none", "verify_interface": False})(),
         },
     )()
 
