@@ -213,9 +213,9 @@ def test_unroute_mirrors_persisted_tuple(mgr, monkeypatch):
     mgr._calls.clear()
     mgr._unroute_nexthop()  # extracted helper called from unroute_network
     disable_args = next(a for c, a in mgr._calls if c == "nexthop_disable")
-    # disable deletes EXACTLY what enable created (vm_ip, interface, rt_table, priority).
-    # The selector is NOT re-run: the persisted self.nexthop_* tuple is used (review M5).
-    assert disable_args == ("192.168.100.42", "ens6", "201", "10042")
+    # disable deletes EXACTLY what enable created (vm_ip, ingress bridge, egress iface, rt_table,
+    # priority). The selector is NOT re-run: the persisted self.nexthop_* tuple + machine is used (M5).
+    assert disable_args == ("192.168.100.42", "virbr0", "ens6", "201", "10042")
     assert disable_args == enable_args
 
 

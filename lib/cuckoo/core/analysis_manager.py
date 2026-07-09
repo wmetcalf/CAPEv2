@@ -603,6 +603,7 @@ class AnalysisManager(threading.Thread):
         self.rooter_response = rooter(
             "nexthop_enable",
             str(self.machine.ip),
+            str(self.machine.interface),   # guest ingress bridge -- constrains forwarding (anti-spoof)
             self.nexthop_interface,
             self.nexthop_rt_table,
             self.nexthop_priority,
@@ -617,6 +618,7 @@ class AnalysisManager(threading.Thread):
         self.rooter_response = rooter(
             "nexthop_disable",
             str(self.machine.ip),
+            str(self.machine.interface),   # mirror the ingress bridge enable used (persisted machine)
             self.nexthop_interface,
             self.nexthop_rt_table,
             self.nexthop_priority,

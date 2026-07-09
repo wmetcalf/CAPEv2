@@ -687,27 +687,44 @@ def nexthop_init(rt_table, egress_if, next_hop):
         run(settings.ip, "route", "replace", "default", "via", next_hop, "dev", egress_if, "table", rt_table)
 
 
-def nexthop_enable(vm_ip, egress_if, rt_table, priority):
-    """Per task: source-route the VM into its profile table and SNAT onto egress_if.
-    run() never raises, so the pre-clean deletes are safe idempotent no-ops when absent."""
+def _iptables_delete_all(*args):
+    """Best-effort delete an iptables rule until it is no longer present, so a retried bind can't
+    leave stacked duplicates (a single -D would remove only one copy). run_iptables never raises;
+    a non-empty stderr from `-D` means the rule is gone. Bounded so a persistent error can't spin."""
+    for _ in range(32):
+        _, err = run_iptables(*args)
+        if err:
+            break
+
+
+def nexthop_enable(vm_ip, ingress_if, egress_if, rt_table, priority):
+    """Per task: source-route the VM into its profile table and SNAT onto egress_if. Idempotent --
+    a retried bind (or route_network called twice) must NOT stack rules, so the ip rule and both
+    iptables rules are delete-then-add'd; the iptables deletes loop until gone."""
     run("conntrack", "-D", "-s", vm_ip)  # drop stale flows so a recycled IP starts clean (best-effort)
     run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)  # idempotent
     run(settings.ip, "rule", "add", "from", vm_ip, "lookup", rt_table, "priority", priority)
+    # SNAT the VM out its gateway. Delete-until-gone first so a retry can't stack duplicate NAT rules
+    # that nexthop_disable's delete would then leave behind (Copilot).
+    _iptables_delete_all("-t", "nat", "-D", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
     run_iptables("-t", "nat", "-A", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
-    # Accept the VM's forwarded egress via CAPE_ACCEPTED_SEGMENTS -- the chain FORWARD jumps to
-    # FIRST (cleanup_rooter) -- so it precedes any libvirt default `-i virbr* -j REJECT` still
-    # sitting in the raw FORWARD chain. A tail `-A FORWARD ... ACCEPT` would be shadowed by that
-    # reject on libvirt-backed guests (codex P1); the generic forward_enable uses this same chain.
-    # ACCEPT terminates traversal, so return traffic is covered by the ESTABLISHED,RELATED accept
-    # state_enable installs in the same chain -- no reverse rule needed here.
-    run_iptables("-I", "CAPE_ACCEPTED_SEGMENTS", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    # Accept the VM's forwarded egress via CAPE_ACCEPTED_SEGMENTS -- the chain FORWARD jumps to FIRST
+    # (cleanup_rooter) -- so it precedes any libvirt default `-i virbr* -j REJECT` still in the raw
+    # FORWARD chain (a tail `-A FORWARD ... ACCEPT` would be shadowed on libvirt guests). Constrain -i
+    # to the guest ingress interface so a spoofed source from another host NIC can't be forwarded and
+    # MASQUERADEd through the gateway -- parity with the legacy forward_enable path (codex). ACCEPT
+    # terminates traversal, so return traffic is covered by the ESTABLISHED,RELATED accept in the same
+    # chain. Delete-until-gone before insert (idempotent, Copilot).
+    _iptables_delete_all("-D", "CAPE_ACCEPTED_SEGMENTS", "-i", ingress_if, "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    run_iptables("-I", "CAPE_ACCEPTED_SEGMENTS", "-i", ingress_if, "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
 
 
-def nexthop_disable(vm_ip, egress_if, rt_table, priority):
-    """Mirror-delete the per-task state from nexthop_enable, then flush conntrack."""
+def nexthop_disable(vm_ip, ingress_if, egress_if, rt_table, priority):
+    """Mirror-delete the per-task state from nexthop_enable, then flush conntrack. The iptables
+    deletes loop until gone so any duplicate left by a retried bind is fully removed (no stale egress)."""
     run(settings.ip, "rule", "del", "from", vm_ip, "lookup", rt_table, "priority", priority)
-    run_iptables("-t", "nat", "-D", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
-    run_iptables("-D", "CAPE_ACCEPTED_SEGMENTS", "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
+    _iptables_delete_all("-t", "nat", "-D", "POSTROUTING", "-s", vm_ip, "-o", egress_if, "-j", "MASQUERADE")
+    _iptables_delete_all("-D", "CAPE_ACCEPTED_SEGMENTS", "-i", ingress_if, "-s", vm_ip, "-o", egress_if, "-j", "ACCEPT")
     run("conntrack", "-D", "-s", vm_ip)
 
 

@@ -109,34 +109,37 @@ def netns():
         ip = _IP
     rooter.settings = _Settings
     rooter.ServicePaths.ip = _IP
-    # iptables not exercised in these tests (no packets traverse), but set it so
-    # the run_iptables calls inside nexthop_enable don't crash on missing attribute.
+    # These tests verify policy ROUTING (ip rule/route), not iptables filtering, and no packets
+    # traverse. STUB run_iptables so nexthop_enable's MASQUERADE/ACCEPT rules never touch the real
+    # host firewall -- otherwise the root-gated suite would leave CAPE-rooter NAT rules behind
+    # (codex/Copilot). Saved + restored around the test.
     rooter.ServicePaths.iptables = "/usr/sbin/iptables"
+    _orig_run_iptables = rooter.run_iptables
+    # Return non-empty stderr for `-D` so the idempotent delete-until-gone loop terminates after one
+    # call instead of spinning to its bound; empty stderr (success) for everything else.
+    rooter.run_iptables = lambda *a, **k: (("", "gone") if "-D" in a else ("", ""))
 
+    NEXTHOP_VM_NET = "192.168.100.0/24"   # every test source IP lives here
     created_ns = []
     created_links = []
     created_tables = []     # table ids with content to flush
 
     def _cleanup():
         # Best-effort teardown; each step is independent.
-        # flush source rules in the per-task band (10000-10255) and fail-closed
-        out = subprocess.run([_IP, "rule", "show"], capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            head = line.split(":", 1)[0].strip()
-            if head.isdigit() and (10000 <= int(head) <= 10255 or int(head) == 30000):
-                subprocess.run([_IP, "rule", "del", "priority", head], capture_output=True)
-        # flush tables
-        for tbl in created_tables:
-            subprocess.run([_IP, "route", "flush", "table", tbl], capture_output=True)
-        # del blackhole default from table 250
-        subprocess.run([_IP, "route", "del", "blackhole", "default", "table", "250"],
-                       capture_output=True)
+        # Use the PRODUCTION filtered teardown for ip rules/routes/tables: it deletes only band rules
+        # whose source is inside vm_net (never an unrelated host rule at a band priority), flushes the
+        # gateway tables, and removes the blackhole + intra-subnet exception (codex/Copilot).
+        try:
+            rooter.nexthop_teardown(",".join(created_tables), NEXTHOP_VM_NET, "250", "30000", "10000", "10255")
+        except Exception:
+            pass
         # bring down/del veth links (deleting one side removes the peer too)
         for link in created_links:
             subprocess.run([_IP, "link", "del", link], capture_output=True)
         # delete namespaces
         for ns in created_ns:
             subprocess.run([_IP, "netns", "del", ns], capture_output=True)
+        rooter.run_iptables = _orig_run_iptables
 
     try:
         for k in (1, 2):
@@ -182,8 +185,8 @@ def test_two_profiles_route_to_distinct_interfaces(netns):
     rooter.nexthop_init("202", "egress_if2", "10.2.0.2")
 
     # Bind the two VM IPs
-    rooter.nexthop_enable(VM_IP1, "egress_if1", "201", PRIO1)
-    rooter.nexthop_enable(VM_IP2, "egress_if2", "202", PRIO2)
+    rooter.nexthop_enable(VM_IP1, "lo", "egress_if1", "201", PRIO1)
+    rooter.nexthop_enable(VM_IP2, "lo", "egress_if2", "202", PRIO2)
 
     # (a) Tables have forced defaults via the correct interface
     assert ip_route_table_has_default_via_if("201", "egress_if1"), (
@@ -228,13 +231,13 @@ def test_concurrent_profile_setup_is_consistent(netns):
 
     def bind1():
         try:
-            rooter.nexthop_enable(VM_IP1, "egress_if1", "201", PRIO1)
+            rooter.nexthop_enable(VM_IP1, "lo", "egress_if1", "201", PRIO1)
         except Exception as e:
             errors.append(e)
 
     def bind2():
         try:
-            rooter.nexthop_enable(VM_IP2, "egress_if2", "202", PRIO2)
+            rooter.nexthop_enable(VM_IP2, "lo", "egress_if2", "202", PRIO2)
         except Exception as e:
             errors.append(e)
 
@@ -299,11 +302,11 @@ def test_enable_then_disable_removes_rules(netns):
     PRIO = "10061"
 
     rooter.nexthop_init("201", "egress_if1", "10.1.0.2")
-    rooter.nexthop_enable(VM_IP, "egress_if1", "201", PRIO)
+    rooter.nexthop_enable(VM_IP, "lo", "egress_if1", "201", PRIO)
 
     assert ip_rule_exists(VM_IP, "201", PRIO), "Rule must exist after enable"
 
-    rooter.nexthop_disable(VM_IP, "egress_if1", "201", PRIO)
+    rooter.nexthop_disable(VM_IP, "lo", "egress_if1", "201", PRIO)
 
     assert not ip_rule_exists(VM_IP, "201", PRIO), (
         "Rule must be removed after disable (mirror teardown)"

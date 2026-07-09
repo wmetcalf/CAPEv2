@@ -18,6 +18,10 @@ def rec(monkeypatch):
 
     def fake_run_iptables(*args, **kwargs):
         calls["iptables"].append(tuple(str(a) for a in args))
+        # A `-D` of an absent rule returns non-empty stderr; report "gone" so the idempotent
+        # delete-until-gone loop (_iptables_delete_all) terminates after one delete in tests.
+        if "-D" in args:
+            return ("", "iptables: Bad rule (does a matching rule exist in that chain?).")
         return ("", "")
 
     class _Settings:
@@ -71,19 +75,23 @@ def test_nexthop_init_skips_reserved_table(rec):
 # ---------------------------------------------------------------------------
 
 def test_nexthop_enable_argv(rec):
-    rooter.nexthop_enable("192.168.100.42", "ens6", "201", "10042")
+    # signature: (vm_ip, ingress_if, egress_if, rt_table, priority)
+    rooter.nexthop_enable("192.168.100.42", "virbr0", "ens6", "201", "10042")
     # iproute2 + conntrack go through run(); nat/filter through run_iptables()
     assert rec["run"] == [
         ("conntrack", "-D", "-s", "192.168.100.42"),                                  # pre-bind flush
         ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),  # idempotent pre-clean
         ("ip", "rule", "add", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
     ]
-    # The forward ACCEPT goes into CAPE_ACCEPTED_SEGMENTS (jumped first in FORWARD), NOT a tail
-    # `-A FORWARD` rule — otherwise a libvirt default `-i virbr* -j REJECT` in front of it would
-    # shadow the accept on libvirt-backed guests (codex P1).
+    # Each iptables rule is delete-until-gone (idempotent; Copilot) then added once. The forward
+    # ACCEPT goes into CAPE_ACCEPTED_SEGMENTS (jumped first in FORWARD), NOT a tail `-A FORWARD`
+    # (else a libvirt `-i virbr* -j REJECT` would shadow it), and is constrained to the guest
+    # ingress interface `-i virbr0` so a spoofed source from another NIC isn't forwarded (codex).
     assert rec["iptables"] == [
+        ("-t", "nat", "-D", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
         ("-t", "nat", "-A", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
-        ("-I", "CAPE_ACCEPTED_SEGMENTS", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+        ("-D", "CAPE_ACCEPTED_SEGMENTS", "-i", "virbr0", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+        ("-I", "CAPE_ACCEPTED_SEGMENTS", "-i", "virbr0", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
     # never a raw tail FORWARD append (regression guard for the shadowing bug)
     assert not any(a[:2] == ("-A", "FORWARD") for a in rec["iptables"])
@@ -94,15 +102,16 @@ def test_nexthop_enable_argv(rec):
 # ---------------------------------------------------------------------------
 
 def test_nexthop_disable_argv(rec):
-    rooter.nexthop_disable("192.168.100.42", "ens6", "201", "10042")
+    # signature: (vm_ip, ingress_if, egress_if, rt_table, priority)
+    rooter.nexthop_disable("192.168.100.42", "virbr0", "ens6", "201", "10042")
     assert rec["run"] == [
         ("ip", "rule", "del", "from", "192.168.100.42", "lookup", "201", "priority", "10042"),
         ("conntrack", "-D", "-s", "192.168.100.42"),
     ]
-    # mirror-delete from the same chain enable inserted into (CAPE_ACCEPTED_SEGMENTS)
+    # mirror-delete (until gone) from the same chain/rules enable installed, incl. the -i ingress
     assert rec["iptables"] == [
         ("-t", "nat", "-D", "POSTROUTING", "-s", "192.168.100.42", "-o", "ens6", "-j", "MASQUERADE"),
-        ("-D", "CAPE_ACCEPTED_SEGMENTS", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
+        ("-D", "CAPE_ACCEPTED_SEGMENTS", "-i", "virbr0", "-s", "192.168.100.42", "-o", "ens6", "-j", "ACCEPT"),
     ]
 
 
