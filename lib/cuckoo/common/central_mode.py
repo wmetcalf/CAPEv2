@@ -49,6 +49,15 @@ def _as_bool(v, default=False):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_int(v, default):
+    """Coerce a config value to int, falling back to `default` on None/blank/garbage so a
+    typo in [central_mode] degrades to the documented default instead of a startup crash."""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class CentralModeConfig:
     enabled: bool = False
@@ -79,6 +88,15 @@ class CentralModeConfig:
     # For job_directory="broker_http": the broker base URL + Bearer API token.
     broker_url: str = ""
     broker_api_token: str = ""
+    # Interactive-Guac worker access (central_guac.py resolves a live task's VM on the worker that
+    # hosts it). These carry the deployment's worker conventions so they aren't hardcoded for
+    # non-deb topologies. worker_api_token_file: file holding the worker apiv2 Token (blank/absent
+    # => no auth header). worker_api_port: the worker's apiv2/web port. worker_ssh_user +
+    # worker_ssh_keyfile: the central node's libvirt-over-SSH identity onto workers.
+    worker_api_token_file: str = "/etc/cape/api-token"
+    worker_api_port: int = 8000
+    worker_ssh_user: str = "cape"
+    worker_ssh_keyfile: str = "/home/cape/.ssh/id_ed25519"
     # The report doc -> central DocumentDB write is the NATIVE mongodb.py reporting module
     # pointed at DocumentDB via [mongodb] (tls=yes, retrywrites=no); central_mode therefore
     # only carries the FS->S3 artifact location.
@@ -101,6 +119,10 @@ def _parse(sec) -> "CentralModeConfig":
         job_directory=str(get("job_directory", "broker_http") or "broker_http").strip().lower(),
         broker_url=str(get("broker_url", "") or ""),
         broker_api_token=str(get("broker_api_token", "") or ""),
+        worker_api_token_file=str(get("worker_api_token_file", "/etc/cape/api-token") or "/etc/cape/api-token"),
+        worker_api_port=_as_int(get("worker_api_port", 8000), 8000),
+        worker_ssh_user=str(get("worker_ssh_user", "cape") or "cape"),
+        worker_ssh_keyfile=str(get("worker_ssh_keyfile", "/home/cape/.ssh/id_ed25519") or "/home/cape/.ssh/id_ed25519"),
     )
 
 

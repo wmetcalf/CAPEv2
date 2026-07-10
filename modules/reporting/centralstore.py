@@ -132,7 +132,7 @@ class CentralStore(Report):
         # upload failure we leave no marker, so the analysis is retained until it is
         # re-confirmed or the worker recycles (24h) — never purged unconfirmed.
         if failed == 0:
-            self._write_done_marker(cfg, job_id, uploaded)
+            _emit_done_marker(store, container, self.analysis_path, cfg, job_id, uploaded)
         else:
             log.warning("centralstore: %d upload(s) failed for job_id=%s; NOT marking done "
                         "(local copy retained for cleanup safety)", failed, job_id)
@@ -213,29 +213,48 @@ class CentralStore(Report):
                 log.warning("centralstore: failed to upload recording %s -> %s/%s: %s", fn, container, rel, e)
         return count, failed
 
-    def _write_done_marker(self, cfg, job_id, uploaded):
-        """Write storage/analyses/<id>/.centralstore.done once the artifact tree is
-        fully in S3. cape-nvme-cleanup purges only analyses carrying this marker, so
-        it can never delete something that didn't reach the central stores."""
-        base = self.analysis_path
-        if not base or not os.path.isdir(base):
-            return
-        marker = os.path.join(base, ".centralstore.done")
-        # Backend-aware location string: s3://bucket/... for the S3 path, or the shared
-        # mount's <root>/<prefix>/<job_id>/ for the local path. Informational only.
-        if cfg.storage_backend == "local" and cfg.central_local_root:
-            location = os.path.join(cfg.central_local_root, cfg.s3_prefix, job_id) + os.sep
-        else:
-            location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
-        try:
-            import json
-            import time
-            with open(marker, "w") as f:
-                json.dump({
-                    "job_id": job_id,
-                    "location": location,
-                    "artifacts": uploaded,
-                    "ts": time.time(),
-                }, f)
-        except Exception as e:
-            log.warning("centralstore: could not write done marker %s: %s", marker, e)
+
+def _emit_done_marker(store, container, analysis_path, cfg, job_id, uploaded):
+    """Emit the analysis completion marker, in TWO places, once the whole tree is confirmed:
+
+    1. LOCAL — storage/analyses/<id>/.centralstore.done. The worker's cape-nvme-cleanup purges
+       only analyses carrying this file, so it can never delete a job that didn't reach the
+       central store.
+    2. CENTRAL STORE — uploaded as the FINAL object at <container>/.centralstore.done. The READ
+       seam (artifact_storage._stage_tree) treats this key as the completion signal and only then
+       caches .central_staged; WITHOUT the store copy `complete` is never True, so every central
+       report view re-stages the entire tree from the store on every request. Uploaded last (and
+       only when failed==0 upstream) so a listing taken mid-upload never shows the marker before
+       the tree is complete.
+
+    Best-effort: a marker failure never breaks reporting — the artifacts are already durable. If
+    the local write fails there's nothing to upload; if the store upload fails the local gate
+    still stands (cleanup stays safe) and the read side falls back to the per-file download seam."""
+    if not analysis_path or not os.path.isdir(analysis_path):
+        return
+    marker = os.path.join(analysis_path, ".centralstore.done")
+    # Backend-aware location string: s3://bucket/... for the S3 path, or the shared
+    # mount's <root>/<prefix>/<job_id>/ for the local path. Informational only.
+    if cfg.storage_backend == "local" and cfg.central_local_root:
+        location = os.path.join(cfg.central_local_root, cfg.s3_prefix, job_id) + os.sep
+    else:
+        location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
+    try:
+        import json
+        import time
+        with open(marker, "w") as f:
+            json.dump({
+                "job_id": job_id,
+                "location": location,
+                "artifacts": uploaded,
+                "ts": time.time(),
+            }, f)
+    except Exception as e:
+        log.warning("centralstore: could not write local done marker %s: %s", marker, e)
+        return  # nothing to upload if the local marker couldn't even be written
+    try:
+        store.put_file(marker, container, ".centralstore.done")
+    except Exception as e:
+        log.warning("centralstore: wrote local done marker but failed to upload %s/.centralstore.done: %s "
+                    "(read-side staging cache disabled for this job; artifacts still served per-file)",
+                    container, e)

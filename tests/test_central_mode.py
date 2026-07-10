@@ -4,7 +4,12 @@ import os
 
 import pytest
 
-from lib.cuckoo.common.central_mode import _parse, _as_bool, upload_target_realpath
+from lib.cuckoo.common.central_mode import _parse, _as_bool, _as_int, upload_target_realpath
+from lib.cuckoo.common.central_guac import (
+    _libvirt_ssh_dsn,
+    _worker_api_token,
+    _worker_task_view_url,
+)
 from lib.cuckoo.common.hunt_query import build_hunt_facets
 from lib.cuckoo.common.storage_backend import (
     ArtifactNotFound,
@@ -27,6 +32,14 @@ def test_as_bool():
     assert _as_bool("no") is False
     assert _as_bool(None, False) is False
     assert _as_bool(True) is True
+
+
+def test_as_int():
+    assert _as_int("42", 0) == 42
+    assert _as_int(7, 0) == 7
+    assert _as_int("  9443 ", 0) == 9443  # stripped
+    assert _as_int(None, 8000) == 8000
+    assert _as_int("notaport", 8000) == 8000  # garbage -> default, no crash
 
 
 def test_central_mode_defaults_off():
@@ -271,6 +284,91 @@ def test_upload_target_realpath(tmp_path):
     link2 = analysis / "sneaky"
     link2.symlink_to(sneaky)
     assert upload_target_realpath(str(link2), base_real, trusted) is None
+
+
+def test_central_mode_worker_access_fields_parse():
+    # Interactive-guac worker access: config-driven (was hardcoded deb paths in central_guac).
+    d = _parse({})
+    assert d.worker_api_token_file == "/etc/cape/api-token"
+    assert d.worker_api_port == 8000 and isinstance(d.worker_api_port, int)
+    assert d.worker_ssh_user == "cape"
+    assert d.worker_ssh_keyfile == "/home/cape/.ssh/id_ed25519"
+    c = _parse({
+        "worker_api_token_file": "/opt/secrets/tok",
+        "worker_api_port": "9443",   # string in conf -> int
+        "worker_ssh_user": "sandbox",
+        "worker_ssh_keyfile": "/home/sandbox/.ssh/id_rsa",
+    })
+    assert c.worker_api_token_file == "/opt/secrets/tok"
+    assert c.worker_api_port == 9443 and isinstance(c.worker_api_port, int)
+    assert c.worker_ssh_user == "sandbox"
+    assert c.worker_ssh_keyfile == "/home/sandbox/.ssh/id_rsa"
+    # a bad port degrades to the default, not a startup crash
+    assert _parse({"worker_api_port": "nope"}).worker_api_port == 8000
+
+
+def test_central_guac_worker_url_and_dsn():
+    # port + task id substitute; the deb defaults no longer live in the code path
+    assert _worker_task_view_url("10.0.0.5", 8000, 42) == "http://10.0.0.5:8000/apiv2/tasks/view/42/"
+    assert _worker_task_view_url("10.0.0.5", "9443", "7") == "http://10.0.0.5:9443/apiv2/tasks/view/7/"
+    # DSN carries the CONFIGURED user + keyfile (not hardcoded cape / id_ed25519)
+    assert _libvirt_ssh_dsn("10.0.0.9", "cape", "/home/cape/.ssh/id_ed25519") == \
+        "qemu+ssh://cape@10.0.0.9/system?keyfile=/home/cape/.ssh/id_ed25519&no_verify=1"
+    assert _libvirt_ssh_dsn("10.0.0.9", "sandbox", "/home/sandbox/.ssh/id_rsa") == \
+        "qemu+ssh://sandbox@10.0.0.9/system?keyfile=/home/sandbox/.ssh/id_rsa&no_verify=1"
+    # a keyfile with a URI metachar is quoted so it can't corrupt the query string
+    dsn = _libvirt_ssh_dsn("10.0.0.9", "cape", "/home/cape/my key&x")
+    assert "my%20key%26x" in dsn and dsn.endswith("&no_verify=1")
+
+
+def test_central_guac_worker_api_token(tmp_path):
+    tok = tmp_path / "api-token"
+    tok.write_text("  s3cr3t\n")
+    assert _worker_api_token(str(tok)) == "s3cr3t"  # stripped
+    # missing/unreadable -> "" (=> no auth header downstream), never raises
+    assert _worker_api_token(str(tmp_path / "nope")) == ""
+
+
+def test_centralstore_done_marker_local_and_uploaded(tmp_path):
+    # The completion marker must be BOTH written locally (the worker's NVMe-cleanup gate) AND
+    # uploaded to the central store (the read seam's .central_staged completion signal). Regression:
+    # it was local-only, so artifact_storage._stage_tree never saw it and re-staged every view.
+    from modules.reporting.centralstore import _emit_done_marker
+
+    analysis = tmp_path / "analyses" / "77"
+    analysis.mkdir(parents=True)
+    store = LocalFSStore(str(tmp_path / "central"))
+    cfg = _parse({"enabled": "yes", "s3_bucket": "bkt", "s3_prefix": "results"})
+    container = "results/ui-77"
+
+    _emit_done_marker(store, container, str(analysis), cfg, "ui-77", 12)
+
+    # local marker present (cleanup gate) with the expected metadata ...
+    local_marker = analysis / ".centralstore.done"
+    assert local_marker.exists()
+    import json
+    meta = json.loads(local_marker.read_text())
+    assert meta["job_id"] == "ui-77" and meta["artifacts"] == 12
+    assert meta["location"] == "s3://bkt/results/ui-77/"
+    # ... AND uploaded to the store under the exact key the read seam checks for
+    assert store.exists(container, ".centralstore.done") is True
+
+
+def test_centralstore_done_marker_upload_failure_keeps_local(tmp_path):
+    # A store put_file failure must NOT raise (the artifacts are already durable) and must leave
+    # the local marker intact so the worker's cleanup gate still fires.
+    from modules.reporting.centralstore import _emit_done_marker
+
+    analysis = tmp_path / "analyses" / "88"
+    analysis.mkdir(parents=True)
+
+    class BoomStore:
+        def put_file(self, *a, **k):
+            raise RuntimeError("s3 down")
+
+    cfg = _parse({"enabled": "yes", "s3_bucket": "bkt"})
+    _emit_done_marker(BoomStore(), "results/ui-88", str(analysis), cfg, "ui-88", 3)  # must not raise
+    assert (analysis / ".centralstore.done").exists()
 
 
 def test_hunt_facets_per_category_no_facet():

@@ -17,6 +17,30 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def _worker_api_token(token_file):
+    """Read the worker apiv2 Token from token_file; '' if unset/unreadable (=> no auth header).
+    Never raises — a missing token file just means unauthenticated requests."""
+    try:
+        with open(token_file) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _worker_task_view_url(worker_ip, port, cape_task_id):
+    """The worker's apiv2 task-view URL. port comes from [central_mode] worker_api_port."""
+    return "http://%s:%d/apiv2/tasks/view/%d/" % (worker_ip, int(port), int(cape_task_id))
+
+
+def _libvirt_ssh_dsn(ip, ssh_user, keyfile):
+    """qemu+ssh libvirt DSN to a worker. ssh_user/keyfile come from [central_mode]
+    (worker_ssh_user/worker_ssh_keyfile) so the deb defaults aren't hardcoded. keyfile is
+    URL-quoted (safe='/') so a configured path with a '&'/'?'/space can't corrupt the query."""
+    from urllib.parse import quote
+
+    return "qemu+ssh://%s@%s/system?keyfile=%s&no_verify=1" % (ssh_user, ip, quote(keyfile, safe="/"))
+
+
 def _job_id_for_task(task_id):
     """Resolve the broker job_id for a task. Prefer the RDS task.custom stamp
     ('job_id=ui-<id>', set by the submit-bridge at enqueue) — it exists DURING the
@@ -96,13 +120,9 @@ def worker_vm_for_task(task_id):
 
         import requests
 
-        token = ""
-        try:
-            token = open("/etc/cape/api-token").read().strip()
-        except Exception:
-            pass
+        token = _worker_api_token(cfg.worker_api_token_file)
         headers = {"Authorization": f"Token {token}"} if token else {}
-        r = requests.get(f"http://{worker_ip}:8000/apiv2/tasks/view/{int(cape_task_id)}/",
+        r = requests.get(_worker_task_view_url(worker_ip, cfg.worker_api_port, cape_task_id),
                          headers=headers, timeout=10)
         data = (r.json() or {}).get("data", {})
         return (data.get("machine"), None)  # central guac uses the worker's localhost for VNC
@@ -113,12 +133,16 @@ def worker_vm_for_task(task_id):
 
 def libvirt_dsn_for_task(task_id, local_dsn):
     """libvirt DSN to query the VM's VNC port: the worker's libvirt over SSH for a
-    worker-hosted task, else the local DSN. (Requires the central node's cape user
-    to hold an SSH key authorized on workers — deploy-time plumbing.)"""
+    worker-hosted task, else the local DSN. (Requires the central node's worker_ssh_user
+    to hold worker_ssh_keyfile, authorized on workers — deploy-time plumbing.)"""
+    from lib.cuckoo.common.central_mode import central_mode_config
+
     ip = worker_ip_for_task(task_id)
     if not ip:
         return (local_dsn, None)
-    # cape's baked SSH key authorizes the central node onto workers; no_verify skips
-    # host-key prompts for ephemeral in-VPC workers.
-    dsn = f"qemu+ssh://cape@{ip}/system?keyfile=/home/cape/.ssh/id_ed25519&no_verify=1"
+    # The central node's libvirt-over-SSH identity onto workers comes from [central_mode]
+    # (worker_ssh_user/worker_ssh_keyfile); no_verify skips host-key prompts for ephemeral
+    # in-VPC workers.
+    cfg = central_mode_config()
+    dsn = _libvirt_ssh_dsn(ip, cfg.worker_ssh_user, cfg.worker_ssh_keyfile)
     return (dsn, ip)
