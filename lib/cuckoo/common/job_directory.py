@@ -44,12 +44,34 @@ class JobLocation:
         return f"JobLocation(worker_ip={self.worker_ip!r}, cape_task_id={self.cape_task_id!r})"
 
 
+def _valid_worker_ip(ip):
+    """The broker record's sandbox_worker_ip becomes the netloc of a qemu+ssh libvirt DSN AND of
+    an authenticated apiv2 URL (central_guac.py). A poisoned/spoofed broker record with a value
+    like '1.2.3.4/system?keyfile=/attacker/key&no_verify=1&x=' or 'attacker:9999/x?a=' would
+    otherwise inject libvirt URI params or redirect the Token-bearing apiv2 request to an attacker
+    host. It is knowably a bare IP, so require it to parse as one; anything else -> None (the caller
+    then keeps the localhost/single-node path). Validating here — the one normalizer both backends
+    and both consumers flow through — is the single choke point."""
+    if not ip:
+        return None
+    import ipaddress
+
+    text = str(ip).strip()
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        log.warning("job_directory: ignoring non-IP sandbox_worker_ip %r from broker record", ip)
+        return None
+    return text
+
+
 def loc_from_item(item):
     """Map a broker job record (dict from DynamoDB or the broker HTTP status API — both
     use the SAME field names) to a JobLocation. Pure, so it's the unit-testable core both
-    backends share."""
+    backends share. The worker IP is validated (see _valid_worker_ip) before it reaches the
+    DSN/URL builders."""
     item = item or {}
-    return JobLocation(item.get("sandbox_worker_ip"), item.get("cape_task_id"))
+    return JobLocation(_valid_worker_ip(item.get("sandbox_worker_ip")), item.get("cape_task_id"))
 
 
 class JobDirectory:

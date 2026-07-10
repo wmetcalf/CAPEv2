@@ -104,6 +104,7 @@ def _stage_tree(task_id, scope, want):
     for rel in store.iter_relpaths(container):
         if rel == ".centralstore.done":
             complete = True
+            continue  # completion marker is a control object, not an artifact — don't stage it
         if not rel or rel.endswith("/") or not want(rel):
             continue
         # Defence-in-depth: an object key suffix must never escape the analysis dir when it

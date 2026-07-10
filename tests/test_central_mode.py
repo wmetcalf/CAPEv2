@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from lib.cuckoo.common.central_mode import _parse, _as_bool, _as_int, upload_target_realpath
+from lib.cuckoo.common.central_mode import _parse, _as_bool, _as_int, _as_port, upload_target_realpath
 from lib.cuckoo.common.central_guac import (
     _libvirt_ssh_dsn,
     _worker_api_token,
@@ -40,6 +40,16 @@ def test_as_int():
     assert _as_int("  9443 ", 0) == 9443  # stripped
     assert _as_int(None, 8000) == 8000
     assert _as_int("notaport", 8000) == 8000  # garbage -> default, no crash
+
+
+def test_as_port():
+    assert _as_port("9443", 8000) == 9443
+    assert _as_port(443, 8000) == 443
+    # int() accepts these but they're not real ports -> fall back to the default (not a broken URL)
+    assert _as_port("0", 8000) == 8000
+    assert _as_port("-1", 8000) == 8000
+    assert _as_port("99999", 8000) == 8000
+    assert _as_port("nope", 8000) == 8000
 
 
 def test_central_mode_defaults_off():
@@ -198,6 +208,20 @@ def test_loc_from_item_maps_and_normalizes():
     assert loc_from_item({"sandbox_worker_ip": "", "cape_task_id": 0}) == JobLocation(None, 0)
     assert loc_from_item({}) == JobLocation(None, None)
     assert loc_from_item(None) == JobLocation(None, None)
+    # IPv6 is a valid IP too (kept as-is)
+    assert loc_from_item({"sandbox_worker_ip": "fd00::1", "cape_task_id": 5}) == JobLocation("fd00::1", 5)
+
+
+def test_loc_from_item_rejects_non_ip_worker_ip():
+    # sandbox_worker_ip becomes the netloc of a libvirt DSN + an authenticated apiv2 URL. A poisoned
+    # broker record must NOT flow through: a non-IP value (injection payload, hostname, garbage) is
+    # dropped to None so the caller keeps the localhost path — closes the DSN/URL-injection vector.
+    payload = "1.2.3.4/system?keyfile=/attacker/key&no_verify=1&x="
+    assert loc_from_item({"sandbox_worker_ip": payload, "cape_task_id": 7}) == JobLocation(None, 7)
+    assert loc_from_item({"sandbox_worker_ip": "attacker.host:9999/x?a=", "cape_task_id": 1}) == JobLocation(None, 1)
+    assert loc_from_item({"sandbox_worker_ip": "not-an-ip", "cape_task_id": 2}) == JobLocation(None, 2)
+    # cape_task_id survives even when the IP is rejected (the job exists; it's just unroutable here)
+    assert loc_from_item({"sandbox_worker_ip": "999.999.999.999", "cape_task_id": 0}) == JobLocation(None, 0)
 
 
 def test_get_job_directory_off_returns_none():
@@ -303,8 +327,10 @@ def test_central_mode_worker_access_fields_parse():
     assert c.worker_api_port == 9443 and isinstance(c.worker_api_port, int)
     assert c.worker_ssh_user == "sandbox"
     assert c.worker_ssh_keyfile == "/home/sandbox/.ssh/id_rsa"
-    # a bad port degrades to the default, not a startup crash
+    # a bad/out-of-range port degrades to the default, not a startup crash or a broken URL
     assert _parse({"worker_api_port": "nope"}).worker_api_port == 8000
+    assert _parse({"worker_api_port": "0"}).worker_api_port == 8000
+    assert _parse({"worker_api_port": "99999"}).worker_api_port == 8000
 
 
 def test_central_guac_worker_url_and_dsn():

@@ -230,6 +230,9 @@ def _emit_done_marker(store, container, analysis_path, cfg, job_id, uploaded):
     Best-effort: a marker failure never breaks reporting — the artifacts are already durable. If
     the local write fails there's nothing to upload; if the store upload fails the local gate
     still stands (cleanup stays safe) and the read side falls back to the per-file download seam."""
+    import json
+    import time
+
     if not analysis_path or not os.path.isdir(analysis_path):
         return
     marker = os.path.join(analysis_path, ".centralstore.done")
@@ -240,8 +243,6 @@ def _emit_done_marker(store, container, analysis_path, cfg, job_id, uploaded):
     else:
         location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
     try:
-        import json
-        import time
         with open(marker, "w") as f:
             json.dump({
                 "job_id": job_id,
@@ -252,9 +253,19 @@ def _emit_done_marker(store, container, analysis_path, cfg, job_id, uploaded):
     except Exception as e:
         log.warning("centralstore: could not write local done marker %s: %s", marker, e)
         return  # nothing to upload if the local marker couldn't even be written
-    try:
-        store.put_file(marker, container, ".centralstore.done")
-    except Exception as e:
-        log.warning("centralstore: wrote local done marker but failed to upload %s/.centralstore.done: %s "
-                    "(read-side staging cache disabled for this job; artifacts still served per-file)",
-                    container, e)
+    # This is the SINGLE object that gates the read-side staging cache (artifact_storage.
+    # _stage_tree). Reporting runs once and won't re-emit it, and the worker's cleanup gate (the
+    # local marker) will let the ephemeral NVMe copy be purged — so a transient store hiccup here
+    # would permanently disable that job's read cache with no self-heal. Retry a few times before
+    # giving up; the tree itself is already durable, so this stays best-effort even on total failure.
+    for attempt in range(3):
+        try:
+            store.put_file(marker, container, ".centralstore.done")
+            return
+        except Exception as e:
+            log.warning("centralstore: marker upload attempt %d/3 to %s/.centralstore.done failed: %s",
+                        attempt + 1, container, e)
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
+    log.warning("centralstore: gave up uploading %s/.centralstore.done after 3 attempts "
+                "(read-side staging cache disabled for this job; artifacts still served per-file)", container)

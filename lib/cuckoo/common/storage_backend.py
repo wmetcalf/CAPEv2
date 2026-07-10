@@ -112,9 +112,24 @@ class LocalFSStore(ArtifactStore):
 
     def put_file(self, local_path, container, relpath):
         dest = self._path(container, relpath)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.realpath(local_path) != os.path.realpath(dest):
-            shutil.copyfile(local_path, dest)
+        dest_dir = os.path.dirname(dest)
+        os.makedirs(dest_dir, exist_ok=True)
+        if os.path.realpath(local_path) == os.path.realpath(dest):
+            return
+        # Write to a temp file in the SAME dir (same filesystem) then atomically rename, so a
+        # concurrent reader (the central read seam staging from a shared/NFS mount) never observes
+        # a half-written object at the final key. A direct copyfile would expose partial content.
+        fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=".part-")
+        os.close(fd)
+        try:
+            shutil.copyfile(local_path, tmp)
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 class S3Store(ArtifactStore):

@@ -73,12 +73,12 @@ def _job_id_for_task(task_id):
         return None
 
 
-def worker_ip_for_task(task_id):
-    """Private IP of the worker hosting this task's live VM, or None (local)."""
-    from lib.cuckoo.common.central_mode import central_mode_config
+def _worker_ip(cfg, task_id):
+    """Resolve task_id -> the hosting worker's private IP using an ALREADY-loaded cfg, so
+    worker_ip_for_task and libvirt_dsn_for_task parse [central_mode] once per call instead of
+    twice. Returns None (local/unresolvable). The IP is validated in job_directory.loc_from_item."""
     from lib.cuckoo.common.job_directory import get_job_directory
 
-    cfg = central_mode_config()
     directory = get_job_directory(cfg)
     if directory is None:
         return None
@@ -91,6 +91,13 @@ def worker_ip_for_task(task_id):
     except Exception as e:
         log.warning("central guac: worker resolution failed for task %s: %s", task_id, e)
         return None
+
+
+def worker_ip_for_task(task_id):
+    """Private IP of the worker hosting this task's live VM, or None (local)."""
+    from lib.cuckoo.common.central_mode import central_mode_config
+
+    return _worker_ip(central_mode_config(), task_id)
 
 
 def worker_vm_for_task(task_id):
@@ -137,12 +144,12 @@ def libvirt_dsn_for_task(task_id, local_dsn):
     to hold worker_ssh_keyfile, authorized on workers — deploy-time plumbing.)"""
     from lib.cuckoo.common.central_mode import central_mode_config
 
-    ip = worker_ip_for_task(task_id)
+    cfg = central_mode_config()  # loaded once; shared with the worker-IP resolution below
+    ip = _worker_ip(cfg, task_id)
     if not ip:
         return (local_dsn, None)
     # The central node's libvirt-over-SSH identity onto workers comes from [central_mode]
     # (worker_ssh_user/worker_ssh_keyfile); no_verify skips host-key prompts for ephemeral
     # in-VPC workers.
-    cfg = central_mode_config()
     dsn = _libvirt_ssh_dsn(ip, cfg.worker_ssh_user, cfg.worker_ssh_keyfile)
     return (dsn, ip)

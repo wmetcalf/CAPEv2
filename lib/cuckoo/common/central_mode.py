@@ -58,6 +58,14 @@ def _as_int(v, default):
         return default
 
 
+def _as_port(v, default):
+    """A TCP port from config. int() accepts syntactically-valid but out-of-range values
+    (0, -1, 99999) that would then format into a broken URL and silently kill worker resolution;
+    fall back to `default` unless the value is a real port (1..65535)."""
+    p = _as_int(v, default)
+    return p if 1 <= p <= 65535 else default
+
+
 @dataclass
 class CentralModeConfig:
     enabled: bool = False
@@ -120,7 +128,7 @@ def _parse(sec) -> "CentralModeConfig":
         broker_url=str(get("broker_url", "") or ""),
         broker_api_token=str(get("broker_api_token", "") or ""),
         worker_api_token_file=str(get("worker_api_token_file", "/etc/cape/api-token") or "/etc/cape/api-token"),
-        worker_api_port=_as_int(get("worker_api_port", 8000), 8000),
+        worker_api_port=_as_port(get("worker_api_port", 8000), 8000),
         worker_ssh_user=str(get("worker_ssh_user", "cape") or "cape"),
         worker_ssh_keyfile=str(get("worker_ssh_keyfile", "/home/cape/.ssh/id_ed25519") or "/home/cape/.ssh/id_ed25519"),
     )
