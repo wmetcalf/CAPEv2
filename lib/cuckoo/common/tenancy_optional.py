@@ -42,8 +42,12 @@ def multitenancy_config():
 
 
 def viewer_for(user):
+    # viewer_for lives in the web `users` MT app (needs the Django ORM), NOT the pure predicate
+    # lib.cuckoo.common.tenancy -- importing it from there always ImportError'd -> the facade
+    # silently degraded to see-all even when MT WAS deployed (cross-tenant leak). Resolve it from
+    # users.tenancy (present => real viewer; absent/non-Django => fall back to see-all).
     try:
-        from lib.cuckoo.common.tenancy import viewer_for as real
+        from users.tenancy import viewer_for as real
     except ImportError:
         return Viewer()
     return real(user)

@@ -7,8 +7,8 @@ worker, so the central guac consumer must target THAT worker's guacd + VM.
 worker_ip_for_task() resolves task_id (info.id) -> info.job_id -> the broker job
 record's sandbox_worker_ip (recorded by the dispatcher at dispatch time) -> the
 worker's private IP. The job record is fetched via a pluggable JobDirectory
-(job_directory.py): DynamoDB by default, or the broker's HTTP status API — so the
-fork carries no hard DynamoDB/boto3 dependency. Returns None for box-local /
+(job_directory.py): the broker's HTTP status API by default (vendor-neutral), or
+DynamoDB (opt-in, AWS) — so the fork carries no hard DynamoDB/boto3 dependency. Returns None for box-local /
 single-node tasks (no broker record), so the consumer/view keep their localhost
 path unchanged when central mode is off or the task ran locally.
 """

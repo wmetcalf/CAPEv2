@@ -187,7 +187,7 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                 # or shared cookie must not tunnel into another tenant's live VM.
                 ws_user = self.scope.get("user")
                 if ws_user is not None and getattr(ws_user, "is_authenticated", False):
-                    from users.tenancy import can_view_task
+                    from web.tenancy_optional import can_view_task
 
                     if not await sync_to_async(can_view_task)(ws_user, task):
                         logger.warning(

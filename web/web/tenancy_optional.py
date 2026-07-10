@@ -74,12 +74,14 @@ def can_view_sample(user, *, sha256=None, sha1=None, md5=None, sample_id=None):
 
 
 def can_ban_user(actor, target_user_id):
-    # MT-disabled returns True (is_local_admin); the ban_user VIEW still applies its own
-    # Django staff/permission gate, so this is not the sole authz boundary.
+    # The ban_user / ban_all_user_tasks VIEWS gate SOLELY on this call (they no longer carry their
+    # own is_staff check), so the MT-absent fallback MUST preserve upstream's staff/superuser-only
+    # boundary. Returning True would let ANY authenticated user (or anonymous, if WEB_AUTHENTICATION
+    # is off) ban/disable accounts on a single-node build.
     try:
         from users.tenancy import can_ban_user as real
     except ImportError:
-        return True
+        return bool(getattr(actor, "is_staff", False) or getattr(actor, "is_superuser", False))
     return real(actor, target_user_id)
 
 

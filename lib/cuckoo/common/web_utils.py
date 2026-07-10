@@ -478,7 +478,7 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
             - distributed_tasks: Statistics related to distributed tasks (if applicable).
             - asns: Top Autonomous System Numbers (ASNs).
     """
-    from lib.cuckoo.common.tenancy import scope_match as _scope_match_fn
+    from lib.cuckoo.common.tenancy_optional import scope_match as _scope_match_fn
 
     # Derive the mongo $match dict from scope+viewer; None → no filter (global, backward-compat).
     sm = _scope_match_fn(scope, viewer) if scope and scope != "global" else None
@@ -1805,7 +1805,7 @@ def process_new_task_files(request, samples: list, details: dict, opt_filename: 
                 )
                 continue
 
-            from users.tenancy import viewer_for as _viewer_for
+            from lib.cuckoo.common.tenancy_optional import viewer_for as _viewer_for
 
             if (
                 not request.user.is_staff
