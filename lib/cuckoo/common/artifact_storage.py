@@ -52,7 +52,8 @@ def _job_id_for_task(task_id, scope=None):
     if scope:
         query = {"$and": [query, scope]}
     doc = mongo_find_one("analysis", query, {"info.job_id": 1})
-    job_id = (doc or {}).get("info", {}).get("job_id")
+    # info may be missing OR explicitly None ({"info": None}); coalesce both to {} before .get.
+    job_id = ((doc or {}).get("info") or {}).get("job_id")
     if not job_id:
         raise Http404("no job_id mapping for task")
     return job_id

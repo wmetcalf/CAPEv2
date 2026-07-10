@@ -68,7 +68,8 @@ def _job_id_for_task(task_id):
         from dev_utils.mongodb import mongo_find_one
 
         doc = mongo_find_one("analysis", {"info.id": int(task_id)}, {"info.job_id": 1})
-        return (doc or {}).get("info", {}).get("job_id")
+        # info may be missing OR explicitly None ({"info": None}); coalesce both before .get.
+        return ((doc or {}).get("info") or {}).get("job_id")
     except Exception:
         return None
 
