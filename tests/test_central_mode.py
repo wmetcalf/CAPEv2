@@ -165,7 +165,7 @@ def test_s3store_is_lazy_no_client_on_construct():
 
 def test_central_mode_job_directory_fields_parse():
     d = _parse({})
-    assert d.job_directory == "dynamodb"  # default backend
+    assert d.job_directory == "broker_http"  # default backend (vendor-neutral)
     assert d.broker_url == "" and d.broker_api_token == ""
     c = _parse({
         "enabled": "yes",
@@ -189,12 +189,19 @@ def test_loc_from_item_maps_and_normalizes():
 
 def test_get_job_directory_off_returns_none():
     assert get_job_directory(_parse({})) is None  # central mode off
-    # enabled but no broker_table and default backend -> None (matches pre-abstraction gate)
+    # enabled but default backend (broker_http) with no broker_url -> None (caller keeps localhost)
     assert get_job_directory(_parse({"enabled": "yes"})) is None
 
 
-def test_get_job_directory_dynamodb_default():
-    d = get_job_directory(_parse({"enabled": "yes", "broker_table": "tbl", "s3_region": "eu-west-1"}))
+def test_get_job_directory_default_is_broker_http():
+    # default backend is now broker_http (vendor-neutral); with a broker_url it resolves to BrokerHttp
+    d = get_job_directory(_parse({"enabled": "yes", "broker_url": "https://broker.local"}))
+    assert isinstance(d, BrokerHttpJobDirectory)
+
+
+def test_get_job_directory_dynamodb_explicit():
+    # dynamodb is opt-in (AWS); must be selected explicitly now
+    d = get_job_directory(_parse({"enabled": "yes", "job_directory": "dynamodb", "broker_table": "tbl", "s3_region": "eu-west-1"}))
     assert isinstance(d, DynamoJobDirectory)
     assert d.table == "tbl" and d.region == "eu-west-1"
 

@@ -247,6 +247,33 @@ mongo = no
 # Clean orphan files in mongodb
 unused_files_in_mongodb = no
 
+[central_mode]
+# Central control-plane mode (off = current single-node behavior; analyses stay on the local
+# storage/analyses tree). When on, analysis artifacts are pushed to a shared object store and
+# interactive Guac routing resolves job->worker via a directory backend.
+enabled = no
+# Artifact storage backend when central mode is ON: "s3" (any S3-compatible store — AWS S3, MinIO,
+# Ceph RGW — via boto3; requires the `aws` extra) or "local" (a shared local/NFS mount).
+storage_backend = s3
+# S3-compatible object store (storage_backend=s3). endpoint blank = AWS default; creds blank =
+# boto3 default credential chain (e.g. an instance role). Point endpoint/creds at MinIO/Ceph/etc.
+s3_bucket =
+s3_region = us-east-1
+s3_prefix = results
+s3_endpoint_url =
+s3_access_key =
+s3_secret_key =
+# storage_backend=local: root the per-job artifact trees live under (blank = local analyses tree).
+central_local_root =
+# Job->worker directory for interactive Guac routing: "broker_http" (default; vendor-neutral —
+# resolves via the broker's GET /api/status/<job_id>) or "dynamodb" (AWS; reads broker_table).
+job_directory = broker_http
+# job_directory=broker_http: broker base URL + optional Bearer API token.
+broker_url =
+broker_api_token =
+# job_directory=dynamodb: the broker job-tracking DynamoDB table name.
+broker_table =
+
 [multitenancy]
 # Multi-tenant identity & job-visibility (off = current single-tenant behavior).
 enabled = no

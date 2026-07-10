@@ -7,9 +7,8 @@ and push the analysis artifact tree to S3 at <prefix>/<job_id>/<rel>. Runs at
 order 9998 — BEFORE the native mongodb reporting module (order 9999) — so the
 report doc that mongodb.py writes to the central DocumentDB already carries
 info.job_id. The DocumentDB write itself is the NATIVE mongodb.py path pointed at
-DocumentDB via [mongodb] (tls=yes, retrywrites=no); compat/docdb_compat.py already
-validated that write path (loop_saver/$set, calls chunking, files $addToSet,
-tenant_scope_idx) against live DocumentDB. This module only adds the FS->S3 half
+DocumentDB via [mongodb] (tls=yes, retrywrites=no) — validated against live DocumentDB
+(loop_saver/$set, calls chunking, files $addToSet, tenant_scope_idx). This module only adds the FS->S3 half
 plus the job_id keying the read seam (artifact_storage.artifact_response) resolves.
 """
 import logging

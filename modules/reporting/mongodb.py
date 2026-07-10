@@ -147,7 +147,7 @@ class MongoDB(Report):
             # when multitenancy is enabled (a disabled install stays exactly
             # upstream; the index backs the scope_match queries that only run
             # in locked mode).
-            from lib.cuckoo.common.tenancy import multitenancy_config
+            from lib.cuckoo.common.tenancy_optional import multitenancy_config
 
             if multitenancy_config().enabled:
                 try:
@@ -191,7 +191,7 @@ class MongoDB(Report):
         # multitenancy being enabled so a disabled/public install writes EXACTLY
         # the upstream report shape (no info.tenant_id/user_id/visibility keys);
         # the migration backfill stamps existing docs when MT is first enabled.
-        from lib.cuckoo.common.tenancy import multitenancy_config
+        from lib.cuckoo.common.tenancy_optional import multitenancy_config
 
         if multitenancy_config().enabled:
             try:

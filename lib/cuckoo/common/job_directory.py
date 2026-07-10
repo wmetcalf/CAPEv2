@@ -115,16 +115,16 @@ class BrokerHttpJobDirectory(JobDirectory):
 def get_job_directory(cfg):
     """Return a JobDirectory for the central-mode config, or None when central mode is off
     or no directory is configured — in which case central_guac's callers keep their
-    single-node/localhost path unchanged. Default backend is 'dynamodb' (our AWS broker),
-    selected unless [central_mode] job_directory='broker_http'."""
+    single-node/localhost path unchanged. Default backend is 'broker_http' (vendor-neutral —
+    resolves via the broker's HTTP API); 'dynamodb' (AWS) is opt-in."""
     if not getattr(cfg, "enabled", False):
         return None
-    backend = (getattr(cfg, "job_directory", "") or "dynamodb").strip().lower()
+    backend = (getattr(cfg, "job_directory", "") or "broker_http").strip().lower()
     if backend == "broker_http":
         if not getattr(cfg, "broker_url", ""):
             return None
         return BrokerHttpJobDirectory(cfg.broker_url, getattr(cfg, "broker_api_token", ""))
-    # default: dynamodb — None if broker_table unset (matches the pre-abstraction gate).
+    # 'dynamodb' (opt-in, AWS) — None if broker_table unset (matches the pre-abstraction gate).
     if not getattr(cfg, "broker_table", ""):
         return None
     return DynamoJobDirectory(cfg.broker_table, getattr(cfg, "s3_region", "us-east-1"))

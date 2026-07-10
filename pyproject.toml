@@ -94,6 +94,9 @@ dependencies = [
 [project.optional-dependencies]
 maco = ["maco"]
 gcp = ["google-cloud-storage", "google-cloud-pubsub"]
+# S3-compatible artifact store + DynamoDB job directory for [central_mode]; imports are lazy
+# (storage_backend.py / job_directory.py) so boto3 is NOT a core dependency.
+aws = ["boto3"]
 yara = ["plyara"]
 mcp = ["fastmcp", "httpx"]
 

@@ -73,16 +73,15 @@ class CentralModeConfig:
     # job to the worker hosting its VM (interactive Guacamole worker routing).
     broker_table: str = ""
     # Job->worker directory backend for interactive guac routing (central_guac.py):
-    # "dynamodb" (default; reads broker_table) or "broker_http" (vendor-neutral; resolves
-    # via the broker's GET /api/status/<job_id>, so the fork needs no DynamoDB/boto3).
-    job_directory: str = "dynamodb"
+    # "broker_http" (default; vendor-neutral — resolves via the broker's GET /api/status/<job_id>,
+    # so no DynamoDB/boto3) or "dynamodb" (AWS; reads broker_table).
+    job_directory: str = "broker_http"
     # For job_directory="broker_http": the broker base URL + Bearer API token.
     broker_url: str = ""
     broker_api_token: str = ""
-    # The report doc -> central DocumentDB write is the NATIVE mongodb.py reporting
-    # module pointed at DocumentDB via [mongodb] (tls=yes, retrywrites=no) — the
-    # write path compat/docdb_compat.py already validated against live DocumentDB.
-    # central_mode therefore only carries the FS->S3 artifact location.
+    # The report doc -> central DocumentDB write is the NATIVE mongodb.py reporting module
+    # pointed at DocumentDB via [mongodb] (tls=yes, retrywrites=no); central_mode therefore
+    # only carries the FS->S3 artifact location.
 
 
 def _parse(sec) -> "CentralModeConfig":
@@ -99,7 +98,7 @@ def _parse(sec) -> "CentralModeConfig":
         s3_secret_key=str(get("s3_secret_key", "") or ""),
         central_local_root=str(get("central_local_root", "") or ""),
         broker_table=str(get("broker_table", "") or ""),
-        job_directory=str(get("job_directory", "dynamodb") or "dynamodb").strip().lower(),
+        job_directory=str(get("job_directory", "broker_http") or "broker_http").strip().lower(),
         broker_url=str(get("broker_url", "") or ""),
         broker_api_token=str(get("broker_api_token", "") or ""),
     )
