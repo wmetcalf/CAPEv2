@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.models import User
 
-from .models import Tenant, UserProfile
+from .models import Exit, Tenant, UserProfile
 
 # Tenancy-privilege fields: the SOLE authority reconcile_tenant() trusts to assign a user's tenant
 # and tenant-admin status on SSO login. Editable only by superusers -- a non-superuser holding a
@@ -68,9 +68,17 @@ class TenantAdmin(admin.ModelAdmin):
     list_display = ("slug", "name", "active", "created_at")
     search_fields = ("slug", "name")
     list_filter = ("active",)
+    filter_horizontal = ("exits",)
 
     def get_readonly_fields(self, request, obj=None):
         ro = tuple(super().get_readonly_fields(request, obj))
         if not request.user.is_superuser:
             ro = ro + _TENANT_PRIV_FIELDS  # non-superusers can't edit the group->tenant/admin maps
         return ro
+
+
+@admin.register(Exit)
+class ExitAdmin(admin.ModelAdmin):
+    list_display = ("slug", "name", "is_global", "active", "created_at")
+    search_fields = ("slug", "name")
+    list_filter = ("is_global", "active")

@@ -144,6 +144,16 @@ def submission_scope(request):
     return real(request)
 
 
+def allowed_exit_slugs(viewer):
+    """Facade for users.tenancy.allowed_exit_slugs. MT-absent => None (unrestricted), matching the
+    resolver's own no-op contract when MT is disabled/shared."""
+    try:
+        from users.tenancy import allowed_exit_slugs as real
+    except ImportError:
+        return None
+    return real(viewer)
+
+
 def viewer_scope_filter(user):
     """Facade for dashboard.views.entitled_scope_filter (None = see-all)."""
     try:

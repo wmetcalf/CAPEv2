@@ -14,6 +14,26 @@ class Tenant(models.Model):
     idp_groups = models.JSONField(default=list, blank=True)  # groups -> membership
     admin_idp_groups = models.JSONField(default=list, blank=True)  # groups -> tenant-admin
     active = models.BooleanField(default=True)
+    # Central-store lifetime (days) for this tenant's analyses: how long S3 artifacts
+    # + DocumentDB reports are retained. Separate from the ephemeral worker NVMe
+    # cleanup. The central retention timer (UI node) stamps info.expire_at from this.
+    retention_days = models.PositiveIntegerField(default=90)
+    exits = models.ManyToManyField("Exit", blank=True, related_name="tenants")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.slug
+
+
+class Exit(models.Model):
+    """A named egress exit (a rooter [gwX] gateway). `slug` MUST equal the routing.conf
+    [gwX] id deployed on the workers. is_global exits are usable by every tenant; others
+    are usable only by the tenants they are assigned to (Tenant.exits)."""
+
+    slug = models.SlugField(max_length=48, unique=True)
+    name = models.CharField(max_length=128, blank=True)
+    is_global = models.BooleanField(default=False)
+    active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

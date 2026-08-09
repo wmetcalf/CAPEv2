@@ -1,5 +1,12 @@
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 from django.contrib.auth.models import User
+from django.test import TestCase
+
+from lib.cuckoo.common.tenancy import MTConfig
+from users.tenancy import allowed_exit_slugs
 
 pytest_plugins = ("mt_test_fixtures",)  # fixtures live in web/mt_test_fixtures.py (not a conftest,
 # which would shadow tests/conftest.py under pythonpath=web + --import-mode=append)
@@ -397,6 +404,21 @@ def test_can_ban_user_tenant_admin_only_within_own_tenant(mt_enabled):
     assert can_ban_user(admin_a, member_a.id) is True          # own tenant -> allowed
     assert can_ban_user(admin_a, member_b.id) is False         # OTHER tenant -> denied (priv-esc closed)
 
+    superu = User.objects.create_superuser("root", "root@x.com", "x")
+    staff = User.objects.create_user("staff", "staff@x.com", "x")
+    staff.is_staff = True
+    staff.save()
+    staff = User.objects.get(pk=staff.pk)
+    admin_acme = _mk_member("aadm", acme, admin=True)
+    member_acme = _mk_member("amem", acme, admin=False)
+    target_acme = _mk_member("atgt", acme)
+    target_globex = _mk_member("gtgt", globex)
+    target_tenantless = _mk_member("ntgt", None)
+
+    # GLOBAL break-glass: staff/superuser ban across any tenant
+    assert can_ban_user(superu, target_acme.id) is True
+    assert can_ban_user(superu, target_globex.id) is True
+    assert can_ban_user(staff, target_globex.id) is True
 
 @pytest.mark.django_db
 def test_can_ban_user_plain_member_denied(mt_enabled):
@@ -422,6 +444,15 @@ def test_can_ban_user_breakglass_superuser_crosses_tenants(mt_enabled):
     su = _mk_user("root", tenant=None, is_superuser=True)
     victim = _mk_user("vv", tenant=globex)
     assert can_ban_user(su, victim.id) is True
+
+    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
+    staff = User.objects.create_user("s2", "s2@x.com", "x")
+    staff.is_staff = True
+    staff.save()
+    member = User.objects.create_user("m2", "m2@x.com", "x")
+    target = User.objects.create_user("t2", "t2@x.com", "x")
+    assert ut.can_ban_user(User.objects.get(pk=staff.pk), target.id) is True
+    assert ut.can_ban_user(member, target.id) is False  # MT-off does NOT grant ban to non-staff
 
 
 @pytest.mark.django_db
@@ -477,3 +508,108 @@ def test_can_ban_user_tenant_admin_cannot_ban_privileged_or_self(mt_enabled):
     assert can_ban_user(admin_a, op_super.id) is False          # superuser target -> refused
     assert can_ban_user(admin_a, staff.id) is False             # staff target -> refused
     assert can_ban_user(admin_a, admin_a.id) is False           # self-ban -> refused
+
+    globex = Tenant.objects.create(slug="globex", name="Globex")
+    admin_acme = _mk_member("vaadm", acme, admin=True)
+    target_acme = _mk_member("vatgt", acme)
+    target_globex = _mk_member("vgtgt", globex)
+
+    client.force_login(admin_acme)
+    # same-tenant ban -> target disabled
+    client.get(reverse("ban_user", args=[target_acme.id]))
+    target_acme.refresh_from_db()
+    assert target_acme.is_active is False
+
+    # cross-tenant ban -> denied, target stays active
+    client.get(reverse("ban_user", args=[target_globex.id]))
+    target_globex.refresh_from_db()
+    assert target_globex.is_active is True
+
+
+def test_extract_groups_reads_userinfo_nested_claims():
+    """REGRESSION (live-Keycloak e2e, 2026-06-15): allauth's openid_connect
+    provider stores extra_data as {"id_token": ..., "userinfo": {...claims...}},
+    so the groups claim is nested under 'userinfo', NOT top-level. _extract_groups
+    + the login wiring must read it there — otherwise EVERY OIDC user resolves to
+    no tenant (silent MT break). The direct reconcile_tenant unit tests pass a
+    group set, so they never exercised the token-shape parsing that broke."""
+    from web.allauth_adapters import _extract_groups, _claims
+
+    assert _extract_groups({"groups": ["acme"]}) == {"acme"}  # top-level (flat providers)
+    # the real allauth openid_connect shape — groups nested under userinfo
+    assert _extract_groups({"id_token": "x", "userinfo": {"groups": ["acme", "acme-admins"]}}) == {"acme", "acme-admins"}
+    assert _extract_groups({"id_token": "x", "userinfo": {"sub": "1"}}) == set()  # absent -> fail-closed
+    # _claims flattens the openid_connect shape (id_token + userinfo) to the claim dict
+    assert _claims({"id_token": "x", "userinfo": {"email": "a@x", "groups": ["g"]}}).get("email") == "a@x"
+
+
+class ExitModelTests(TestCase):
+    def test_global_and_assigned_exits(self):
+        from users.models import Tenant, Exit
+
+        t = Tenant.objects.create(slug="acme", name="Acme")
+        Exit.objects.create(slug="gwGlobal", name="Shared", is_global=True)
+        d = Exit.objects.create(slug="gw1", name="Acme dedicated")
+        t.exits.add(d)
+        assert set(t.exits.values_list("slug", flat=True)) == {"gw1"}
+        assert set(Exit.objects.filter(is_global=True).values_list("slug", flat=True)) == {"gwGlobal"}
+        # inactive exits still stored but flagged
+        d.active = False
+        d.save()
+        assert Exit.objects.filter(active=True, is_global=False).count() == 0
+
+
+def _viewer(tenant_id=None, is_local_admin=False):
+    return SimpleNamespace(tenant_id=tenant_id, is_local_admin=is_local_admin)
+
+
+class AllowedExitTests(TestCase):
+    def setUp(self):
+        from users.models import Tenant, Exit
+
+        self.t = Tenant.objects.create(slug="acme", name="Acme")
+        self.other = Tenant.objects.create(slug="globex", name="Globex")
+        Exit.objects.create(slug="gwGlobal", name="Shared", is_global=True)
+        self.dedic = Exit.objects.create(slug="gw1", name="Acme dedicated")
+        self.inactive = Exit.objects.create(slug="gwOld", name="Retired", active=False)
+        Exit.objects.create(slug="gwGlobalOld", name="Retired global", is_global=True, active=False)
+        self.t.exits.add(self.dedic)
+        self.t.exits.add(self.inactive)
+
+    def _cfg(self, enabled=True, mode="locked"):
+        return MTConfig(enabled=enabled, mode=mode, default_visibility="", local_admins_manage_all_tenants=True)
+
+    def test_locked_tenant_gets_globals_plus_assigned(self):
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) == {"gwGlobal", "gw1"}
+
+    def test_tenant_without_assigned_gets_only_globals(self):
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.other.id)) == {"gwGlobal"}
+
+    def test_locked_tenantless_gets_globals_only(self):
+        # tenant_id=None exercises the `tid is not None` guard: globals only, no M2M lookup
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=None)) == {"gwGlobal"}
+
+    def test_inactive_assigned_exit_excluded(self):
+        # gwOld is assigned to acme but inactive -> never offered
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert "gwOld" not in allowed_exit_slugs(_viewer(tenant_id=self.t.id))
+
+    def test_inactive_global_exit_excluded(self):
+        # gwGlobalOld is a global exit but inactive -> excluded (active guard on the global branch)
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert "gwGlobalOld" not in allowed_exit_slugs(_viewer(tenant_id=self.t.id))
+
+    def test_shared_mode_is_unrestricted(self):
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg(mode="shared")):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) is None
+
+    def test_mt_disabled_is_unrestricted(self):
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg(enabled=False)):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id)) is None
+
+    def test_local_admin_is_unrestricted(self):
+        with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
+            assert allowed_exit_slugs(_viewer(tenant_id=self.t.id, is_local_admin=True)) is None
