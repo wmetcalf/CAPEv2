@@ -3,6 +3,7 @@ from django.contrib.auth.models import User
 from types import SimpleNamespace
 from unittest import mock
 from django.test import TestCase
+from lib.cuckoo.common.tenancy import MTConfig
 from users.tenancy import allowed_exit_slugs
 
 pytest_plugins = ("mt_test_fixtures",)  # fixtures live in web/mt_test_fixtures.py (not a conftest,
