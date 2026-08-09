@@ -484,6 +484,10 @@ def test_can_ban_user_tenant_admin_cannot_ban_privileged_or_self(mt_enabled):
     assert can_ban_user(admin_a, admin_a.id) is False           # self-ban -> refused
 
 
+def _viewer(tenant_id=None, is_local_admin=False):
+    return SimpleNamespace(tenant_id=tenant_id, is_local_admin=is_local_admin)
+
+
 class AllowedExitTests(TestCase):
     def setUp(self):
         from users.models import Tenant, Exit
