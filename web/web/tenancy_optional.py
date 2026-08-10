@@ -145,12 +145,19 @@ def submission_scope(request):
 
 
 def allowed_exit_slugs(viewer):
-    """Facade for users.tenancy.allowed_exit_slugs. MT-absent => None (unrestricted), matching the
-    resolver's own no-op contract when MT is disabled/shared."""
+    """Facade for users.tenancy.allowed_exit_slugs. Same fail-closed contract as every arm above:
+    MT genuinely absent => None (single-tenant, no exit ACL exists -- today's behaviour); MT enabled
+    but its import chain broke => DENY-ALL, never None.
+
+    None is the UNRESTRICTED sentinel here, and the worker guard's first line is
+    `if allowed_csv is None: return route`. So returning None on ImportError (as this arm originally
+    did) switched the whole tenant egress ACL OFF silently -- every task stamped
+    allowed_exits=NULL, with no error, no log line and no failing test, while MT stayed enabled and
+    locked. An empty set stamps "" instead, which the worker denies."""
     try:
         from users.tenancy import allowed_exit_slugs as real
     except ImportError:
-        return None
+        return frozenset() if _mt_enabled() else None
     return real(viewer)
 
 

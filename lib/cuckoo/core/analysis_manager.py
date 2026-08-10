@@ -62,12 +62,24 @@ def _nexthop_enabled(routing):
 # FORK-ONLY (tenant-egress-exits): NOT part of the upstream nexthop primitive. Keep out of the #3103 regen.
 _POOL_TOKENS = ("nexthop", "roundrobin", "random")
 
+# Routes a tenant under a RESTRICTED exit ACL may still select, because none of them egress to the
+# real internet from a shared address: the no-network dispositions plus inetsim (fakenet). Every
+# other legacy route (internet/tor/vpnX/socks5/tunX) IS real egress that bypasses the tenant's
+# assigned exits, so under a restricted ACL it fails closed -- see _tenant_scope_nexthop.
+_NO_EGRESS_ROUTES = frozenset({"none", "None", "drop", "false", "inetsim"})
+
 
 def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
     """FORK-ONLY tenant exit ACL, applied before the upstream nexthop branch resolves. Returns the
-    route to use: unchanged for legacy/unrestricted, a concrete allowed gateway id for a pool route,
-    or 'drop' (fail closed) when the requested exit is not in the tenant's live allowed set.
-    allowed_csv == None => unrestricted (MT off/shared)."""
+    route to use: unchanged for unrestricted or a no-egress route, a concrete allowed gateway id for
+    a pool route, or 'drop' (fail closed) for anything the tenant's live allowed set does not cover.
+    allowed_csv == None => unrestricted (MT off/shared).
+
+    Called UNCONDITIONALLY by route_network -- do NOT gate it on [nexthop] being enabled. With
+    nexthop off the `gateways` dict is empty, so a gwX route lands on the "allowed exit not
+    configured here" arm and drops. Gating the call let such a task fall through route_network's
+    terminal "Unknown network routing destination" else, which issues no rooter command at all and
+    left the guest on the host's default forwarding (unrestricted egress)."""
     if allowed_csv is None:
         return route
     allowed = {s.strip() for s in allowed_csv.split(",") if s.strip()}
@@ -86,7 +98,11 @@ def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
         return "drop"          # global exit not present here) -- cannot honor it -> fail closed
         # (prevents the case where such a slug == the node default route escalating via
         # _resolve_nexthop's default_policy to a gateway outside the tenant's allowed set)
-    return route               # legacy route (none/tor/vpnX/...) -- never gated
+    # Anything left is a LEGACY route. Passing these through unconditionally (as this arm originally
+    # did) made the entire ACL bypassable in one dropdown click: a tenant locked to gw1 could pick
+    # route=internet and egress from the worker's shared public IP, outside its assigned exit. Only
+    # the no-egress dispositions stay permitted; real-egress legacy routes fail closed.
+    return route if route in _NO_EGRESS_ROUTES else "drop"
 
 
 class CuckooDeadMachine(Exception):
@@ -670,15 +686,22 @@ class AnalysisManager(threading.Thread):
             self.route = self.task.route
 
         # FORK: constrain the route to the task's tenant allowed exits (stamped at submit).
-        # No-op when allowed_exits is NULL (MT off/shared) or the route isn't a nexthop route.
-        # A returned "drop" flows into the none/drop/false dispatch below (fail closed); a concrete
-        # gateway id flows into the _nexthop_enabled branch and _resolve_nexthop binds it.
-        if _nexthop_enabled(routing):
-            from lib.cuckoo.core.rooter import gateways as _gws, _gw_live as _live
-            self.route = _tenant_scope_nexthop(
-                self.route, getattr(self.task, "allowed_exits", None), _gws,
-                lambda g: _live(_gws[g]),
-            )
+        # No-op when allowed_exits is NULL (MT off/shared). A returned "drop" flows into the
+        # none/drop/false dispatch below (fail closed); a concrete gateway id flows into the
+        # _nexthop_enabled branch and _resolve_nexthop binds it.
+        #
+        # UNCONDITIONAL -- deliberately NOT gated on _nexthop_enabled(routing). When [nexthop] is
+        # off, `gateways` is empty and an ACL-stamped gwX route drops. Gating this let such a task
+        # reach the terminal "Unknown network routing destination" else, which issues NO rooter
+        # command, leaving the guest on the host's default forwarding with full egress. That is the
+        # live posture while the gateway AMI bake is pending: UI nodes already stamp the ACL, workers
+        # still run nexthop off.
+        from lib.cuckoo.core.rooter import gateways as _gws, _gw_live as _live
+
+        self.route = _tenant_scope_nexthop(
+            self.route, getattr(self.task, "allowed_exits", None), _gws,
+            lambda g: _live(_gws[g]),
+        )
 
         if self.route in ("none", "None", "drop", "false"):
             self.interface = None

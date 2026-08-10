@@ -229,9 +229,16 @@ def allowed_exit_slugs(viewer):
     cfg = multitenancy_config()
     if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
         return None
+    # Locked mode with NO resolvable tenant => deny-all, NOT the global exit set. Covers the
+    # anonymous viewer (viewer_for(AnonymousUser) -> tenant_id=None, reachable on a
+    # token_auth_enabled=no node where DRF leaves the request anonymous), a UserProfile with no
+    # tenant, a DEACTIVATED tenant (viewer_for deliberately maps that to tenant_id=None), and the
+    # tenant_id=0 sentinel the tenancy_optional ImportError arm returns. Returning globals here let
+    # an unauthenticated caller detonate with real egress through a shared exit.
+    tid = getattr(viewer, "tenant_id", None)
+    if not tid:
+        return set()
     active = Exit.objects.filter(active=True)
     slugs = set(active.filter(is_global=True).values_list("slug", flat=True))
-    tid = getattr(viewer, "tenant_id", None)
-    if tid is not None:
-        slugs |= set(active.filter(tenants__id=tid).values_list("slug", flat=True))
+    slugs |= set(active.filter(tenants__id=tid).values_list("slug", flat=True))
     return slugs

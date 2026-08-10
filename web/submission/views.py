@@ -299,44 +299,42 @@ def force_int(value):
 
 _POOL_TOKENS = ("nexthop", "roundrobin", "random")
 
-
-def _known_gateway_slugs():
-    """The submit-tier gateway universe used to decide 'is this route a gateway (gate it) vs a
-    legacy route (pass it through)'. UNION of (a) the configured [nexthop] gateways= ids -- the SAME
-    set the worker's rooter loads (rooter.gateways is empty in the web process, so we read the
-    routing config, mirroring the gateways_data picker) -- and (b) every Exit slug in the DB
-    (active OR inactive). Gating on the union closes the fail-open gaps where a live [gwX] lacks an
-    active Exit row, or an Exit was deactivated but the [gwX] is still configured+live on workers."""
-    slugs = set()
-    try:
-        raw = str(getattr(routing.nexthop, "gateways", "") or "")
-        slugs |= {s.strip() for s in raw.split(",") if s.strip()}
-    except Exception:
-        pass
-    from users.models import Exit
-
-    slugs |= set(Exit.objects.values_list("slug", flat=True))
-    return slugs
+# Mirrors lib/cuckoo/core/analysis_manager._NO_EGRESS_ROUTES -- KEEP IN SYNC. Duplicated rather than
+# imported for the same reason _POOL_TOKENS above is: importing analysis_manager into the web process
+# drags in the rooter/machinery import chain. Routes here egress nowhere real (no-network
+# dispositions plus inetsim/fakenet), so a tenant under a restricted exit ACL may still pick them.
+_NO_EGRESS_ROUTES = frozenset({"none", "None", "drop", "false", "inetsim"})
 
 
-def validate_and_scope_route(route, allowed_slugs, known_slugs=None):
+def validate_and_scope_route(route, allowed_slugs):
     """Enforce the tenant exit ACL for a submitted route. `allowed_slugs` is the tenant's allowed
-    exit-slug set (from allowed_exit_slugs), or None (unrestricted: MT off/shared). `known_slugs` is
-    the gateway universe (defaults to _known_gateway_slugs(); injectable for tests). Returns the
-    route unchanged if permitted; raises ValueError if the tenant may not use it. Only nexthop
-    routes (a gateway slug or a pool token) are gated -- legacy routes (none/internet/tor/inetsim/
-    vpnX/socks5) pass through. The worker's route_network guard is the authoritative fail-closed
-    boundary; this layer rejects early so the user gets a clear error instead of a silent drop."""
+    exit-slug set (from allowed_exit_slugs), or None (unrestricted: MT off/shared). Returns the route
+    unchanged if permitted; raises ValueError if the tenant may not use it. The worker's
+    route_network guard is the authoritative fail-closed boundary; this layer rejects early so the
+    user gets a clear error instead of a silent drop.
+
+    DENY BY DEFAULT under a restricted ACL. The permitted universe is exactly: the tenant's own exit
+    slugs, the pool tokens, and _NO_EGRESS_ROUTES. This replaces the original
+    `route in known_slugs and route not in allowed_slugs` test -- and the _known_gateway_slugs()
+    helper that fed it, now deleted -- which was wrong three ways:
+      * real-egress legacy routes (internet/tor/vpnX/socks5) were never in known_slugs, so they
+        passed through -- the ACL was bypassable in one dropdown click;
+      * known_slugs unioned in every raw Exit.slug, so an Exit row named `internet` made that
+        legitimate route rejected fleet-wide for every tenant not assigned it;
+      * raising only for slugs that exist made this endpoint an ORACLE -- "not permitted" vs
+        "accepted" let any tenant dictionary-walk the full Exit inventory, including other tenants'
+        dedicated exit names and retired ones. The message below is deliberately uniform so a
+        permitted-but-absent route and a real-but-foreign route are indistinguishable."""
     if allowed_slugs is None:
         return route
     if route in _POOL_TOKENS:
         if not allowed_slugs:
             raise ValueError("tenant has no egress exits assigned")
         return route
-    if known_slugs is None:
-        known_slugs = _known_gateway_slugs()
-    if route in known_slugs and route not in allowed_slugs:
-        raise ValueError(f"exit '{route}' is not permitted for this tenant")
+    if route in _NO_EGRESS_ROUTES:
+        return route
+    if route not in allowed_slugs:
+        raise ValueError("the requested network route is not permitted for this tenant")
     return route
 
 

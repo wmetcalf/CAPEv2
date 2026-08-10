@@ -1,54 +1,76 @@
+"""Submit-tier tenant egress-exit ACL (submission.views.validate_and_scope_route).
+
+The validator is DENY-BY-DEFAULT: under a restricted ACL the permitted universe is exactly the
+tenant's own exit slugs + the pool tokens + _NO_EGRESS_ROUTES. Everything else raises, whether or
+not it names a real Exit row.
+
+These assertions were rewritten when the xhigh review found the original
+`route in known_slugs and route not in allowed_slugs` formulation fail-open (real-egress legacy
+routes like internet/tor/vpn0 were never in known_slugs, so they sailed past the ACL) and an
+existence oracle. The old file pinned that behaviour as CORRECT -- see
+test_non_nexthop_routes_untouched below, now inverted -- which is why the suite went green on a
+bypassable ACL. The gateway-universe parameter (and the _known_gateway_slugs helper that computed
+it) no longer exists: deny-by-default needs no universe.
+"""
 import pytest
 
-from submission.views import validate_and_scope_route
-
-# The gateway-slug universe. Passed explicitly so these stay hermetic unit tests (no DB): in the
-# real web process it defaults to the active Exit slugs (rooter.gateways is empty in the web tier).
-_KNOWN = {"gw1", "gw2", "gwGlobal"}
+from submission.views import _NO_EGRESS_ROUTES, validate_and_scope_route
 
 
 def test_cross_tenant_route_rejected():
     # allowed set = {gw1, gwGlobal}; requesting gw2 (another tenant's gateway) must raise
     with pytest.raises(ValueError):
-        validate_and_scope_route("gw2", {"gw1", "gwGlobal"}, known_slugs=_KNOWN)
+        validate_and_scope_route("gw2", {"gw1", "gwGlobal"})
 
 
 def test_own_and_global_and_pool_ok():
-    assert validate_and_scope_route("gw1", {"gw1", "gwGlobal"}, known_slugs=_KNOWN) == "gw1"
-    assert validate_and_scope_route("gwGlobal", {"gw1", "gwGlobal"}, known_slugs=_KNOWN) == "gwGlobal"
-    assert validate_and_scope_route("nexthop", {"gw1"}, known_slugs=_KNOWN) == "nexthop"     # pool ok when tenant has >=1 exit
-    assert validate_and_scope_route("roundrobin", {"gw1"}, known_slugs=_KNOWN) == "roundrobin"
+    assert validate_and_scope_route("gw1", {"gw1", "gwGlobal"}) == "gw1"
+    assert validate_and_scope_route("gwGlobal", {"gw1", "gwGlobal"}) == "gwGlobal"
+    assert validate_and_scope_route("nexthop", {"gw1"}) == "nexthop"  # pool ok when tenant has >=1 exit
+    assert validate_and_scope_route("roundrobin", {"gw1"}) == "roundrobin"
 
 
 def test_pool_with_empty_allowed_set_rejected():
     with pytest.raises(ValueError):
-        validate_and_scope_route("nexthop", set(), known_slugs=_KNOWN)
+        validate_and_scope_route("nexthop", set())
 
 
 def test_unrestricted_passes_through():
-    # allowed is None (MT off/shared) => any route accepted, legacy routes untouched
-    assert validate_and_scope_route("gw2", None, known_slugs=_KNOWN) == "gw2"
-    assert validate_and_scope_route("vpn0", None, known_slugs=_KNOWN) == "vpn0"
+    # allowed is None (MT off/shared/local-admin) => any route accepted, legacy routes untouched
+    assert validate_and_scope_route("gw2", None) == "gw2"
+    assert validate_and_scope_route("vpn0", None) == "vpn0"
 
 
-def test_non_nexthop_routes_untouched():
-    # a legacy route (vpn/tor/none) is never gated by exit ACLs even when restricted
-    assert validate_and_scope_route("tor", {"gw1"}, known_slugs=_KNOWN) == "tor"
-    assert validate_and_scope_route("none", {"gw1"}, known_slugs=_KNOWN) == "none"
-
-
-@pytest.mark.django_db
-def test_default_known_slugs_from_db():
-    # Exercise the DEFAULT known_slugs path (_known_gateway_slugs -> Exit table union), the one that
-    # actually runs in production when index() calls the validator without an explicit universe.
-    from users.models import Exit
-
-    Exit.objects.create(slug="gw1", active=True)
-    Exit.objects.create(slug="gw2", active=True)
-    Exit.objects.create(slug="gwOld", active=False)
+@pytest.mark.parametrize("route", ["internet", "tor", "vpn0", "socks5", "tun3", "all_exitnodes"])
+def test_real_egress_legacy_routes_are_gated(route):
+    """INVERTED from the original test_non_nexthop_routes_untouched, which asserted
+    `validate_and_scope_route("tor", {"gw1"}) == "tor"`. A tenant confined to gw1 that can pick
+    route=tor/internet/vpn0 egresses outside its assigned exit -- the ACL meant nothing."""
     with pytest.raises(ValueError):
-        validate_and_scope_route("gw2", {"gw1"})        # foreign active exit rejected via the DB universe
+        validate_and_scope_route(route, {"gw1"})
+
+
+@pytest.mark.parametrize("route", sorted(_NO_EGRESS_ROUTES))
+def test_no_egress_routes_remain_permitted(route):
+    """The half of the original assertion that was right: route=none et al egress nowhere, so
+    gating them would just break submission for every restricted tenant."""
+    assert validate_and_scope_route(route, {"gw1"}) == route
+
+
+def test_unknown_slug_is_denied_not_accepted():
+    """Replaces test_default_known_slugs_from_db, which needed the DB to decide whether a route was
+    'known' (and passed an unknown one straight through: the old file asserted
+    `validate_and_scope_route("nonexit-legacy-route", {"gw1"}) == "nonexit-legacy-route"`).
+    Deny-by-default needs no DB at all, so this is hermetic."""
     with pytest.raises(ValueError):
-        validate_and_scope_route("gwOld", {"gw1"})      # deactivated exit is STILL gated (fail-closed)
-    assert validate_and_scope_route("gw1", {"gw1"}) == "gw1"
-    assert validate_and_scope_route("nonexit-legacy-route", {"gw1"}) == "nonexit-legacy-route"
+        validate_and_scope_route("nonexit-legacy-route", {"gw1"})
+
+
+def test_no_existence_oracle():
+    """A real-but-foreign slug and a nonexistent one must be indistinguishable to the caller,
+    otherwise the endpoint enumerates the Exit inventory (incl. other tenants' dedicated exits)."""
+    with pytest.raises(ValueError) as foreign:
+        validate_and_scope_route("gw2", {"gw1"})
+    with pytest.raises(ValueError) as absent:
+        validate_and_scope_route("gw2-does-not-exist", {"gw1"})
+    assert str(foreign.value) == str(absent.value)
