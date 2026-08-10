@@ -136,3 +136,96 @@ def test_tasks_create_static_leaves_null_for_an_unrestricted_caller(monkeypatch)
 
     views.tasks_create_static(req)
     assert "allowed_exits" in captured and captured["allowed_exits"] is None
+
+
+# ------------------------------------- control-plane relay of the exit ACL (central mode) ----
+# In central mode the broker re-submits a UI task to a worker whose Django auth DB is empty and
+# whose apiv2 is AllowAny. viewer_for() there is anonymous+tenantless, so allowed_exit_slugs()
+# returns DENY-ALL -- correct for a real anonymous caller, fatal for the relay: every central
+# submission would be refused with error=True/HTTP 200, which the dispatcher's raise_for_status
+# cannot detect. The relay forwards the stamp the central UI computed instead, trusted ONLY behind
+# the [api] control_plane_token.
+_CP_SECRET = "cp-secret-for-tests"
+
+
+def _cp_request(monkeypatch, token=None, body=None):
+    monkeypatch.setattr(views, "apiconf", SimpleNamespace(api={"control_plane_token": _CP_SECRET}))
+    req = APIRequestFactory().post("/apiv2/tasks/create/url/", body or {})
+    if token is not None:
+        req.META["HTTP_AUTHORIZATION"] = f"token {token}"
+    # DRF Request wrapper so .data works the way the endpoints use it
+    from rest_framework.request import Request
+    from rest_framework.parsers import FormParser, MultiPartParser
+
+    return Request(req, parsers=[FormParser(), MultiPartParser()])
+
+
+def test_relay_stamp_is_honoured_with_a_valid_token(monkeypatch):
+    r = _cp_request(monkeypatch, token=_CP_SECRET, body={"allowed_exits": "gw1,gwGlobal"})
+    allowed, csv = views._submission_exit_acl(r)
+    assert allowed == {"gw1", "gwGlobal"}
+    assert csv == "gw1,gwGlobal"
+
+
+def test_relay_deny_all_stamp_survives_the_round_trip(monkeypatch):
+    """A tenant with zero exits stamps "" (deny-all). It must NOT collapse to None/unrestricted."""
+    r = _cp_request(monkeypatch, token=_CP_SECRET, body={"allowed_exits": ""})
+    allowed, csv = views._submission_exit_acl(r)
+    assert allowed == set() and csv == ""
+
+
+def test_an_unauthenticated_caller_cannot_self_assert_an_acl(monkeypatch):
+    """THE new trust surface. The worker's apiv2 is AllowAny, so if a bare allowed_exits field were
+    honoured, any caller could widen its own ACL and bypass the whole feature. Without a valid
+    token the field must be ignored and the ACL derived from the caller's own viewer."""
+    monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: {"only-mine"})
+    r = _cp_request(monkeypatch, token=None, body={"allowed_exits": "gw-i-should-not-have"})
+    allowed, csv = views._submission_exit_acl(r)
+    assert allowed == {"only-mine"} and csv == "only-mine"
+
+
+def test_a_wrong_token_cannot_self_assert_an_acl(monkeypatch):
+    monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: {"only-mine"})
+    r = _cp_request(monkeypatch, token="not-the-secret", body={"allowed_exits": "gw-nope"})
+    allowed, _ = views._submission_exit_acl(r)
+    assert allowed == {"only-mine"}
+
+
+def test_an_empty_configured_secret_disables_the_relay_path(monkeypatch):
+    """FAIL-CLOSED: an unset [api] control_plane_token must never match a presented empty bearer."""
+    monkeypatch.setattr(views, "apiconf", SimpleNamespace(api={"control_plane_token": ""}))
+    monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: {"only-mine"})
+    req = APIRequestFactory().post("/apiv2/tasks/create/url/", {"allowed_exits": "gw-nope"})
+    req.META["HTTP_AUTHORIZATION"] = "token "
+    from rest_framework.request import Request
+    from rest_framework.parsers import FormParser, MultiPartParser
+
+    allowed, _ = views._submission_exit_acl(Request(req, parsers=[FormParser(), MultiPartParser()]))
+    assert allowed == {"only-mine"}
+    assert views._control_plane_authenticated(Request(req, parsers=[FormParser()])) is False
+
+
+def test_relay_without_a_stamp_is_unrestricted_for_rolling_upgrades(monkeypatch):
+    """New worker + older bridge that forwards nothing must keep detonating (pre-feature
+    behaviour), not fail closed on every task. The deploy gate asserts the stamp is really wired."""
+    r = _cp_request(monkeypatch, token=_CP_SECRET, body={})
+    allowed, csv = views._submission_exit_acl(r)
+    assert allowed is None and csv is None
+
+
+def test_anonymous_locked_worker_would_deny_without_the_relay(monkeypatch):
+    """The regression this whole mechanism exists to prevent: prove the un-relayed path really is
+    deny-all for an anonymous caller on an MT-enabled+locked node, so nobody 'simplifies' the relay
+    away later."""
+    from lib.cuckoo.common.tenancy import exit_route_permitted
+
+    monkeypatch.setattr(views, "apiconf", SimpleNamespace(api={"control_plane_token": _CP_SECRET}))
+    monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: set())  # locked + tenantless
+    req = APIRequestFactory().post("/apiv2/tasks/create/url/", {})
+    from rest_framework.request import Request
+    from rest_framework.parsers import FormParser
+
+    allowed, _ = views._submission_exit_acl(Request(req, parsers=[FormParser()]))
+    assert allowed == set()
+    # ...and vpn0 (what the dispatcher sends today) would be refused outright
+    assert exit_route_permitted("vpn0", allowed) is False

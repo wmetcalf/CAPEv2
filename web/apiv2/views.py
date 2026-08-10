@@ -41,6 +41,7 @@ _UI_INTERNAL_AUTH = [SessionAuthentication] + ([ApiKeyAuthentication] if ApiKeyA
 
 from web.tenancy_optional import submission_scope, can_view_task, can_manage_task, can_delete_task, can_set_visibility_task, can_view_sample, viewer_for, allowed_exit_slugs
 from web.tenancy_optional import VISIBILITIES, TENANT, multitenancy_config
+from lib.cuckoo.common.tenancy_optional import parse_allowed_exits
 
 # Shared central-mode cross-store info.id collision seam (report-family reads route through it) --
 # see analysis.central_views. The apiv2 report-family passes no `extra` (extra defaults to None).
@@ -106,6 +107,59 @@ def _strip_mt_task_fields(d):
         d.pop("visibility", None)
         d.pop("allowed_exits", None)
     return d
+
+
+def _control_plane_authenticated(request) -> bool:
+    """True iff the caller presented the configured [api] control_plane_token shared secret.
+
+    The same machine-to-machine primitive tasks_machine uses, factored out. It works even under
+    token_auth_enabled=no (where DRF leaves the request anonymous), which is exactly the central
+    worker's posture. FAIL-CLOSED: an unset/empty secret disables this path entirely -- never
+    treat "" == "" as a match.
+    """
+    from django.utils.crypto import constant_time_compare
+
+    secret = str(apiconf.api.get("control_plane_token") or "")
+    if not secret:
+        return False
+    auth = request.META.get("HTTP_AUTHORIZATION", "") or ""
+    presented = auth[6:].strip() if auth[:6].lower() == "token " else ""
+    return bool(presented) and constant_time_compare(presented, secret)
+
+
+def _submission_exit_acl(request):
+    """Resolve (allowed_slugs, allowed_csv) for a submission to THIS node.
+
+    Two callers, two very different situations:
+
+    * A NORMAL api caller is the submitter, so the ACL derives from its own viewer.
+
+    * A CONTROL-PLANE RELAY (central mode: the broker re-submitting a task a tenant created on the
+      central UI) is NOT the submitter. This worker's Django auth DB is empty and its apiv2 runs
+      AllowAny, so viewer_for() here resolves to an anonymous, tenantless viewer -- for which
+      allowed_exit_slugs() correctly returns DENY-ALL. Deriving from it would reject every central
+      submission at the door (the endpoint returns error=True with HTTP 200, which the dispatcher's
+      raise_for_status cannot see, so the whole fleet would silently stop detonating). The relay
+      therefore FORWARDS the stamp the central UI already computed for the real submitter.
+
+    The forwarded value is trusted ONLY behind the shared secret. Without it an `allowed_exits`
+    field in the request body is IGNORED -- honouring it on an AllowAny apiv2 would let any caller
+    widen its own ACL, a self-service bypass of the entire feature.
+
+    A control-plane caller that forwards NOTHING yields unrestricted (None), matching pre-feature
+    behaviour. That keeps a rolling upgrade (new worker + older bridge) from becoming a fleet
+    outage; the deploy gate asserts a central task actually lands a non-NULL allowed_exits, so the
+    wiring is verified rather than assumed.
+    """
+    if _control_plane_authenticated(request):
+        data = getattr(request, "data", None)
+        raw = data.get("allowed_exits") if hasattr(data, "get") else None
+        if raw is None:
+            return None, None
+        csv = str(raw)
+        return parse_allowed_exits(csv), csv
+    allowed = allowed_exit_slugs(viewer_for(request.user))
+    return allowed, (",".join(sorted(allowed)) if allowed is not None else None)
 
 
 def _strip_mt_sample_fields(d):
@@ -415,8 +469,7 @@ def tasks_create_static(request):
     # one, and demux_sample_and_add_to_db passes route=None, which the worker resolves to its node
     # default. Every sibling endpoint (including the add_static call inside tasks_create_file) stamps
     # it; this was the only submit path that did not.
-    _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
-    _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+    _allowed_exits, _allowed_exits_csv = _submission_exit_acl(request)
 
     files = request.FILES.getlist("file")
     extra_details = {}
@@ -514,12 +567,11 @@ def tasks_create_file(request):
         # Tenant egress ACL (API parity with the web submit path): reject a foreign exit and
         # stamp the tenant's allowed set onto every task created below.
         from submission.views import validate_and_scope_route
-        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        _allowed_exits, _allowed_exits_csv = _submission_exit_acl(request)
         try:
             route = validate_and_scope_route(route, _allowed_exits)
         except ValueError as exc:
             return Response({"error": True, "error_value": str(exc)})
-        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
 
         details = {
             "errors": [],
@@ -677,12 +729,11 @@ def tasks_create_url(request):
 
         # Tenant egress ACL (API parity with the web submit path).
         from submission.views import validate_and_scope_route
-        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        _allowed_exits, _allowed_exits_csv = _submission_exit_acl(request)
         try:
             route = validate_and_scope_route(route, _allowed_exits)
         except ValueError as exc:
             return Response({"error": True, "error_value": str(exc)})
-        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
 
         task_ids = []
         task_machines = []
@@ -797,12 +848,11 @@ def tasks_create_dlnexec(request):
 
         # Tenant egress ACL: validate BEFORE process_new_dlnexec_task, which fetches via the route.
         from submission.views import validate_and_scope_route
-        _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+        _allowed_exits, _allowed_exits_csv = _submission_exit_acl(request)
         try:
             route = validate_and_scope_route(route, _allowed_exits)
         except ValueError as exc:
             return Response({"error": True, "error_value": str(exc)})
-        _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
 
         details = {}
         task_machines = []
@@ -3669,12 +3719,11 @@ def tasks_download_services(request):
     # Tenant egress ACL (API parity): validate the requested route + stamp the tenant's allowed set.
     # download_from_3rdparty -> download_file re-parses route from request.POST, so validate that.
     from submission.views import validate_and_scope_route
-    _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+    _allowed_exits, _allowed_exits_csv = _submission_exit_acl(request)
     try:
         validate_and_scope_route(request.POST.get("route") or "none", _allowed_exits)
     except ValueError as exc:
         return Response({"error": True, "error_value": str(exc)})
-    _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
 
     details = {}
     task_machines = []
