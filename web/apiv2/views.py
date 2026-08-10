@@ -93,13 +93,18 @@ def _deny_manage(request, task_id):
 
 def _strip_mt_task_fields(d):
     """Task.to_dict() now emits the multitenancy columns ("tenant_id",
-    "visibility"). On a DEFAULT (multitenancy-disabled) install these keys did
-    not exist upstream, so drop them from any api response payload to keep the
-    output byte-identical to upstream base. When MT is enabled the keys are part
-    of the tenant model and are preserved untouched."""
+    "visibility", "allowed_exits"). On a DEFAULT (multitenancy-disabled) install
+    these keys did not exist upstream, so drop them from any api response payload
+    to keep the output byte-identical to upstream base. When MT is enabled the keys
+    are part of the tenant model and are preserved untouched.
+
+    "allowed_exits" arrived with the tenant egress ACL and was missed here, so an
+    MT-disabled install started emitting a column upstream never had -- the exact
+    compatibility break this helper exists to prevent."""
     if not multitenancy_config().enabled and isinstance(d, dict):
         d.pop("tenant_id", None)
         d.pop("visibility", None)
+        d.pop("allowed_exits", None)
     return d
 
 
@@ -402,6 +407,17 @@ def tasks_create_static(request):
         _tenant_id, _visibility = submission_scope(request)
     except ValueError:
         return Response({"error": True, "error_value": "invalid visibility"})
+
+    # Tenant egress ACL: stamp the tenant's allowed exits like every other submit endpoint. This one
+    # takes no `route` argument, so there is nothing to validate -- but leaving the column NULL means
+    # UNRESTRICTED, and a NULL stamp is not a safe default just because static extraction does not
+    # detonate today: the row is a normal task that can be rescheduled or resubmitted as a dynamic
+    # one, and demux_sample_and_add_to_db passes route=None, which the worker resolves to its node
+    # default. Every sibling endpoint (including the add_static call inside tasks_create_file) stamps
+    # it; this was the only submit path that did not.
+    _allowed_exits = allowed_exit_slugs(viewer_for(request.user))
+    _allowed_exits_csv = ",".join(sorted(_allowed_exits)) if _allowed_exits is not None else None
+
     files = request.FILES.getlist("file")
     extra_details = {}
     task_ids = []
@@ -418,6 +434,7 @@ def tasks_create_static(request):
                     user_id=request.user.id or 0,
                     tenant_id=_tenant_id,
                     visibility=_visibility,
+                    allowed_exits=_allowed_exits_csv,
                 )
                 task_ids.extend(task_id)
                 if extra_details.get("erros"):
@@ -3114,7 +3131,14 @@ def exit_nodes_list(request):
 def tenant_exits_list(request):
     """List the egress exits the caller's tenant may use (global + assigned, active) for the nexthop
     [gwX] pool. Mirrors exit_nodes_list. Unrestricted callers (MT off/shared/local-admin) get the
-    full configured [nexthop] gateways= pool."""
+    full configured [nexthop] gateways= pool.
+
+    Gated on the SAME [list_exitnodes] toggle as exit_nodes_list: this is the tenant-scoped analogue
+    of that endpoint, so an operator who turned exit-node enumeration off should not find it still
+    reachable here. It shipped with no gate at all, unlike every sibling in this module."""
+    if not apiconf.list_exitnodes.get("enabled"):
+        return Response({"error": True, "error_value": "Exit nodes list API is disabled"})
+
     allowed = allowed_exit_slugs(viewer_for(request.user))
     if allowed is None:
         try:

@@ -937,6 +937,33 @@ class TasksMixIn:
         self.session.add(task)
         return task
 
+    def restamp_pending_allowed_exits(self, tenant_id: int, allowed_exits: Optional[str]) -> int:
+        """Re-stamp allowed_exits on every PENDING task of `tenant_id`. Returns the number updated.
+
+        The exit ACL is snapshotted onto the task row at submit time, which means revoking an exit
+        from a tenant did NOT affect work already queued: a task submitted minutes before the
+        revocation still carried the old allowed set and the worker honoured it, so an exit could stay
+        in use long after being taken away (queue depth, not policy, decided for how long).
+
+        Only PENDING tasks are re-stamped. A RUNNING task has already had its route bound by
+        route_network and rewriting the row would not move the live guest; a finished one is history.
+        That leaves a bounded window (an in-flight analysis completes under the old ACL) rather than
+        an unbounded one, which is the same guarantee the visibility toggle gives.
+        """
+        stmt = (
+            update(Task)
+            .where(Task.tenant_id == tenant_id)
+            .where(Task.status == TASK_PENDING)
+            .values(allowed_exits=allowed_exits)
+        )
+        updated = self.session.execute(stmt).rowcount or 0
+        if updated:
+            log.info(
+                "re-stamped allowed_exits=%r on %d pending task(s) for tenant %s after an exit "
+                "assignment change", allowed_exits, updated, tenant_id,
+            )
+        return updated
+
     def set_status(self, task_id: int, status) -> Optional[Task]:
         """Set task status.
         @param task_id: task identifier

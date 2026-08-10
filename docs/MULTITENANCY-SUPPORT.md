@@ -83,6 +83,17 @@ will simply not be visible. Adding real support is tracked as future work.
   distributed multitenant analysis. (Our central path keys by `job_id` and never
   sets `main_task_id`, so it is unaffected.)
 
+  The **egress exit ACL** fails closed on this path too, and did not always: the
+  relay re-submits through the worker's `apiv2` as its own API principal — usually
+  an admin, whose `allowed_exit_slugs` is `None` — so the worker's task row was
+  stamped UNRESTRICTED and a tenant confined to one exit egressed through the
+  worker's default route. `_task_allowed_exits` now treats an unstamped
+  `main_task_id` task as **deny-all** while MT is enabled: no-egress dispositions
+  (`none`/`drop`/`inetsim`) still run, real egress drops. Forwarding the stamp
+  instead is deliberately *not* done — that would make `allowed_exits` a
+  client-supplied field on the worker's submit API, so any API caller could assert
+  its own exit set. MT-disabled installs are unaffected.
+
 ## Behavior notes
 
 - **Statistics API shape (shared mode).** With MT enabled in `shared` mode, the

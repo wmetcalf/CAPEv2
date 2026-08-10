@@ -106,11 +106,17 @@ def test_gateways_picker_filtered_to_tenant(cape_db, mt_enabled, client, monkeyp
 
 
 @pytest.mark.django_db
-def test_apiv2_tenant_exits_list_scoped(cape_db, mt_enabled):
+def test_apiv2_tenant_exits_list_scoped(cape_db, mt_enabled, monkeypatch):
     # The read endpoint lists the caller's usable exits: own assigned + global, never another tenant's.
+    from types import SimpleNamespace
+
     from rest_framework.test import APIRequestFactory, force_authenticate
     import apiv2.views as av
     from users.models import Exit, Tenant
+
+    # The endpoint is gated on [list_exitnodes] (same toggle as its sibling exit_nodes_list), which
+    # ships disabled, so enable it here. Before that gate existed this test passed without it.
+    monkeypatch.setattr(av, "apiconf", SimpleNamespace(list_exitnodes={"enabled": True}))
 
     acme = Tenant.objects.create(slug="acme", name="Acme")
     gw1 = Exit.objects.create(slug="gw1")

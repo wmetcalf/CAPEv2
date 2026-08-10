@@ -1,7 +1,11 @@
+import logging
+
 from django.contrib.auth.models import User
 from django.db import models
-from django.db.models.signals import post_save
+from django.db.models.signals import m2m_changed, post_save
 from django.dispatch import receiver
+
+log = logging.getLogger(__name__)
 
 
 class Tenant(models.Model):
@@ -59,3 +63,64 @@ def create_or_update_user_profile(sender, instance, created, **kwargs):
         UserProfile.objects.create(user=instance)
     if hasattr(instance, "userprofile"):
         instance.userprofile.save()
+
+
+class _TenantViewer:
+    """Minimal viewer for allowed_exit_slugs: a plain tenant member, never a local admin (which
+    would resolve to None/unrestricted and wipe the stamp instead of narrowing it)."""
+
+    is_local_admin = False
+
+    def __init__(self, tenant_id):
+        self.tenant_id = tenant_id
+
+
+@receiver(m2m_changed, sender=Tenant.exits.through)
+def restamp_pending_tasks_on_exit_change(sender, instance, action, reverse, **kwargs):
+    """Push an exit-assignment change onto the tenant's ALREADY-QUEUED tasks.
+
+    The ACL is snapshotted onto Task.allowed_exits at submit time, so without this a revocation only
+    affected future submissions: anything already sitting in the queue kept the old allowed set and
+    the worker honoured it, meaning a revoked exit stayed usable for as long as the backlog lasted.
+    Re-stamp pending rows so revocation takes effect on the queue as well.
+
+    Fires on add/remove/clear (an ADD must propagate too, or a newly-granted exit would be unusable
+    by queued tasks for no reason). Runs for both directions of the M2M -- editing Tenant.exits in
+    the Tenant admin, or Exit.tenants from the other side.
+    """
+    if action not in ("post_add", "post_remove", "post_clear"):
+        return
+
+    if reverse:
+        # instance is an Exit; the affected tenants are the pk_set (or, for a clear, unknowable --
+        # Django has already dropped the rows, so fall back to every tenant).
+        pks = kwargs.get("pk_set") or None
+        tenants = Tenant.objects.filter(pk__in=pks) if pks else Tenant.objects.all()
+    else:
+        tenants = [instance]
+
+    from lib.cuckoo.common.tenancy import multitenancy_config
+
+    if not multitenancy_config().enabled:
+        return
+
+    from lib.cuckoo.core.database import Database
+    from users.tenancy import allowed_exit_slugs
+
+    db = Database()
+    for tenant in tenants:
+        # Resolve through the SAME resolver the submit path uses, so the re-stamp cannot drift from
+        # what a fresh submission would compute (globals U assigned, active only).
+        slugs = allowed_exit_slugs(_TenantViewer(tenant.id))
+        csv = ",".join(sorted(slugs)) if slugs is not None else None
+        try:
+            db.restamp_pending_allowed_exits(tenant.id, csv)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            # Never let a task-store failure break the admin save; the ACL is still enforced at the
+            # worker for every FUTURE task, and the stale pending rows are logged here.
+            log.exception(
+                "failed to re-stamp pending tasks for tenant %s after an exit assignment change; "
+                "queued tasks keep their previous allowed_exits until they run", tenant.id,
+            )

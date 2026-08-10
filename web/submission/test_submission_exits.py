@@ -1,7 +1,7 @@
 """Submit-tier tenant egress-exit ACL (submission.views.validate_and_scope_route).
 
 The validator is DENY-BY-DEFAULT: under a restricted ACL the permitted universe is exactly the
-tenant's own exit slugs + the pool tokens + _NO_EGRESS_ROUTES. Everything else raises, whether or
+tenant's own exit slugs + the pool tokens + NO_EGRESS_ROUTES. Everything else raises, whether or
 not it names a real Exit row.
 
 These assertions were rewritten when the xhigh review found the original
@@ -14,7 +14,8 @@ it) no longer exists: deny-by-default needs no universe.
 """
 import pytest
 
-from submission.views import _NO_EGRESS_ROUTES, validate_and_scope_route
+from lib.cuckoo.common.tenancy import NO_EGRESS_ROUTES
+from submission.views import validate_and_scope_route
 
 
 def test_cross_tenant_route_rejected():
@@ -50,7 +51,7 @@ def test_real_egress_legacy_routes_are_gated(route):
         validate_and_scope_route(route, {"gw1"})
 
 
-@pytest.mark.parametrize("route", sorted(_NO_EGRESS_ROUTES))
+@pytest.mark.parametrize("route", sorted(NO_EGRESS_ROUTES))
 def test_no_egress_routes_remain_permitted(route):
     """The half of the original assertion that was right: route=none et al egress nowhere, so
     gating them would just break submission for every restricted tenant."""

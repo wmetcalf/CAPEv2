@@ -3,7 +3,13 @@
 The web/apiv2 layers call can_view_task / can_toggle_task; the actual policy lives
 in the framework-neutral predicate so the broker can reuse it unchanged.
 """
+import logging
+
+from django.db import DatabaseError
+
 from lib.cuckoo.common.tenancy import Viewer, Job, can_read, can_toggle, can_delete, can_set_visibility, multitenancy_config
+
+log = logging.getLogger(__name__)
 
 
 def viewer_for(user) -> Viewer:
@@ -238,7 +244,22 @@ def allowed_exit_slugs(viewer):
     tid = getattr(viewer, "tenant_id", None)
     if not tid:
         return set()
-    active = Exit.objects.filter(active=True)
-    slugs = set(active.filter(is_global=True).values_list("slug", flat=True))
-    slugs |= set(active.filter(tenants__id=tid).values_list("slug", flat=True))
+    try:
+        active = Exit.objects.filter(active=True)
+        slugs = set(active.filter(is_global=True).values_list("slug", flat=True))
+        slugs |= set(active.filter(tenants__id=tid).values_list("slug", flat=True))
+    except DatabaseError:
+        # users migration 0006 (Exit + Tenant.exits) not applied while MT is enabled and locked.
+        # Unguarded, this ProgrammingError propagated out of every submit view as a 500. Deny-all
+        # instead: submissions keep working with no-egress dispositions, real egress is refused, and
+        # the operator gets an actionable log line rather than a stack trace. NOT None -- an
+        # un-migrated schema is the one case where "the ACL table is missing" must never be read as
+        # "there is no ACL".
+        log.error(
+            "egress exit ACL unavailable: the users Exit/Tenant.exits tables are missing or "
+            "unreadable while multitenancy is enabled in locked mode. Denying all egress exits. "
+            "Run: python3 manage.py migrate users",
+            exc_info=True,
+        )
+        return set()
     return slugs

@@ -21,6 +21,12 @@ from lib.cuckoo.common.exceptions import (
 from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
+from lib.cuckoo.common.tenancy_optional import (
+    exit_route_permitted,
+    is_pool_route,
+    multitenancy_config,
+    parse_allowed_exits,
+)
 from lib.cuckoo.common.utils import convert_to_printable, create_folder, get_memdump_path
 from lib.cuckoo.core.database import Database, _Database
 from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_PENDING, TASK_RUNNING, TASK_FAILED_ANALYSIS, Task
@@ -59,14 +65,46 @@ def _nexthop_enabled(routing):
     return hasattr(routing, "nexthop") and routing.nexthop.enabled
 
 
-# FORK-ONLY (tenant-egress-exits): NOT part of the upstream nexthop primitive. Keep out of the #3103 regen.
-_POOL_TOKENS = ("nexthop", "roundrobin", "random")
+def _is_dist_relay_task(task):
+    """True iff this task arrived via the LEGACY distributed relay (utils/dist.py), which stamps
+    main_task_id into the task options. Same signal modules/reporting/mongodb.py uses to fail the
+    report stamp closed to private on this path."""
+    opts = getattr(task, "options", "") or ""
+    if isinstance(opts, dict):
+        return bool(opts.get("main_task_id"))
+    return any(o.strip().startswith("main_task_id=") for o in str(opts).split(","))
 
-# Routes a tenant under a RESTRICTED exit ACL may still select, because none of them egress to the
-# real internet from a shared address: the no-network dispositions plus inetsim (fakenet). Every
-# other legacy route (internet/tor/vpnX/socks5/tunX) IS real egress that bypasses the tenant's
-# assigned exits, so under a restricted ACL it fails closed -- see _tenant_scope_nexthop.
-_NO_EGRESS_ROUTES = frozenset({"none", "None", "drop", "false", "inetsim"})
+
+def _task_allowed_exits(task):
+    """The exit ACL stamp to enforce for `task`: normally Task.allowed_exits, but DENY-ALL for a
+    legacy-distributed relay task while MT is enabled.
+
+    utils/dist.py forwards no tenant context at all -- not user, not visibility, not allowed_exits
+    (docs/MULTITENANCY-SUPPORT.md lists it as unsupported/fail-closed). For visibility that boundary
+    is genuinely fail-closed: the worker stamps the report private. For EGRESS it was fail-OPEN. The
+    relay re-submits through the worker's apiv2 as its own API principal -- typically an admin, whose
+    allowed_exit_slugs is None -- so the new task row is stamped UNRESTRICTED and a tenant confined to
+    gw1 egresses through whatever the worker's default route is.
+
+    Forwarding the stamp instead would be worse: allowed_exits would become a client-supplied field
+    on the worker's submit API, letting any API caller assert its own exit set. So this path fails
+    closed like the rest of the dist boundary -- real egress denied, no-egress dispositions still
+    permitted -- and MT+distributed users are directed to the broker/central path, which keys by
+    job_id, never sets main_task_id, and carries the stamp properly.
+
+    Untouched when MT is disabled: upstream and every non-MT distributed install keep today's
+    behaviour exactly."""
+    stamped = getattr(task, "allowed_exits", None)
+    if stamped is not None:
+        return stamped
+    if _is_dist_relay_task(task) and multitenancy_config().enabled:
+        log.warning(
+            "task %s arrived via the legacy distributed relay with no tenant exit stamp; denying real "
+            "egress (fail-closed). Use the broker/central path for multitenant distributed analysis.",
+            getattr(task, "id", "?"),
+        )
+        return ""  # deny-all
+    return None
 
 
 def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
@@ -75,17 +113,37 @@ def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
     a pool route, or 'drop' (fail closed) for anything the tenant's live allowed set does not cover.
     allowed_csv == None => unrestricted (MT off/shared).
 
+    WHICH routes a tenant may use is not decided here -- that is exit_route_permitted in
+    lib.cuckoo.common.tenancy, the same predicate the submit validator calls, reached through the
+    import-optional facade so an MT-free build still imports this module. This function only resolves
+    a permitted route against THIS worker's live gateways. The two layers previously each carried
+    their own copy of the policy and had drifted: the submit tier gated a different route set than
+    the worker did, which is how real-egress legacy routes came to bypass the ACL entirely.
+
     Called UNCONDITIONALLY by route_network -- do NOT gate it on [nexthop] being enabled. With
     nexthop off the `gateways` dict is empty, so a gwX route lands on the "allowed exit not
     configured here" arm and drops. Gating the call let such a task fall through route_network's
     terminal "Unknown network routing destination" else, which issues no rooter command at all and
     left the guest on the host's default forwarding (unrestricted egress)."""
-    if allowed_csv is None:
+    allowed = parse_allowed_exits(allowed_csv)
+    if allowed is None:
         return route
-    allowed = {s.strip() for s in allowed_csv.split(",") if s.strip()}
-    if route in _POOL_TOKENS:
+    if not exit_route_permitted(route, allowed):
+        # Covers a foreign/unknown exit slug, a real-egress legacy route (internet/tor/vpnX/socks5/
+        # tunX -- the one-dropdown-click bypass), and a pool token from a tenant with zero exits.
+        log.warning(
+            "tenant exit ACL denied route %r (tenant allows %s); dropping network for this analysis",
+            route, sorted(allowed) or "no exits",
+        )
+        return "drop"
+    if is_pool_route(route):
         candidates = sorted(g for g in gateways if g in allowed and live_filter(g))
         if not candidates:
+            log.warning(
+                "tenant exit ACL: pool route %r has no LIVE allowed gateway on this worker "
+                "(tenant allows %s, configured here: %s); dropping network",
+                route, sorted(allowed), sorted(gateways) or "none",
+            )
             return "drop"
         # Tenant-scoped pool: balance across the tenant's live exits by random choice for BOTH
         # roundrobin and random. (Strict round-robin ordering is an upstream-only nicety for the
@@ -93,16 +151,30 @@ def _tenant_scope_nexthop(route, allowed_csv, gateways, live_filter):
         # stateless, thread-safe, and balances a small per-tenant exit set fine.)
         return random.choice(candidates)
     if route in gateways:      # explicit gateway id configured on THIS worker
-        return route if (route in allowed and live_filter(route)) else "drop"
-    if route in allowed:       # an allowed exit slug NOT configured on this worker (config skew /
-        return "drop"          # global exit not present here) -- cannot honor it -> fail closed
-        # (prevents the case where such a slug == the node default route escalating via
-        # _resolve_nexthop's default_policy to a gateway outside the tenant's allowed set)
-    # Anything left is a LEGACY route. Passing these through unconditionally (as this arm originally
-    # did) made the entire ACL bypassable in one dropdown click: a tenant locked to gw1 could pick
-    # route=internet and egress from the worker's shared public IP, outside its assigned exit. Only
-    # the no-egress dispositions stay permitted; real-egress legacy routes fail closed.
-    return route if route in _NO_EGRESS_ROUTES else "drop"
+        # `route in allowed` is re-checked rather than inferred from exit_route_permitted: a gateway
+        # id that collides with a no-egress name (a [gwX] literally called "none") is permitted by
+        # policy without being assigned to this tenant, and must not resolve to a live gateway.
+        if route in allowed and live_filter(route):
+            return route
+        log.warning(
+            "tenant exit ACL: gateway %r is configured here but %s; dropping network",
+            route, "not assigned to this tenant" if route not in allowed else "not live",
+        )
+        return "drop"
+    if route in allowed:
+        # An allowed exit slug NOT configured on this worker (config skew / a global exit absent
+        # here) -- cannot honor it -> fail closed. (Also prevents such a slug, when it equals the
+        # node default route, escalating via _resolve_nexthop's default_policy to a gateway outside
+        # the tenant's allowed set.) This is the case an operator is most likely to hit and least
+        # likely to guess, hence the explicit remediation hint.
+        log.warning(
+            "tenant exit ACL: exit %r is assigned to this tenant but is NOT configured as a [gw*] "
+            "section on this worker (configured here: %s); dropping network. Add the gateway to "
+            "routing.conf on this worker, or unassign the exit from the tenant.",
+            route, sorted(gateways) or "none",
+        )
+        return "drop"
+    return route               # a permitted no-egress disposition (none/drop/false/inetsim)
 
 
 class CuckooDeadMachine(Exception):
@@ -699,7 +771,7 @@ class AnalysisManager(threading.Thread):
         from lib.cuckoo.core.rooter import gateways as _gws, _gw_live as _live
 
         self.route = _tenant_scope_nexthop(
-            self.route, getattr(self.task, "allowed_exits", None), _gws,
+            self.route, _task_allowed_exits(self.task), _gws,
             lambda g: _live(_gws[g]),
         )
 

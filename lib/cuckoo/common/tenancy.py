@@ -241,3 +241,52 @@ def viewer_scope_es_filter(viewer):
     if getattr(viewer, "user_id", None) is not None:
         shoulds.append({"term": {"info.user_id": viewer.user_id}})
     return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+
+
+# --------------------------------------------------------------------------- egress exit ACL ---
+# THE single source of truth for "may this tenant use this network route", shared by every layer
+# that decides it: the submit validator (web.submission.views), the 3rd-party download path
+# (lib.cuckoo.common.web_utils.download_file), and the worker's fail-closed guard
+# (lib.cuckoo.core.analysis_manager._tenant_scope_nexthop).
+#
+# These lived as private per-module copies with a "KEEP IN SYNC" comment. That is exactly the
+# arrangement that produced the fail-open bug this replaces -- the submit tier and the worker had
+# drifted into two different notions of which routes were gated -- so the policy lives here instead.
+# This module is stdlib-only by design, so the worker core, the web tier, and the broker can all
+# import it without dragging in Django or the rooter/machinery chain.
+
+# Routes that select from a POOL of gateways rather than naming one. Permitted iff the tenant has at
+# least one exit assigned; the worker then narrows the pool to that tenant's live exits.
+POOL_TOKENS = frozenset({"nexthop", "roundrobin", "random"})
+
+# Routes a tenant under a RESTRICTED exit ACL may still select, because none of them egress to the
+# real internet from a shared address: the no-network dispositions plus inetsim (fakenet). Every
+# other legacy route (internet/tor/vpnX/socks5/tunX) IS real egress that bypasses the tenant's
+# assigned exits, so under a restricted ACL it must fail closed.
+NO_EGRESS_ROUTES = frozenset({"none", "None", "drop", "false", "inetsim"})
+
+
+def parse_allowed_exits(allowed_csv):
+    """Task.allowed_exits (a CSV string as stamped at submit) -> a set of slugs, or None for
+    UNRESTRICTED. None and "" are deliberately different: None means no ACL applies (MT off/shared/
+    local-admin), while "" is the deny-all stamp of a tenant with zero exits assigned."""
+    if allowed_csv is None:
+        return None
+    return {s.strip() for s in str(allowed_csv).split(",") if s.strip()}
+
+
+def exit_route_permitted(route, allowed):
+    """True iff a viewer whose allowed exit-slug set is `allowed` may submit `route`.
+
+    `allowed` is a set of slugs, or None for unrestricted. DENY BY DEFAULT: the permitted universe
+    under a restricted ACL is exactly the tenant's own slugs + POOL_TOKENS + NO_EGRESS_ROUTES.
+    Anything else -- including real-egress legacy routes like internet/tor/vpn0/socks5/tunN -- is
+    refused, whether or not it names a real Exit row. Not knowing whether a slug exists is the
+    point: it keeps this from being an inventory oracle."""
+    if allowed is None:
+        return True
+    if route in POOL_TOKENS:
+        return bool(allowed)
+    if route in NO_EGRESS_ROUTES:
+        return True
+    return route in allowed

@@ -118,3 +118,49 @@ def viewer_scope_es_filter(viewer):
     except ImportError:
         return None
     return real(viewer)
+
+
+# ------------------------------------------------------------------- egress exit ACL accessors ---
+# Behaviour-only, deliberately NOT re-exporting POOL_TOKENS / NO_EGRESS_ROUTES the way the
+# visibility constants above are. Copying those two sets into a fallback arm would recreate the
+# duplicate-policy drift that caused the fail-open bug these guards exist to prevent: the submit
+# tier and the worker each carried their own idea of which routes were gated, and they disagreed.
+# Callers ask questions here instead of comparing against local copies.
+
+
+def parse_allowed_exits(allowed_csv):
+    """Task.allowed_exits CSV -> set of slugs, or None for unrestricted. Pure parsing, no policy,
+    so the fallback arm reproducing the split carries no drift risk."""
+    try:
+        from lib.cuckoo.common.tenancy import parse_allowed_exits as real
+    except ImportError:
+        if allowed_csv is None:
+            return None
+        return {s.strip() for s in str(allowed_csv).split(",") if s.strip()}
+    return real(allowed_csv)
+
+
+def exit_route_permitted(route, allowed):
+    """True iff a viewer whose allowed exit-slug set is `allowed` (or None = unrestricted) may use
+    `route`. THE gate for the submit validator, the 3rd-party download path, and the worker guard.
+
+    MT layer absent => there is no exit ACL, so `allowed` is None on every path that can reach here
+    and the answer is 'permitted'. If a non-None allowed set arrives anyway -- a task row stamped by
+    an MT-enabled UI, later processed by an MT-free worker -- DENY rather than wave it through: there
+    is no policy module to evaluate it with. That is the skewed-deploy case, and treating it as
+    unrestricted is exactly the mistake the web-tier facade made (returning None == see-all)."""
+    try:
+        from lib.cuckoo.common.tenancy import exit_route_permitted as real
+    except ImportError:
+        return allowed is None
+    return real(route, allowed)
+
+
+def is_pool_route(route):
+    """True iff `route` selects from a gateway POOL rather than naming one exit. Only the worker
+    needs this (to narrow the pool to the tenant's live exits); MT absent => no ACL => False."""
+    try:
+        from lib.cuckoo.common.tenancy import POOL_TOKENS
+    except ImportError:
+        return False
+    return route in POOL_TOKENS

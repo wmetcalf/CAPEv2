@@ -8,7 +8,12 @@ from .models import Exit, Tenant, UserProfile
 # and tenant-admin status on SSO login. Editable only by superusers -- a non-superuser holding a
 # delegated change_tenant / change_userprofile grant must NOT be able to escalate (add themselves to
 # admin_idp_groups, flip is_tenant_admin, or move a user's tenant). Enforced via get_readonly_fields.
-_TENANT_PRIV_FIELDS = ("idp_groups", "admin_idp_groups")
+#
+# `exits` belongs here for the same reason: it is the M2M that decides which egress exits the
+# tenant's tasks may use, so a delegated change_tenant grant would otherwise let a non-superuser
+# assign their own tenant ANY Exit -- including another tenant's dedicated residential exit -- and
+# then submit through it. It is an egress-privilege field, not tenant metadata.
+_TENANT_PRIV_FIELDS = ("idp_groups", "admin_idp_groups", "exits")
 _PROFILE_PRIV_FIELDS = ("tenant", "is_tenant_admin")
 
 

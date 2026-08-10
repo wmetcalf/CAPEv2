@@ -23,6 +23,7 @@ from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.integrations.parse_pe import HAVE_PEFILE, IsPEImage, pefile
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_exists, path_mkdir, path_write_file
+from lib.cuckoo.common.tenancy_optional import exit_route_permitted, parse_allowed_exits
 from lib.cuckoo.common.utils import (
     generate_fake_name,
     get_ip_address,
@@ -891,6 +892,16 @@ def download_file(**kwargs):
             route = vpn_random
         elif socks5s_random:
             route = socks5s_random
+
+    # Tenant egress ACL, re-checked on the route this function ACTUALLY decided. Callers validate the
+    # route the user submitted, but that value never reaches here: `route` is re-parsed from the
+    # request above, and the random_socks5/random_vpn block immediately above can INVENT one that
+    # no caller ever saw. A restricted tenant submitting no route on a node with random_vpn enabled
+    # therefore acquired a real-egress VPN route that passed every upstream check. An unspecified
+    # route still defers to the worker (which resolves its node default and re-evaluates it), matching
+    # validate_and_scope_route; a concrete one must be permitted here.
+    if route and not exit_route_permitted(route, parse_allowed_exits(kwargs.get("allowed_exits"))):
+        return "error", {"error": "the requested network route is not permitted for this tenant"}
 
     if tags:
         all_vms_tags = load_vms_tags()

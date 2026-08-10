@@ -28,6 +28,7 @@ from uuid import NAMESPACE_DNS, uuid3
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.saztopcap import saz_to_pcap
+from lib.cuckoo.common.tenancy_optional import exit_route_permitted, is_pool_route
 from lib.cuckoo.common.utils import get_options, get_user_filename, sanitize_filename, store_temp_file
 from lib.cuckoo.common.web_utils import (
     download_file,
@@ -297,15 +298,6 @@ def force_int(value):
         return value
 
 
-_POOL_TOKENS = ("nexthop", "roundrobin", "random")
-
-# Mirrors lib/cuckoo/core/analysis_manager._NO_EGRESS_ROUTES -- KEEP IN SYNC. Duplicated rather than
-# imported for the same reason _POOL_TOKENS above is: importing analysis_manager into the web process
-# drags in the rooter/machinery import chain. Routes here egress nowhere real (no-network
-# dispositions plus inetsim/fakenet), so a tenant under a restricted exit ACL may still pick them.
-_NO_EGRESS_ROUTES = frozenset({"none", "None", "drop", "false", "inetsim"})
-
-
 def validate_and_scope_route(route, allowed_slugs):
     """Enforce the tenant exit ACL for a submitted route. `allowed_slugs` is the tenant's allowed
     exit-slug set (from allowed_exit_slugs), or None (unrestricted: MT off/shared). Returns the route
@@ -313,10 +305,11 @@ def validate_and_scope_route(route, allowed_slugs):
     route_network guard is the authoritative fail-closed boundary; this layer rejects early so the
     user gets a clear error instead of a silent drop.
 
-    DENY BY DEFAULT under a restricted ACL. The permitted universe is exactly: the tenant's own exit
-    slugs, the pool tokens, and _NO_EGRESS_ROUTES. This replaces the original
-    `route in known_slugs and route not in allowed_slugs` test -- and the _known_gateway_slugs()
-    helper that fed it, now deleted -- which was wrong three ways:
+    The policy itself is exit_route_permitted (lib.cuckoo.common.tenancy, reached through the
+    import-optional facade): DENY BY DEFAULT, permitting only the tenant's own exit slugs, the pool
+    tokens, and the no-egress dispositions. This function only turns that verdict into a ValueError.
+    It replaces the original `route in known_slugs and route not in allowed_slugs` test -- and the
+    _known_gateway_slugs() helper that fed it, now deleted -- which was wrong three ways:
       * real-egress legacy routes (internet/tor/vpnX/socks5) were never in known_slugs, so they
         passed through -- the ACL was bypassable in one dropdown click;
       * known_slugs unioned in every raw Exit.slug, so an Exit row named `internet` made that
@@ -325,17 +318,24 @@ def validate_and_scope_route(route, allowed_slugs):
         "accepted" let any tenant dictionary-walk the full Exit inventory, including other tenants'
         dedicated exit names and retired ones. The message below is deliberately uniform so a
         permitted-but-absent route and a real-but-foreign route are indistinguishable."""
-    if allowed_slugs is None:
+    if not route:
+        # UNSPECIFIED (parse_request_arguments defaults route to ""). Not a request for anything, so
+        # refusing it here would break the ordinary "just submit it" case for every restricted
+        # tenant. Deferring is still fail-closed: the worker resolves "" to its node default
+        # (route_network: self.route = routing.routing.route, overridden only when the task names
+        # one) and runs THAT concrete value through this same predicate, so a node default of
+        # `internet` on a restricted tenant drops there. The worker must NOT extend this allowance --
+        # by the time it holds a falsy route there is no default left to resolve, and passing it
+        # through lands on route_network's terminal else, which issues no rooter command at all.
         return route
-    if route in _POOL_TOKENS:
-        if not allowed_slugs:
-            raise ValueError("tenant has no egress exits assigned")
+    if exit_route_permitted(route, allowed_slugs):
         return route
-    if route in _NO_EGRESS_ROUTES:
-        return route
-    if route not in allowed_slugs:
-        raise ValueError("the requested network route is not permitted for this tenant")
-    return route
+    if is_pool_route(route):
+        # A pool token is refused ONLY when the tenant has zero exits assigned. Saying so is not an
+        # oracle -- it describes the caller's own tenant, not the exit inventory -- and without it
+        # the operator-side misconfiguration is indistinguishable from a bad route.
+        raise ValueError("tenant has no egress exits assigned")
+    raise ValueError("the requested network route is not permitted for this tenant")
 
 
 @conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
