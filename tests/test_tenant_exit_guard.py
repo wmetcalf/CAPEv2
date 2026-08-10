@@ -27,8 +27,21 @@ def test_unrestricted_passthrough():
     assert _scope("gw2", None, {"gw1", "gw2"}, {"gw1", "gw2"}) == "gw2"   # allowed_csv None => no gating
 
 
-def test_legacy_route_untouched():
-    assert _scope("tor", "gw1", {"gw1"}, {"gw1"}) == "tor"      # not a gateway/pool token
+def test_real_egress_legacy_route_is_denied():
+    """INVERTED (was test_legacy_route_untouched, asserting == "tor").
+
+    "not a gateway/pool token" was the wrong question to ask. tor/internet/vpnX/socks5/tunN are all
+    REAL egress from an address the tenant was never granted, so passing them through left the whole
+    ACL bypassable by one dropdown change. Only no-egress dispositions stay permitted."""
+    assert _scope("tor", "gw1", {"gw1"}, {"gw1"}) == "drop"
+    assert _scope("internet", "gw1", {"gw1"}, {"gw1"}) == "drop"
+
+
+def test_no_egress_dispositions_still_pass():
+    """Counter-check to the above: routes that egress nowhere must NOT be gated, or a restricted
+    tenant could not submit anything at all."""
+    assert _scope("none", "gw1", {"gw1"}, {"gw1"}) == "none"
+    assert _scope("inetsim", "gw1", {"gw1"}, {"gw1"}) == "inetsim"
 
 
 def test_empty_csv_denies_all():
@@ -49,6 +62,10 @@ def test_allowed_slug_not_local_drops():
     assert _scope("gwG", "gw1,gwG", {"gw1"}, {"gw1"}) == "drop"   # gwG allowed but absent locally
 
 
-def test_legacy_route_not_in_allowed_still_passes():
-    # a legacy route (not a gateway slug, not in allowed) still passes through even when restricted
-    assert _scope("tor", "gw1,gwG", {"gw1"}, {"gw1"}) == "tor"
+def test_legacy_route_not_in_allowed_is_denied():
+    """INVERTED (was test_legacy_route_not_in_allowed_still_passes, asserting == "tor").
+
+    Being "not a gateway slug and not in allowed" is precisely the condition that must DENY under a
+    restricted ACL, not the condition that exempts a route from it. This assertion and
+    test_real_egress_legacy_route_is_denied above are why the F3 bypass survived a green suite."""
+    assert _scope("tor", "gw1,gwG", {"gw1"}, {"gw1"}) == "drop"

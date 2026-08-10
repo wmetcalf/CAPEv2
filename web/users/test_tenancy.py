@@ -512,10 +512,18 @@ class AllowedExitTests(TestCase):
         with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
             assert allowed_exit_slugs(_viewer(tenant_id=self.other.id)) == {"gwGlobal"}
 
-    def test_locked_tenantless_gets_globals_only(self):
-        # tenant_id=None exercises the `tid is not None` guard: globals only, no M2M lookup
+    def test_locked_tenantless_denies_everything(self):
+        """INVERTED (was test_locked_tenantless_gets_globals_only, asserting {"gwGlobal"}).
+
+        Handing a tenantless viewer the global exit set is fail-OPEN, and this test had pinned it as
+        correct. It is reachable by an ANONYMOUS caller on a token_auth_enabled=no node (DRF leaves
+        the request anonymous), by a profile with no tenant, by a DEACTIVATED tenant (viewer_for maps
+        that to tenant_id=None on purpose), and by the tenant_id=0 sentinel the tenancy_optional
+        ImportError arm returns -- so an unauthenticated caller could detonate with real egress
+        through a shared exit. A falsy tenant id now denies all."""
         with mock.patch("users.tenancy.multitenancy_config", return_value=self._cfg()):
-            assert allowed_exit_slugs(_viewer(tenant_id=None)) == {"gwGlobal"}
+            assert allowed_exit_slugs(_viewer(tenant_id=None)) == set()
+            assert allowed_exit_slugs(_viewer(tenant_id=0)) == set()
 
     def test_inactive_assigned_exit_excluded(self):
         # gwOld is assigned to acme but inactive -> never offered

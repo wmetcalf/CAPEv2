@@ -79,7 +79,10 @@ def test_tasks_create_static_stamps_allowed_exits(monkeypatch):
         captured.update(kw)
         return [7], {}
 
-    monkeypatch.setattr(views.db, "demux_sample_and_add_to_db", _fake_demux)
+    # views.db is a lazy Database proxy that raises CuckooDatabaseInitializationError on ANY
+    # attribute access until init_database() runs, so swap the whole proxy rather than patching
+    # an attribute on it.
+    monkeypatch.setattr(views, "db", SimpleNamespace(demux_sample_and_add_to_db=_fake_demux))
     monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: {"gw1", "gwGlobal"})
     monkeypatch.setattr(views, "submission_scope", lambda req: (3, "private"))
     monkeypatch.setattr(views, "store_temp_file", lambda content, name: "/tmp/static-acl-test")
@@ -112,7 +115,10 @@ def test_tasks_create_static_leaves_null_for_an_unrestricted_caller(monkeypatch)
         captured.update(kw)
         return [7], {}
 
-    monkeypatch.setattr(views.db, "demux_sample_and_add_to_db", _fake_demux)
+    # views.db is a lazy Database proxy that raises CuckooDatabaseInitializationError on ANY
+    # attribute access until init_database() runs, so swap the whole proxy rather than patching
+    # an attribute on it.
+    monkeypatch.setattr(views, "db", SimpleNamespace(demux_sample_and_add_to_db=_fake_demux))
     monkeypatch.setattr(views, "allowed_exit_slugs", lambda viewer: None)
     monkeypatch.setattr(views, "submission_scope", lambda req: (None, "public"))
     monkeypatch.setattr(views, "store_temp_file", lambda content, name: "/tmp/static-acl-test")

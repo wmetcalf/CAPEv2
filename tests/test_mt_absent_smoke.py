@@ -66,6 +66,12 @@ def test_no_unguarded_mt_app_imports_in_gate_sites():
         "web/web/tenancy_optional.py",
         "lib/cuckoo/common/tenancy_optional.py",
         "web/analysis/central_scope.py",  # raw import is inside try/except ImportError (guarded)
+        # INTRA-APP, safe by construction rather than by a guard: users/models.py is itself part of the
+        # MT `users` app, so it cannot outlive the app whose import it would fail. Its m2m_changed
+        # receiver resolves a tenant's allowed exits through users.tenancy deliberately -- routing that
+        # through the facade would add a hop that can never fail differently. Anything OUTSIDE the
+        # users app still has to go through a facade.
+        "web/users/models.py",
     }
     offenders = []
     for sub in ("lib", "web", "modules", "utils"):
