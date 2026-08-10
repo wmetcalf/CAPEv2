@@ -230,11 +230,17 @@ def allowed_exit_slugs(viewer):
     disabled, in shared mode, or the caller is a local admin — the SAME no-op conditions as
     viewer_scope_match. THE single source of truth for the submit filter/validation and the
     worker guard, so they cannot drift."""
-    from users.models import Exit
-
     cfg = multitenancy_config()
     if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
         return None
+    # Imported HERE, below the no-op early return, and not at module scope or the top of this
+    # function: on a build that has this module but no Exit model (an upstream/MT-only node, or a
+    # skewed deploy) the import raises ImportError, and hoisting it above the early return made
+    # even the UNRESTRICTED no-op path -- MT off, shared mode, local admin -- raise instead of
+    # returning None. Every caller then 500'd on submit. Past this point an exit ACL genuinely
+    # applies, so an ImportError here is a real fault; web.tenancy_optional.allowed_exit_slugs
+    # wraps this call and converts it to deny-all.
+    from users.models import Exit
     # Locked mode with NO resolvable tenant => deny-all, NOT the global exit set. Covers the
     # anonymous viewer (viewer_for(AnonymousUser) -> tenant_id=None, reachable on a
     # token_auth_enabled=no node where DRF leaves the request anonymous), a UserProfile with no

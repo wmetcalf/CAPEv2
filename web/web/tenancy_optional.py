@@ -144,21 +144,95 @@ def submission_scope(request):
     return real(request)
 
 
+def _exit_acl_feature_present():
+    """Tri-state probe: does THIS build ship the tenant egress-exit ACL AT ALL?
+
+    Probes the ACL's STORAGE (the users.Exit MODEL, through the Django app registry) and
+    deliberately NOT the resolver we were trying to call. The whole question being answered is
+    "did the exits feature ever exist here, or did its import chain break?", so the probe must
+    not travel the very import chain under suspicion (users.tenancy, and users.tenancy's own
+    in-body `from users.models import Exit`). apps.get_model() is a lookup in the registry
+    Django populated at startup: no module import, no DB query, no table access.
+
+      True  -> the model exists, so the feature IS part of this build.
+      False -> definitively absent: no `users` app, or a `users` app that predates Exit
+               (i.e. upstream, which now HAS multitenancy but has NO Exit model).
+      None  -> undeterminable (registry not ready / ImproperlyConfigured). Callers must treat
+               this like "present" and fail closed; "I cannot tell" must never unlock egress.
+
+    Note the probe is intentionally NOT cached: it is a dict lookup, and memoising it would make
+    the answer depend on which request happened to run first.
+    """
+    try:
+        from django.apps import apps
+
+        apps.get_model("users", "Exit")
+    except LookupError:
+        return False
+    except Exception:
+        return None
+    return True
+
+
+def _exit_acl_unavailable():
+    """The value allowed_exit_slugs must return when the real resolver cannot be reached.
+
+    Two ImportError shapes reach here and they need OPPOSITE answers -- which is why this is a
+    feature probe and not a single `_mt_enabled()` test:
+
+    1. The exits resolver is GENUINELY ABSENT: an older/upstream build that never had the
+       feature. There is no exit ACL to enforce, so None (UNRESTRICTED) is correct -- it is
+       exactly pre-feature behaviour. This case is NOT hypothetical: upstream now carries
+       multitenancy (so `_mt_enabled()` is True there) and does NOT carry the Exit model, so
+       keying off `_mt_enabled()` alone would deny EVERY real-egress submission on an
+       MT-locked upstream node.
+    2. The resolver is PRESENT but its import chain broke: a skewed deploy of the same feature
+       (new web tier vs stale users app, half-installed package, partially-initialised module).
+       Here an ACL does exist and we simply cannot read it => DENY-ALL, never None.
+
+    MT-off short-circuits first because the real resolver itself returns None when MT is
+    disabled -- with no tenants there is nothing to scope, and denying would break egress on a
+    single-tenant node for no security gain.
+    """
+    if not _mt_enabled():
+        return None
+    # `is False` on purpose: the undeterminable (None) answer falls through to deny-all.
+    if _exit_acl_feature_present() is False:
+        return None
+    return frozenset()
+
+
 def allowed_exit_slugs(viewer):
     """Facade for users.tenancy.allowed_exit_slugs. Same fail-closed contract as every arm above:
-    MT genuinely absent => None (single-tenant, no exit ACL exists -- today's behaviour); MT enabled
-    but its import chain broke => DENY-ALL, never None.
+    the exits feature genuinely absent => None (no exit ACL exists -- pre-feature behaviour); the
+    feature present but its import chain broke => DENY-ALL, never None. See _exit_acl_unavailable
+    for how the two are told apart without re-walking the broken import.
 
     None is the UNRESTRICTED sentinel here, and the worker guard's first line is
     `if allowed_csv is None: return route`. So returning None on ImportError (as this arm originally
     did) switched the whole tenant egress ACL OFF silently -- every task stamped
     allowed_exits=NULL, with no error, no log line and no failing test, while MT stayed enabled and
-    locked. An empty set stamps "" instead, which the worker denies."""
+    locked. An empty set stamps "" instead, which the worker denies.
+
+    The CALL is guarded as well as the import, and that is not belt-and-braces: users.tenancy's
+    allowed_exit_slugs does `from users.models import Exit` INSIDE its own body, so on a build
+    that has users.tenancy but not the Exit model the ImportError escapes from real(viewer) --
+    i.e. past a try that only wraps the import statement -- and surfaced as an HTTP 500 on every
+    submit path while this docstring promised deny-all. (The resolver's own DatabaseError arm
+    covers a missing TABLE; it cannot cover a missing MODEL.)
+
+    Only ImportError is caught, matching every arm above: a genuine runtime fault inside a
+    deployed resolver still propagates. That is fail-closed too -- the submit view 500s and no
+    task is minted, so no egress is granted -- and it stays loud instead of being laundered into
+    a silent deny."""
     try:
         from users.tenancy import allowed_exit_slugs as real
     except ImportError:
-        return frozenset() if _mt_enabled() else None
-    return real(viewer)
+        return _exit_acl_unavailable()
+    try:
+        return real(viewer)
+    except ImportError:
+        return _exit_acl_unavailable()
 
 
 def viewer_scope_filter(user):

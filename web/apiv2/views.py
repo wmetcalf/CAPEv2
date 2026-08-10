@@ -127,6 +127,29 @@ def _control_plane_authenticated(request) -> bool:
     return bool(presented) and constant_time_compare(presented, secret)
 
 
+_CP_EXIT_ACL_TOLERANCE_KEY = "control_plane_missing_exit_acl_is_unrestricted"
+
+# One-shot log guards. The two outcomes below are per-DEPLOYMENT facts, not per-request ones, so
+# announce each once per process instead of once per submission: a worker under load would otherwise
+# bury the line in its own repetition (and the operator would start filtering it out). Process-scoped
+# is deliberate -- every restart/roll re-announces, so a tolerance left on cannot age out of the logs.
+_cp_exit_acl_logged = {"tolerated": False, "denied": False}
+
+
+def _cp_missing_exit_acl_tolerated() -> bool:
+    """Is the default-OFF [api] control_plane_missing_exit_acl_is_unrestricted opt-in set?
+
+    Accepts a real bool (what Config's getboolean coercion yields for a yes/no conf value) or a
+    string (a conf.d/dict override, or a value that failed getboolean and fell through to str).
+    ABSENT or unparseable => False: a key nobody deliberately set must never widen an ACL, and an
+    older api.conf that predates the key must land on the safe arm rather than on "" -> truthy.
+    """
+    raw = apiconf.api.get(_CP_EXIT_ACL_TOLERANCE_KEY)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("yes", "true", "on", "1")
+
+
 def _submission_exit_acl(request):
     """Resolve (allowed_slugs, allowed_csv) for a submission to THIS node.
 
@@ -146,16 +169,73 @@ def _submission_exit_acl(request):
     field in the request body is IGNORED -- honouring it on an AllowAny apiv2 would let any caller
     widen its own ACL, a self-service bypass of the entire feature.
 
-    A control-plane caller that forwards NOTHING yields unrestricted (None), matching pre-feature
-    behaviour. That keeps a rolling upgrade (new worker + older bridge) from becoming a fleet
-    outage; the deploy gate asserts a central task actually lands a non-NULL allowed_exits, so the
-    wiring is verified rather than assumed.
+    WHAT AN UNSTAMPED CONTROL-PLANE SUBMISSION MEANS, and the two failures the arms trade against.
+    "Unstamped" (no `allowed_exits` key in the body at all -- distinct from the explicit ""
+    deny-all stamp) is indistinguishable at this seam between two causes:
+
+      (a) a relay too old to forward the field, mid rolling upgrade; and
+      (b) a relay whose stamping broke, or a caller holding the control-plane secret that never
+          computed one.
+
+    Reading it as UNRESTRICTED costs, in case (b), SILENT CROSS-TENANT EGRESS: the task detonates
+    out of any gateway on the node, including exits belonging to other tenants, with nothing in the
+    response or the logs to say a policy decision was skipped.
+
+    Reading it as DENY-ALL costs, in case (a), a STALE RELAY BLACKHOLING EVERY TASK -- and not
+    gently. Deny-all is `set()`, so validate_and_scope_route REFUSES any concrete real-egress route
+    (`vpn0` -- what the dispatcher sends today -- `internet`, a `gwN` slug) and any pool token, i.e.
+    the endpoint returns error=True with HTTP 200, which the dispatcher's raise_for_status cannot
+    see: submissions disappear rather than fail loudly. Only an UNSPECIFIED route (validate's
+    `if not route` short-circuit) or a no-egress disposition (none/drop/inetsim) still lands, and
+    those then get no network from the worker's own route_network guard. Because the failure is
+    uniform across the fleet it presents as an outage, not as a policy decision.
+
+    So: DENY-ALL is the default, but only where an ACL genuinely applies -- multitenancy enabled AND
+    mode=locked, the same condition under which allowed_exit_slugs() restricts anything at all. With
+    MT off or in shared mode that helper returns None for every caller, so None here is the correct
+    answer and not a fail-open at all.
+
+    An operator mid-upgrade who would rather take (b)'s risk than (a)'s outage opts in KNOWINGLY via
+    [api] control_plane_missing_exit_acl_is_unrestricted = yes, which restores the old unrestricted
+    behaviour and is trivially revertible. It is default-off, and the first submission it lets
+    through logs a warning naming the key, so it cannot sit on silently after the upgrade ends.
+    Prefer fixing the relay: the deploy gate asserts a central task lands a non-NULL allowed_exits.
     """
     if _control_plane_authenticated(request):
         data = getattr(request, "data", None)
         raw = data.get("allowed_exits") if hasattr(data, "get") else None
         if raw is None:
-            return None, None
+            cfg = multitenancy_config()
+            # getattr-guarded: multitenancy_config() may return either MTConfig class (real or the
+            # tenancy_optional fallback), and its fail-closed arm yields enabled=True/mode=locked.
+            acl_applies = bool(getattr(cfg, "enabled", False)) and getattr(cfg, "mode", "") == "locked"
+            if not acl_applies:
+                return None, None
+            if _cp_missing_exit_acl_tolerated():
+                if not _cp_exit_acl_logged["tolerated"]:
+                    _cp_exit_acl_logged["tolerated"] = True
+                    log.warning(
+                        "control-plane submission carried NO allowed_exits stamp and was accepted as "
+                        "UNRESTRICTED because [api] %s is enabled. Egress for these tasks is NOT "
+                        "tenant-scoped -- a task may exit through another tenant's gateway. This is a "
+                        "rolling-upgrade tolerance only: update the control plane to forward the exit "
+                        "ACL, then set it back to 'no'.",
+                        _CP_EXIT_ACL_TOLERANCE_KEY,
+                    )
+                return None, None
+            if not _cp_exit_acl_logged["denied"]:
+                _cp_exit_acl_logged["denied"] = True
+                log.error(
+                    "control-plane submission carried NO allowed_exits stamp while multitenancy is "
+                    "enabled in locked mode; denying all egress exits for it. The control plane is not "
+                    "forwarding the tenant exit ACL (relay too old, or its stamping is broken) -- tasks "
+                    "will detonate with no network. Fix the relay, or, to accept UN-SCOPED egress for "
+                    "the duration of an upgrade, set [api] %s = yes.",
+                    _CP_EXIT_ACL_TOLERANCE_KEY,
+                )
+            # "" is the deny-all stamp (NOT None/unrestricted), matching what a tenant with zero
+            # exits sends and what the worker-side guard already understands.
+            return set(), ""
         csv = str(raw)
         return parse_allowed_exits(csv), csv
     allowed = allowed_exit_slugs(viewer_for(request.user))

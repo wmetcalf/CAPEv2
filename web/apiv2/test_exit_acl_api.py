@@ -205,12 +205,74 @@ def test_an_empty_configured_secret_disables_the_relay_path(monkeypatch):
     assert views._control_plane_authenticated(Request(req, parsers=[FormParser()])) is False
 
 
-def test_relay_without_a_stamp_is_unrestricted_for_rolling_upgrades(monkeypatch):
-    """New worker + older bridge that forwards nothing must keep detonating (pre-feature
-    behaviour), not fail closed on every task. The deploy gate asserts the stamp is really wired."""
+def _mt(monkeypatch, enabled=True, mode="locked"):
+    """Point views' multitenancy_config binding at a chosen config."""
+    from lib.cuckoo.common.tenancy import MTConfig
+
+    cfg = MTConfig(enabled=enabled, mode=mode, default_visibility="",
+                   local_admins_manage_all_tenants=True)
+    monkeypatch.setattr(views, "multitenancy_config", lambda: cfg)
+
+
+def test_relay_without_a_stamp_DENIES_on_a_locked_node(monkeypatch):
+    """INVERTED from test_relay_without_a_stamp_is_unrestricted_for_rolling_upgrades, which asserted
+    (None, None).
+
+    That was a fail-OPEN arm: a bridge/worker skew where the bridge forwards no allowed_exits handed
+    the task UNRESTRICTED egress, and the only thing standing between that and a silent cross-tenant
+    leak was a deploy-time check documented in another repo's runbook. On an MT-enabled, LOCKED node
+    an absent stamp now means deny-all -- the tenant's tasks blackhole, loudly, instead of quietly
+    getting everything."""
+    _mt(monkeypatch, enabled=True, mode="locked")
     r = _cp_request(monkeypatch, token=_CP_SECRET, body={})
     allowed, csv = views._submission_exit_acl(r)
-    assert allowed is None and csv is None
+    assert allowed == set(), "absent stamp on a locked node must be deny-all, not unrestricted"
+    assert csv == "", "deny-all must stamp the empty CSV, not NULL (NULL == unrestricted)"
+
+
+def test_relay_without_a_stamp_is_unrestricted_when_mt_is_off(monkeypatch):
+    """The ACL only exists under MT-locked. A single-tenant / shared install must be untouched."""
+    for enabled, mode in ((False, "shared"), (True, "shared")):
+        _mt(monkeypatch, enabled=enabled, mode=mode)
+        r = _cp_request(monkeypatch, token=_CP_SECRET, body={})
+        allowed, csv = views._submission_exit_acl(r)
+        assert allowed is None and csv is None, f"enabled={enabled} mode={mode} must stay unrestricted"
+
+
+def test_the_rolling_upgrade_tolerance_is_off_by_default_and_opt_in(monkeypatch):
+    """The old fail-open behaviour survives ONLY behind an explicit, default-OFF [api] key, so an
+    operator mid-upgrade opts in knowingly and can revert."""
+    _mt(monkeypatch, enabled=True, mode="locked")
+
+    # default: key absent => tolerance OFF => deny
+    r = _cp_request(monkeypatch, token=_CP_SECRET, body={})
+    assert views._cp_missing_exit_acl_tolerated() is False
+    assert views._submission_exit_acl(r)[0] == set()
+
+    # opt in => the old unrestricted behaviour returns
+    monkeypatch.setattr(
+        views, "apiconf",
+        SimpleNamespace(api={"control_plane_token": _CP_SECRET,
+                             views._CP_EXIT_ACL_TOLERANCE_KEY: True}))
+    assert views._cp_missing_exit_acl_tolerated() is True
+    req = APIRequestFactory().post("/apiv2/tasks/create/url/", {})
+    req.META["HTTP_AUTHORIZATION"] = f"token {_CP_SECRET}"
+    # MultiPartParser is required, not optional: APIRequestFactory().post defaults to multipart
+    # encoding, so a FormParser-only Request raises UnsupportedMediaType on .data. Mirrors the
+    # parser list _cp_request uses.
+    from rest_framework.parsers import FormParser, MultiPartParser
+    from rest_framework.request import Request
+
+    allowed, csv = views._submission_exit_acl(Request(req, parsers=[FormParser(), MultiPartParser()]))
+    assert allowed is None and csv is None, "the opt-in must restore unrestricted, not something else"
+
+
+def test_a_forwarded_stamp_still_wins_over_the_deny_default(monkeypatch):
+    """The deny default applies only to an ABSENT stamp; a real forwarded stamp is still honoured."""
+    _mt(monkeypatch, enabled=True, mode="locked")
+    r = _cp_request(monkeypatch, token=_CP_SECRET, body={"allowed_exits": "gw0"})
+    allowed, csv = views._submission_exit_acl(r)
+    assert allowed == {"gw0"} and csv == "gw0"
 
 
 def test_anonymous_locked_worker_would_deny_without_the_relay(monkeypatch):

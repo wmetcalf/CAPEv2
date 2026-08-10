@@ -117,7 +117,15 @@ class PendingRestampTests(TestCase):
         self.e2 = Exit.objects.create(slug="gw2", active=True)
 
     def _restamps(self, fn):
-        """Run fn() with the task store stubbed; return the (tenant_id, csv) re-stamp calls."""
+        """Run fn() with the task store stubbed; return the (tenant_id, csv) re-stamp calls.
+
+        captureOnCommitCallbacks(execute=True) is REQUIRED, not incidental. The receiver defers its
+        cross-store write to transaction.on_commit (so a rolled-back admin save can never publish a
+        phantom ACL to the task store), and django.test.TestCase wraps every test in an atomic block
+        that is rolled back rather than committed -- so on_commit callbacks NEVER fire under
+        TestCase. Without this the receiver looks like it silently does nothing and these tests pass
+        vacuously while asserting `calls` is empty... or, as written before, fail outright.
+        """
         calls = []
 
         class _DB:
@@ -130,7 +138,8 @@ class PendingRestampTests(TestCase):
         with mock.patch("users.tenancy.multitenancy_config", return_value=_locked()):
             with mock.patch("lib.cuckoo.common.tenancy.multitenancy_config", return_value=_locked()):
                 with mock.patch("lib.cuckoo.core.database.Database", _DB):
-                    fn()
+                    with self.captureOnCommitCallbacks(execute=True):
+                        fn()
         return calls
 
     def test_revoking_an_exit_restamps_queued_tasks(self):
@@ -165,7 +174,11 @@ class PendingRestampTests(TestCase):
         with mock.patch("users.tenancy.multitenancy_config", return_value=_locked()):
             with mock.patch("lib.cuckoo.common.tenancy.multitenancy_config", return_value=_locked()):
                 with mock.patch("lib.cuckoo.core.database.Database", _BoomDB):
-                    self.t.exits.add(self.e1)  # must not raise
+                    # execute=True is what makes this test mean anything: the receiver defers to
+                    # transaction.on_commit, so without it the raising callback never runs and
+                    # "does not break the admin save" would pass trivially.
+                    with self.captureOnCommitCallbacks(execute=True):
+                        self.t.exits.add(self.e1)  # must not raise
         assert list(self.t.exits.values_list("slug", flat=True)) == ["gw1"]
 
     def test_mt_disabled_does_not_touch_the_task_store(self):
@@ -181,4 +194,8 @@ class PendingRestampTests(TestCase):
 
         with mock.patch("lib.cuckoo.common.tenancy.multitenancy_config", return_value=off):
             with mock.patch("lib.cuckoo.core.database.Database", _DB):
-                self.t.exits.add(self.e1)
+                # execute=True so a callback that DID get registered would actually fire and trip the
+                # AssertionError. The MT-off early return should mean none was registered at all.
+                with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                    self.t.exits.add(self.e1)
+        assert callbacks == [], "MT off must not even register a re-stamp callback"
