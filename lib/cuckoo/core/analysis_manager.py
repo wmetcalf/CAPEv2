@@ -754,8 +754,24 @@ class AnalysisManager(threading.Thread):
         routing = Config("routing")
         self.route = routing.routing.route
 
+        _allowed_csv = _task_allowed_exits(self.task)
         if self.task.route:
             self.route = self.task.route
+        elif parse_allowed_exits(_allowed_csv):
+            # A RESTRICTED tenant that named no route defaults to ITS OWN pool, not the node's
+            # shared default. Without this the node default (route = vpn0 on our central workers)
+            # is evaluated against the tenant's exits, is not one of them, and the guard correctly
+            # drops -- so every ordinary "just submit it" task from a restricted tenant would come
+            # back with no network at all. That is fail-closed but useless, and the pressure it
+            # creates is to loosen the ACL, which is the wrong repair. Resolving to the tenant's
+            # pool keeps the default working while still confining egress to exits they hold:
+            # _tenant_scope_nexthop narrows the pool to their LIVE allowed gateways and still drops
+            # if none is usable.
+            #
+            # Deliberately gated on a NON-EMPTY allowed set: "" is the deny-all stamp (a tenant with
+            # zero exits) and must keep falling through to the node default so it drops, and None is
+            # unrestricted, which must keep the node default verbatim (upstream parity).
+            self.route = "roundrobin"
 
         # FORK: constrain the route to the task's tenant allowed exits (stamped at submit).
         # No-op when allowed_exits is NULL (MT off/shared). A returned "drop" flows into the
@@ -771,7 +787,7 @@ class AnalysisManager(threading.Thread):
         from lib.cuckoo.core.rooter import gateways as _gws, _gw_live as _live
 
         self.route = _tenant_scope_nexthop(
-            self.route, _task_allowed_exits(self.task), _gws,
+            self.route, _allowed_csv, _gws,
             lambda g: _live(_gws[g]),
         )
 

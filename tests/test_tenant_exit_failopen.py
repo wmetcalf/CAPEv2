@@ -297,3 +297,30 @@ def test_a_permitted_route_logs_nothing(caplog):
         assert _tenant_scope_nexthop("gw1", "gw1", GATEWAYS, ALL_LIVE) == "gw1"
         assert _tenant_scope_nexthop("none", "gw1", GATEWAYS, ALL_LIVE) == "none"
     assert not [r for r in caplog.records if "exit ACL" in r.getMessage()]
+
+
+# ------------------- restricted tenant + unspecified route resolves to THEIR pool ----
+# Worker node default is route=vpn0 (worker-userdata.sh). Evaluated against a restricted tenant's
+# exits, vpn0 is not one of them, so the guard drops -- meaning an ordinary no-route submission from
+# a restricted tenant would come back with NO network. Fail-closed but useless, and the pressure it
+# creates is to loosen the ACL. route_network resolves a restricted tenant's unspecified route to a
+# pool token instead, which _tenant_scope_nexthop narrows to their live allowed gateways.
+def test_pool_token_resolves_within_the_tenants_own_exits():
+    got = _tenant_scope_nexthop("roundrobin", "gw1", GATEWAYS, ALL_LIVE)
+    assert got == "gw1", "a restricted tenant's pool must resolve to an exit they hold"
+
+
+def test_pool_token_never_picks_a_foreign_gateway():
+    # gw2 is live and configured, but not assigned -- the pool must never reach it.
+    for _ in range(20):
+        assert _tenant_scope_nexthop("roundrobin", "gw1", GATEWAYS, ALL_LIVE) == "gw1"
+
+
+def test_node_default_is_still_denied_when_explicitly_requested():
+    """The pool default must not become a loophole: naming vpn0 outright is still refused."""
+    assert _tenant_scope_nexthop("vpn0", "gw1", GATEWAYS, ALL_LIVE) == "drop"
+
+
+def test_deny_all_tenant_still_drops_rather_than_getting_a_pool():
+    """"" is the deny-all stamp; it must NOT be promoted into a pool that picks some gateway."""
+    assert _tenant_scope_nexthop("roundrobin", "", GATEWAYS, ALL_LIVE) == "drop"
