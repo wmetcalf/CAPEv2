@@ -3144,6 +3144,10 @@ def tenant_exits_list(request):
         try:
             raw = str(getattr(routing_conf.nexthop, "gateways", "") or "")
         except Exception:
+            # An unreadable [nexthop] section is a config error, not "no gateways". Swallowing it
+            # silently reported an empty pool, which reads identically to a correctly-configured
+            # install that has none -- so an operator debugging a missing picker had nothing to go on.
+            log.exception("could not read [nexthop] gateways= while listing tenant exits")
             raw = ""
         allowed = {s.strip() for s in raw.split(",") if s.strip()}
     return Response({"error": False, "data": sorted(allowed)})
