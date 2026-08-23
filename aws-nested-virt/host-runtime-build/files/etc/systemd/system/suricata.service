@@ -1,0 +1,60 @@
+[Unit]
+# Suricata IDS daemon in CAPE unix-socket mode.
+#
+# CAPE's suricata processing module (modules/processing/suricata.py) has
+# two runmodes: "cli" (spawn `suricata -r dump.pcap` per task — reloads
+# the full ~50K-rule ruleset every analysis) and "socket" (feed the pcap
+# to a long-running daemon over a unix socket — rules loaded ONCE).
+# processing.conf is flipped to runmode=socket by cape-host-config; this
+# unit is the daemon it talks to.
+#
+# Why this unit lives in cape-host-runtime: cape/systemd/suricata.service
+# exists in the cape source tree but is NOT in debian/cape-core.install,
+# so cape-core never shipped it (the deployed AMI showed the unit
+# "not-found" — which is why socket mode silently fell back to cli).
+# We ship a hardened version here alongside the other runtime daemons
+# (cape-routing, cape-guacd, openvpn-pia, cape-fakenet-fix).
+Description=Suricata IDS daemon (CAPE unix-socket mode)
+Documentation=man:suricata(8) man:suricatasc(8)
+After=network-online.target
+Wants=network-online.target
+# The per-task processing workers connect to this socket; the daemon
+# must be up before cape-processor starts pulling tasks.
+Before=cape.service cape-processor.service
+
+[Service]
+Type=forking
+# /run/suricata is tmpfs (cleared each boot).  Our source-built suricata
+# (--localstatedir=/var) splits its runtime paths: the unix command socket
+# defaults to /var/run/suricata/suricata-command.socket (subdir) but the
+# PIDFILE defaults to /var/run/suricata.pid (NO subdir — suricata.yaml's
+# pid-file: line is commented out, so the compiled default wins).  We do
+# NOT rely on those defaults: both paths are pinned explicitly on the
+# ExecStart below so the unit's clean / PIDFile= / socket-chmod all
+# reference the exact same files suricata actually uses.
+#
+# Create both runtime dirs (mkdir of /var/log/suricata silences the
+# "error opening file /var/log/suricata/suricata.log: No such file" warning
+# on a fresh tmpfs boot) and clear any stale socket/pid a previous crash
+# left behind — including the legacy /var/run/suricata.pid default, which a
+# boot-time `suricata-update`/`suricata -T` invocation can leave around and
+# which would otherwise abort our daemon with "pid file ... appears stale".
+ExecStartPre=/bin/mkdir -p /var/run/suricata /var/log/suricata
+ExecStartPre=-/bin/rm -f /var/run/suricata/suricata.pid /var/run/suricata.pid /var/run/suricata/suricata-command.socket /tmp/suricata-command.socket
+ExecStart=/usr/bin/suricata -D -c /etc/suricata/suricata.yaml --unix-socket=/var/run/suricata/suricata-command.socket --pidfile /var/run/suricata/suricata.pid
+# Make the command socket reachable by the cape service account (the
+# cape-processor workers run as `cape`, the daemon runs as root).  Done
+# here in the unit rather than via suricata.yaml's unix-command.group so
+# the access guarantee is self-contained + deterministic regardless of
+# suricata's default socket mode.  Poll up to 30s for suricata to finish
+# init and create the socket.
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do if [ -S /var/run/suricata/suricata-command.socket ]; then chgrp cape /var/run/suricata/suricata-command.socket && chmod 0660 /var/run/suricata/suricata-command.socket && exit 0; fi; sleep 1; done; echo "suricata: command socket never appeared" >&2; exit 1'
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/var/run/suricata/suricata.pid
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

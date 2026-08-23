@@ -1,0 +1,41 @@
+# cape-fakenet.service — run the FakeNet-NG VNC-redirect container.
+#
+# CAPE rooter.py's `inetsim_trap()` redirects all uncaught TCP/UDP/ICMP
+# traffic from analysis VMs (via virbr100 NAT) to this container's IP
+# 172.28.100.2 — so the VM sees "internet" but every conn lands on a
+# FakeNet listener that records the request and replies with a canned
+# response.  Lets a sample's network behavior get fully observed
+# without giving it real-world internet access.
+#
+# Container source: /opt/CAPEv2/docker/fakenet-ng/  (shipped by this
+# deb).  Image is built at deb install time (postinst runs
+# `docker compose build`) so the deb itself stays small — only the
+# Dockerfile + fakenet.ini + patch_fakenet.py + CA pair ship in the
+# .deb, not the ~400 MB built image.
+#
+# Network: `br-fakenet` bridge on 172.28.100.0/24, container at .2.
+# Created by docker compose on first start; persists across restarts.
+
+[Unit]
+Description=CAPE FakeNet-NG (network simulation) in Docker
+Documentation=https://github.com/mandiant/flare-fakenet-ng
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10s
+WorkingDirectory=/opt/CAPEv2/docker/fakenet-ng
+
+# Start the container.  `docker compose up` blocks attached to the
+# container — matches Type=simple's expectation.  `--build` re-uses
+# the image cached by postinst; only re-builds if Dockerfile content
+# changed since last install.
+ExecStart=/usr/bin/docker compose up --build
+
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target

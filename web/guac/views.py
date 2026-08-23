@@ -4,18 +4,14 @@ from base64 import urlsafe_b64decode
 
 import json
 import logging
-from functools import wraps
-
 from django.conf import settings
-from django.contrib.auth.views import redirect_to_login
+from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import render, redirect
 
-from guac.channels_auth import resolve_session_user
-
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
-from web.tenancy_optional import can_manage_task, multitenancy_config, viewer_for
+from web.tenancy_optional import can_view_task
 
 logger = logging.getLogger("guac-session")
 
@@ -29,33 +25,6 @@ class conditional_login_required:
         if not self.condition:
             return func
         return self.decorator(func)
-
-
-def guac_login_required(view_func):
-    """Backend-agnostic ``@login_required`` for guac-web's HTTP views.
-
-    guac-web (``web.guac_settings``) shares the main web's session store but deliberately
-    does NOT install the allauth app stack. Django's stock ``login_required`` resolves
-    ``request.user`` via ``auth.get_user()``, which ``load_backend()``s the exact auth
-    backend the session was created with; for an OIDC/allauth session that backend is not
-    in guac-web's ``AUTHENTICATION_BACKENDS`` (importing ``allauth.account.*`` is exactly
-    what guac_settings avoids), so ``get_user()`` returns ``AnonymousUser`` and every
-    interactive-console request for an OIDC user is bounced to the login page — even though
-    the browser is logged in on the main web. The websocket path already solved this with a
-    backend-agnostic resolver (``guac.channels_auth.resolve_session_user``); the HTTP views
-    must do the same. Resolve identity straight from the session (user id + auth-hash check,
-    the same security gate ``get_user`` enforces) without loading the backend. Redirect to
-    the login page only for a genuinely anonymous session, identical to ``login_required``.
-    """
-    @wraps(view_func)
-    def _wrapped(request, *args, **kwargs):
-        user = resolve_session_user(request.session)
-        if not user.is_authenticated:
-            return redirect_to_login(request.get_full_path())
-        request.user = user
-        return view_func(request, *args, **kwargs)
-
-    return _wrapped
 
 try:
     import libvirt
@@ -77,40 +46,76 @@ def is_vnc_console_enabled():
     return bool(enabled)
 
 
+def _vnc_console_denied_reason(request):
+    """None if the direct-VNC console is allowed for this request, else a reason string.
+
+    The direct console addresses VMs by NAME / host:port and mints a task_id=0 session that
+    the websocket consumer does NOT tenant-check — it bypasses task-scoped access by design
+    (an operator tool). So on top of the [guacamole] vnc_console_enabled flag, restrict it to
+    local-admin operators whenever multitenancy is enabled; otherwise any tenant could drive
+    another tenant's VM — or a live analysis — by name (codex P1 / MT audit, task #172)."""
+    if not is_vnc_console_enabled():
+        return "VNC Console is disabled in configuration"
+    from web.tenancy_optional import viewer_for
+
+    # Gate on is_local_admin: viewer_for marks EVERY principal is_local_admin when
+    # multitenancy is disabled (single-node operator console keeps working, back-compat),
+    # and only break-glass operators when MT is enabled — exactly the restriction we want,
+    # with no separate MT-enabled check.
+    #
+    # request.user may be ABSENT when these views are served by the standalone Guacamole
+    # ASGI app (web.guac_settings has no AuthenticationMiddleware), so read it defensively;
+    # viewer_for(None) is is_local_admin=True when MT is off (single-node no-op) and a
+    # restricted anon viewer when MT is on (codex P2, #172).
+    if not viewer_for(getattr(request, "user", None)).is_local_admin:
+        return "VNC Console is restricted to operators"
+    return None
+
+
+def _vm_has_active_analysis(vm_name):
+    """True if `vm_name` is currently hosting a live CAPE analysis — an active Guest
+    (label==vm, not yet shut down) OR a TASK_RUNNING task bound to its machine.
+
+    Keys off the active task/guest DIRECTLY, NOT machine.locked: CAPE marks a task
+    TASK_RUNNING BEFORE it locks the machine (analysis_manager), so a .locked check leaves a
+    race window where a live analysis is already running but the machine is still unlocked
+    (codex High, #172). FAILS CLOSED (returns True) if it can't determine the state — better
+    to refuse a direct console than hand one out for a possibly-live VM."""
+    try:
+        from lib.cuckoo.core.data.task import Task, TASK_RUNNING
+        from lib.cuckoo.core.data.guests import Guest
+
+        sess = db.session()
+        if sess.query(Guest).filter(Guest.label == vm_name, Guest.shutdown_on.is_(None)).first():
+            return True
+        machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+        if machine and sess.query(Task).filter(Task.machine_id == machine.id, Task.status == TASK_RUNNING).first():
+            return True
+        return False
+    except Exception as e:
+        logger.error("direct_vnc_vm: could not verify active analysis for %s: %s", vm_name, e)
+        return True  # fail closed
+
+
 def _error(request, task_id, msg):
     return render(request, "guac/error.html", {
         "error_msg": msg, "error": "remote session", "task_id": task_id,
     })
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def index(request, task_id, session_data):
-    # tenant isolation: minting a live-VM session grants keyboard/mouse/framebuffer
-    # control of the running analysis VM — a task ACTION, not passive report viewing.
-    # Gate it on can_manage_task (owner / tenant-admin / break-glass), NOT mere read
-    # visibility, so a read-only viewer of a public/tenant task can't tunnel into the
-    # live VM. hidden == "not found" (no cross-tenant enumeration).
-    #
-    # MT-OFF INVARIANT: this gate is ADDITIVE. When multitenancy is disabled we skip it
-    # entirely and fall through to upstream's original ordering (libvirt/machinery checks
-    # first, then the existence check + exact "The specified task doesn't seem to exist"
-    # message below) so MT-off behavior is byte-for-byte identical to upstream.
-    if multitenancy_config().enabled:
-        _task = db.view_task(int(task_id))
-        if _task is None or not can_manage_task(request.user, _task):
-            return _error(request, task_id, "No analysis found with specified ID")
+    # tenant isolation: only mint a live-VM session token for a task the caller
+    # may view (hidden == "not found" — no cross-tenant enumeration).
+    _task = db.view_task(int(task_id))
+    if _task is None or not can_view_task(request.user, _task):
+        return _error(request, task_id, "No analysis found with specified ID")
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, task_id, "Libvirt not available")
 
     if machinery not in machinery_available:
         return _error(request, task_id, f"Machinery type '{machinery}' is not supported")
-
-    # The VM label + guest IP are derived authoritatively from the task below (never from the
-    # attacker-controlled session_data path segment), so the task must exist.
-    _task = db.view_task(int(task_id))
-    if not _task:
-        return _error(request, task_id, "The specified task doesn't seem to exist")
 
     # Central mode: a broker-dispatched job's VM is on a worker — check that
     # worker's libvirt. None => local (single-node), DSN unchanged.
@@ -131,13 +136,14 @@ def index(request, task_id, session_data):
         except Exception as e:
             return _error(request, task_id, str(e))
 
-        # SECURITY: BOTH the VM label AND the guest IP MUST come from the authorized task,
-        # never from the attacker-controlled session_data path segment. Trusting the label
-        # lets a caller who can reach ONE running task tunnel into another VM by name;
-        # trusting guest_ip lets them point the guacd RDP tunnel at an arbitrary host:3389
-        # (SSRF — guest_host is built from this value in consumers.py). Derive both from the
-        # task: _task.machine + its machine record (single-node) or the worker's VM (central
-        # mode). Ignore _claimed_label / _claimed_ip entirely.
+        # SECURITY: BOTH the VM label AND the guest IP MUST come from the authorized
+        # task, never from the attacker-controlled session_data path segment. Trusting
+        # the label lets a tenant who can view ONE of their own running tasks tunnel into
+        # another tenant's live VM (cross-tenant takeover); trusting guest_ip lets them
+        # point the guacd RDP tunnel at an arbitrary host:3389 (SSRF — guest_host comes
+        # from this value in consumers.py). Derive both authoritatively from the gated
+        # task: _task.machine + its machine record (single-node) or the worker's VM
+        # (central mode). Ignore _claimed_label / _claimed_ip entirely.
         label = _task.machine
         guest_ip = ""
         if label:
@@ -199,17 +205,11 @@ def index(request, task_id, session_data):
                 pass
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_host_port(request, host, port):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
-    # Direct VNC opens a raw tunnel to a caller-chosen host:port with no task/tenant
-    # scoping (task_id=0). Restrict to break-glass admins (viewer_for().is_local_admin
-    # — config-aware: a plain tenant user or non-break-glass superuser is denied) —
-    # it is an operator console, never a tenant-user surface; without this a logged-in
-    # tenant user could reach any reachable host:port. Config-gated + admin-gated.
-    if not viewer_for(request.user).is_local_admin:
-        return _error(request, 0, "VNC Console is restricted to administrators")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     token = uuid.uuid4()
     try:
@@ -245,12 +245,11 @@ def direct_vnc_host_port(request, host, port):
     return response
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm(request, vm_name):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
-    if not viewer_for(request.user).is_local_admin:
-        return _error(request, 0, "VNC Console is restricted to administrators")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -309,6 +308,15 @@ def direct_vnc_vm(request, vm_name):
     if not vm_exists:
         return _error(request, 0, f"VM {vm_name} not found")
 
+    # SECURITY (codex P1 / MT audit, #172): refuse the direct console for ANY VM hosting a
+    # live CAPE analysis — BEFORE branching on running/not-running. libvirt can momentarily
+    # report a busy VM as not-running, which would otherwise fall through to the manual
+    # start page (and let an operator start/revert a VM owned by an active analysis).
+    # _vm_has_active_analysis keys off the active Guest/Task directly (race-free, not
+    # machine.locked); it returns False for a genuinely idle VM so the normal flow proceeds.
+    if _vm_has_active_analysis(vm_name):
+        return _error(request, 0, "This VM is running an active analysis — open it from the task's Remote Session, not the direct console.")
+
     # If the VM is running, check for an active Guacamole connection session
     override = request.GET.get("override") == "true"
     if is_running and not override:
@@ -346,8 +354,7 @@ def direct_vnc_vm(request, vm_name):
                 # Check if this lock belongs to a legitimate active CAPE analysis task
                 try:
                     from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
+                    from lib.cuckoo.core.data.task import Task, TASK_RUNNING
 
                     session = db.session()
                     active_task = session.query(Task).filter(
@@ -386,6 +393,8 @@ def direct_vnc_vm(request, vm_name):
             "default_snapshot": default_snapshot,
         })
 
+    # (active-analysis guard moved EARLIER — before the running/not-running branch — so it
+    # covers both the start page and the mint; see the _vm_has_active_analysis call above.)
     token = uuid.uuid4()
     try:
         guac_session = db.create_guac_session(
@@ -637,12 +646,11 @@ sys.exit(res.returncode)
                 pass
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_start(request, vm_name):
-    if not is_vnc_console_enabled():
-        return _error(request, 0, "VNC Console is disabled in configuration")
-    if not viewer_for(request.user).is_local_admin:
-        return _error(request, 0, "VNC Console is restricted to administrators")
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return _error(request, 0, _denied)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -652,6 +660,12 @@ def direct_vnc_vm_start(request, vm_name):
 
     if request.method != "POST":
         return _error(request, 0, "Invalid request method")
+
+    # SECURITY (codex P1 / MT audit, #172): never start/revert a VM that's hosting a live
+    # CAPE analysis — that would clobber the running task. Mirror direct_vnc_vm's guard,
+    # keyed off the active Guest/Task directly (race-free, not machine.locked).
+    if _vm_has_active_analysis(vm_name):
+        return _error(request, 0, "This VM is running an active analysis — it can't be started/reverted from the direct console.")
 
     start_mode = request.POST.get("start_mode", "snapshot")
     selected_snapshot = request.POST.get("selected_snapshot")
@@ -679,8 +693,7 @@ def direct_vnc_vm_start(request, vm_name):
             if machine.locked:
                 try:
                     from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
+                    from lib.cuckoo.core.data.task import Task, TASK_RUNNING
 
                     session = db.session()
                     active_task = session.query(Task).filter(
@@ -750,12 +763,11 @@ def direct_vnc_vm_start(request, vm_name):
                 pass
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_shutdown(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
-    if not viewer_for(request.user).is_local_admin:
-        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -849,17 +861,20 @@ def get_route_params(route_name, routing, configured_vpns):
 
         return interface, rt_table, reject_segments, reject_hostports
     elif route_name in configured_vpns:
+        # routing.get(route_name) is None if the VPN section is absent from
+        # routing.conf — guard before .get() so a missing section doesn't crash the
+        # route change/shutdown with an AttributeError (gemini review, PR #12).
         vpn = routing.get(route_name)
-        return vpn.get("interface"), vpn.get("rt_table"), None, None
+        if vpn:
+            return vpn.get("interface"), vpn.get("rt_table"), None, None
     return None, None, None, None
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_route(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
-    if not viewer_for(request.user).is_local_admin:
-        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Invalid request method"}, status=405)
@@ -942,12 +957,11 @@ def direct_vnc_vm_route(request, vm_name):
         }, status=500)
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshots_list(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
-    if not viewer_for(request.user).is_local_admin:
-        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -1004,12 +1018,11 @@ def direct_vnc_vm_snapshots_list(request, vm_name):
                 pass
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshot_create(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
-    if not viewer_for(request.user).is_local_admin:
-        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -1095,12 +1108,11 @@ def direct_vnc_vm_snapshot_create(request, vm_name):
                 pass
 
 
-@conditional_login_required(guac_login_required, settings.WEB_AUTHENTICATION)
+@conditional_login_required(login_required, settings.WEB_AUTHENTICATION)
 def direct_vnc_vm_snapshot_delete(request, vm_name):
-    if not is_vnc_console_enabled():
-        return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
-    if not viewer_for(request.user).is_local_admin:
-        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+    _denied = _vnc_console_denied_reason(request)
+    if _denied:
+        return JsonResponse({"status": "error", "message": _denied}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)

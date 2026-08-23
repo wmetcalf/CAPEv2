@@ -44,34 +44,12 @@ class JobLocation:
         return f"JobLocation(worker_ip={self.worker_ip!r}, cape_task_id={self.cape_task_id!r})"
 
 
-def _valid_worker_ip(ip):
-    """The broker record's sandbox_worker_ip becomes the netloc of a qemu+ssh libvirt DSN AND of
-    an authenticated apiv2 URL (central_guac.py). A poisoned/spoofed broker record with a value
-    like '1.2.3.4/system?keyfile=/attacker/key&no_verify=1&x=' or 'attacker:9999/x?a=' would
-    otherwise inject libvirt URI params or redirect the Token-bearing apiv2 request to an attacker
-    host. It is knowably a bare IP, so require it to parse as one; anything else -> None (the caller
-    then keeps the localhost/single-node path). Validating here — the one normalizer both backends
-    and both consumers flow through — is the single choke point."""
-    if not ip:
-        return None
-    import ipaddress
-
-    text = str(ip).strip()
-    try:
-        ipaddress.ip_address(text)
-    except ValueError:
-        log.warning("job_directory: ignoring non-IP sandbox_worker_ip %r from broker record", ip)
-        return None
-    return text
-
-
 def loc_from_item(item):
     """Map a broker job record (dict from DynamoDB or the broker HTTP status API — both
     use the SAME field names) to a JobLocation. Pure, so it's the unit-testable core both
-    backends share. The worker IP is validated (see _valid_worker_ip) before it reaches the
-    DSN/URL builders."""
+    backends share."""
     item = item or {}
-    return JobLocation(_valid_worker_ip(item.get("sandbox_worker_ip")), item.get("cape_task_id"))
+    return JobLocation(item.get("sandbox_worker_ip"), item.get("cape_task_id"))
 
 
 class JobDirectory:
@@ -126,9 +104,6 @@ class BrokerHttpJobDirectory(JobDirectory):
             headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
             r = requests.get(f"{self.broker_url}/api/status/{job_id}", headers=headers, timeout=10)
             if r.status_code != 200:
-                # Log the non-200 (stale broker_url/broker_api_token is the likely misconfig) so a
-                # dead lookup is diagnosable instead of silently degrading to (None, None) == "no job".
-                log.warning("job_directory(broker_http): status %s for %s (check broker_url/broker_api_token)", r.status_code, job_id)
                 return None
             item = r.json() or {}
         except Exception as e:
@@ -140,16 +115,16 @@ class BrokerHttpJobDirectory(JobDirectory):
 def get_job_directory(cfg):
     """Return a JobDirectory for the central-mode config, or None when central mode is off
     or no directory is configured — in which case central_guac's callers keep their
-    single-node/localhost path unchanged. Default backend is 'broker_http' (vendor-neutral —
-    resolves via the broker's HTTP API); 'dynamodb' (AWS) is opt-in."""
+    single-node/localhost path unchanged. Default backend is 'dynamodb' (our AWS broker),
+    selected unless [central_mode] job_directory='broker_http'."""
     if not getattr(cfg, "enabled", False):
         return None
-    backend = (getattr(cfg, "job_directory", "") or "broker_http").strip().lower()
+    backend = (getattr(cfg, "job_directory", "") or "dynamodb").strip().lower()
     if backend == "broker_http":
         if not getattr(cfg, "broker_url", ""):
             return None
         return BrokerHttpJobDirectory(cfg.broker_url, getattr(cfg, "broker_api_token", ""))
-    # 'dynamodb' (opt-in, AWS) — None if broker_table unset (matches the pre-abstraction gate).
+    # default: dynamodb — None if broker_table unset (matches the pre-abstraction gate).
     if not getattr(cfg, "broker_table", ""):
         return None
     return DynamoJobDirectory(cfg.broker_table, getattr(cfg, "s3_region", "us-east-1"))

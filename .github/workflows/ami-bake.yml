@@ -1,0 +1,278 @@
+name: ami-bake
+
+# Triggered by a `cape-deb-promote-to-prod` repository_dispatch from the
+# IaC repo's cape-deb-e2e workflow after Layers 4 + 5 pass against the
+# dev apt channel. Bakes a new cape-host-base AMI and opens a PR against
+# the aws-nested-virt IaC repo's terraform/nestedvirt-ami/terraform.tfvars
+# to roll the new source_ami_id.
+#
+# Two-phase: Packer for the warm AMI (cape-* installed, qcow2 staged),
+# then a follow-on AWS CLI bake on m8i.8xlarge with NestedVirtualization
+# enabled to run clone-win11-vms.sh and capture snapshot1 state. See
+# aws-nested-virt/packer/cape-host.pkr.hcl for the rationale for the split.
+#
+# Required secrets:
+#   AMI_BAKE_ROLE_ARN         OIDC role: ec2:*, ssm:SendCommand, iam:PassRole
+#                             on the build instance profile
+# No cross-repo dispatch token needed: the IaC nestedvirt-ami stack uses
+# `data "aws_ami"` filtered on `Purpose=cape-host-base + Retention=keep`,
+# so a fresh `terraform apply` automatically picks up the AMI we tag here.
+#
+# Required vars:
+#   AMI_BAKE_SUBNET_ID
+#   AMI_BAKE_VPC_ID
+#   AMI_BAKE_SECURITY_GROUP_ID
+#   AMI_BAKE_INSTANCE_PROFILE      profile name granting ssm:* + s3:Get on qcow2
+#   APT_REPO_URL                   prod apt CDN URL
+#   APT_KEYRING_URL                prod keyring URL
+#   QCOW2_S3_BUCKET                bucket holding win11_seabios.qcow2
+#   QCOW2_S3_KEY                   default images/win11_seabios.qcow2
+
+on:
+  repository_dispatch:
+    types: [cape-deb-promote-to-prod]
+  workflow_dispatch:
+    inputs:
+      cape_core_version:        { type: string, required: true }
+      cape_signatures_version:  { type: string, required: true }
+      cape_qemu_version:        { type: string, required: true }
+      cape_suricata_version:    { type: string, required: true }
+      previous_ami_id:          { type: string, required: false, description: 'optional; tagged Retention=superseded if set' }
+      # 64-char sha256 of the sorted-JSON dict of OS-affecting cape-*
+      # deb hashes (computed in apt-publish.yml's "Compute OS-affecting
+      # deb sha256s" step).  Stored as the OsDebHashes tag on the
+      # produced AMI so the next apt-publish can skip ami-bake when
+      # the OS-affecting deb set is byte-identical to this AMI's
+      # (host-side timers handle threat-content deltas).
+      os_deb_hashes_digest:     { type: string, required: false, default: '', description: '64-char combined sha256; tagged on AMI as OsDebHashes for skip-ami-bake check' }
+  # packer/** changes don't change cape-* deb contents (those go through
+  # cape-build → apt-publish-* → cape-deb-e2e → promote → ami-bake) but
+  # they DO change how the AMI is built around the same cape-* versions
+  # — e.g. base-OS apt upgrade additions, new provisioner scripts,
+  # changed install order.  Without this trigger every packer/** edit
+  # required either waiting for the next deb change or operator manual
+  # workflow_dispatch.  The Resolve step below pulls the current prod
+  # cape-* versions from the apt Packages index at runtime so push-
+  # triggered runs bake the same versions that are deployed today.
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/packer/**'
+      - '.github/workflows/ami-bake.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ami-bake
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      new_ami_id: ${{ steps.phase2.outputs.new_ami_id }}
+      cape_core_version: ${{ steps.vars.outputs.cape_core_version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve inputs
+        id: vars
+        env:
+          APT_REPO_URL:  ${{ vars.APT_REPO_URL }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            cc="${{ github.event.client_payload.cape_core_version }}"
+            cs="${{ github.event.client_payload.cape_signatures_version }}"
+            cq="${{ github.event.client_payload.cape_qemu_version }}"
+            csu="${{ github.event.client_payload.cape_suricata_version }}"
+            prev="${{ github.event.client_payload.previous_ami_id }}"
+            os_digest="${{ github.event.client_payload.os_deb_hashes_digest }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            # packer/** change pushed to main.  No operator-supplied
+            # versions in this trigger path — pull the current prod
+            # cape-* versions straight from the apt Packages.gz so the
+            # bake reproduces what's deployed today, with the new
+            # packer code wrapping it.
+            echo "Resolving cape-* versions from prod apt index..."
+            tmp=$(mktemp)
+            curl -fsSL \
+              "$APT_REPO_URL/Packages.gz" \
+              | gunzip > "$tmp"
+            resolve() {
+              awk -v pkg="$1" '
+                /^Package: / { p=$2 }
+                /^Version: / && p==pkg { print $2; exit }
+              ' "$tmp"
+            }
+            cc=$(resolve cape-core)
+            cs=$(resolve cape-signatures)
+            cq=$(resolve cape-qemu)
+            csu=$(resolve cape-suricata)
+            prev=""
+            rm -f "$tmp"
+            for v in "$cc" "$cs" "$cq" "$csu"; do
+              [[ -n "$v" ]] || {
+                echo "::error::missing version in prod apt index (cc=$cc cs=$cs cq=$cq csu=$csu)"
+                exit 1
+              }
+            done
+          else
+            cc="${{ inputs.cape_core_version }}"
+            cs="${{ inputs.cape_signatures_version }}"
+            cq="${{ inputs.cape_qemu_version }}"
+            csu="${{ inputs.cape_suricata_version }}"
+            prev="${{ inputs.previous_ami_id }}"
+            os_digest="${{ inputs.os_deb_hashes_digest }}"
+          fi
+          # os_digest default for the non-workflow_dispatch trigger paths
+          # (repository_dispatch w/o the field + push) — these don't
+          # carry the digest, so the produced AMI lands without the
+          # OsDebHashes tag.  Tag-missing is treated as "must bake" by
+          # the apt-publish skip-check, so the next prod publish bakes
+          # unconditionally until a hash-bearing AMI lands.
+          : "${os_digest:=}"
+          {
+            echo "cape_core_version=$cc"
+            echo "cape_signatures_version=$cs"
+            echo "cape_qemu_version=$cq"
+            echo "cape_suricata_version=$csu"
+            echo "previous_ami_id=$prev"
+            echo "os_deb_hashes_digest=$os_digest"
+          } >> "$GITHUB_OUTPUT"
+          echo "Baking with: cape-core=$cc cape-signatures=$cs cape-qemu=$cq cape-suricata=$csu"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AMI_BAKE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # ami-bake routinely runs ~50min (Phase 1 Packer ~12min +
+          # Phase 2 15-min VM warmup + snapshot + AMI create + waiter).
+          # Default 1h STS session has each bake straddle the TTL and
+          # the final `aws ec2 wait instance-stopped` errors with
+          # RequestExpired.  Role MaxSessionDuration bumped to 7200s
+          # in the apt-repo/content stack's terraform to match.
+          role-duration-seconds: 7200
+
+      - name: Install Packer
+        run: |
+          set -euo pipefail
+          # Direct download of pinned packer binary.  HashiCorp's apt
+          # repo's Packages.gz is served as a 20-byte truncated stub
+          # as of 2026-05-15, so `apt-get install packer` fails with
+          # "Package 'packer' has no installation candidate".  Same
+          # outage that broke cape-deb-e2e's terraform install.  The
+          # .zip release at releases.hashicorp.com is the canonical
+          # source and unaffected.
+          PACKER_VERSION="1.13.1"
+          curl -fsSL -o /tmp/packer.zip \
+            "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip"
+          sudo unzip -o /tmp/packer.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/packer
+          packer version
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends jq
+
+      - name: Phase 1 — Packer warm AMI
+        id: phase1
+        env:
+          PKR_VAR_apt_repo_url:            ${{ vars.APT_REPO_URL }}
+          PKR_VAR_apt_keyring_url:         ${{ vars.APT_KEYRING_URL }}
+          PKR_VAR_subnet_id:               ${{ vars.AMI_BAKE_SUBNET_ID }}
+          PKR_VAR_vpc_id:                  ${{ vars.AMI_BAKE_VPC_ID }}
+          PKR_VAR_instance_profile:        ${{ vars.AMI_BAKE_INSTANCE_PROFILE }}
+          PKR_VAR_qcow2_s3_bucket:         ${{ vars.QCOW2_S3_BUCKET }}
+          PKR_VAR_qcow2_s3_key:            ${{ vars.QCOW2_S3_KEY }}
+          PKR_VAR_cape_core_version:       ${{ steps.vars.outputs.cape_core_version }}
+          PKR_VAR_cape_signatures_version: ${{ steps.vars.outputs.cape_signatures_version }}
+          PKR_VAR_cape_qemu_version:       ${{ steps.vars.outputs.cape_qemu_version }}
+          PKR_VAR_cape_suricata_version:   ${{ steps.vars.outputs.cape_suricata_version }}
+          PKR_VAR_build_run_id:            ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt/packer
+          packer init cape-host.pkr.hcl
+          packer build -on-error=cleanup cape-host.pkr.hcl
+          # Manifest emits {"builds": [{"artifact_id": "us-east-1:ami-..."}]}
+          warm_ami=$(jq -r '.builds[-1].artifact_id' packer-manifest.json | cut -d':' -f2)
+          echo "warm_ami_id=$warm_ami" >> "$GITHUB_OUTPUT"
+          echo "Phase 1 produced $warm_ami"
+
+      - name: Phase 2 — clone-snapshot bake on nested-virt host
+        id: phase2
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          new_ami_id=$(./aws-nested-virt/packer/ami-bake-clone-phase.sh \
+              --warm-ami-id          "${{ steps.phase1.outputs.warm_ami_id }}" \
+              --subnet-id            "${{ vars.AMI_BAKE_SUBNET_ID }}" \
+              --security-group-id    "${{ vars.AMI_BAKE_SECURITY_GROUP_ID }}" \
+              --instance-profile     "${{ vars.AMI_BAKE_INSTANCE_PROFILE }}" \
+              --cape-core-version    "${{ steps.vars.outputs.cape_core_version }}" \
+              --cape-signatures-version "${{ steps.vars.outputs.cape_signatures_version }}" \
+              --cape-qemu-version    "${{ steps.vars.outputs.cape_qemu_version }}" \
+              --cape-suricata-version "${{ steps.vars.outputs.cape_suricata_version }}" \
+              --previous-ami-id      "${{ steps.vars.outputs.previous_ami_id }}" \
+              --os-deb-hashes-digest "${{ steps.vars.outputs.os_deb_hashes_digest }}" \
+              | tail -1)
+          echo "new_ami_id=$new_ami_id" >> "$GITHUB_OUTPUT"
+          echo "Phase 2 produced $new_ami_id"
+
+      - name: Terminate Phase 2 builder (always — guard against leaks on cancel)
+        if: always()
+        env:
+          BAKE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Belt-and-suspenders builder cleanup.  ami-bake-clone-phase.sh
+          # terminates its own instance on normal/error exit and now traps
+          # SIGTERM/INT too, but if GitHub cancels the job hard the script
+          # may not finish.  always() steps DO run during the cancellation
+          # grace window.  The builder is tagged BakeRunId=<this run> at
+          # launch, so discover it from AWS (source of truth — no env/file
+          # propagation that a cancelled step might drop) and terminate it.
+          # Scoped to THIS run id, so concurrent bakes' builders are never
+          # touched.  A cut-short bake must never leak an m8i.8xlarge (the
+          # source of a past orphaned builder; its 1TB root volume is
+          # DeleteOnTermination).
+          ids=$(aws ec2 describe-instances \
+              --filters "Name=tag:BakeRunId,Values=${BAKE_RUN_ID}" \
+                        "Name=tag:Purpose,Values=cape-host-base-bake" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)
+          if [ -n "$ids" ]; then
+              read -ra id_arr <<< "$ids"
+              echo "Terminating Phase 2 builder(s) for run ${BAKE_RUN_ID}: ${id_arr[*]}"
+              aws ec2 terminate-instances --instance-ids "${id_arr[@]}" >/dev/null 2>&1 || true
+          else
+              echo "No Phase 2 builder found for run ${BAKE_RUN_ID} (already cleaned up)."
+          fi
+
+      - name: Deregister warm AMI (always — it's not promoted)
+        if: always() && steps.phase1.outputs.warm_ami_id != ''
+        run: |
+          set -euo pipefail
+          # The warm AMI is intermediate. Deregistering it cleans up the
+          # block-device snapshot too if we capture the snapshot id first.
+          warm="${{ steps.phase1.outputs.warm_ami_id }}"
+          snap_ids=$(aws ec2 describe-images --image-ids "$warm" \
+              --query 'Images[0].BlockDeviceMappings[].Ebs.SnapshotId' \
+              --output text 2>/dev/null || true)
+          aws ec2 deregister-image --image-id "$warm" 2>/dev/null || true
+          for s in $snap_ids; do
+              aws ec2 delete-snapshot --snapshot-id "$s" 2>/dev/null || true
+          done
+
+  # Post-bake handoff to the IaC repo is now data-driven: ami-bake stamps
+  # the new AMI with `Purpose=cape-host-base` + `Retention=keep` (and the
+  # previous lineage's AMI with `Retention=superseded`). The IaC stack's
+  # nestedvirt-ami `data "aws_ami"` lookup picks the new one up on next
+  # `terraform apply`. No tfvars PR, no cross-repo dispatch needed.
+  #
+  # Operators wanting to pin/rollback can pass `-var='source_ami_id=…'`
+  # on the IaC stack — the data lookup is gated on the var being empty.

@@ -1,0 +1,17 @@
+# managed via cape-host-config.deb.  Mode 0440 root:root —
+# anything else and sudo refuses to load it ("sudoers is world-
+# writable" / "sudoers is owned by uid X, should be 0").
+#
+# Grants the cape service account passwordless sudo so operators
+# SSH'd in as `cape` can run systemctl / virsh / journalctl without
+# needing a second account.  Matches install-nestedvirt.sh::
+# configure_cape_admin_access which dropped /etc/sudoers.d/90-cape-
+# admin with the same line at first boot.
+#
+# Justification: cape is the CAPE service account and already owns
+# /opt/CAPEv2/storage/, /home/cape/, the libvirt connection, and the
+# postgres `cape` DB role.  Giving it sudo doesn't widen the blast
+# radius materially over what cape can already do, and it eliminates
+# the operator-needs-ubuntu-key second-account pattern the bootstrap-
+# from-QCOW2 path required.
+cape ALL=(ALL) NOPASSWD:ALL

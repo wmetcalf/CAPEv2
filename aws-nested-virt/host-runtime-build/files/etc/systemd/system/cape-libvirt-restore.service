@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore CAPE libvirt networks and domains
+After=libvirtd.service
+Wants=libvirtd.service
+Before=cape-routing.service cape.service cape-web.service cape-processor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-cape-libvirt-state.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

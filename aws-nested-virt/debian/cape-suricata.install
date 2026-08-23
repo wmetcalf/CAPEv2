@@ -1,0 +1,31 @@
+# cape-suricata: Suricata staged under debian/cape-suricata/ by the
+# build-cape-suricata rule (suricata_from_source.sh DESTDIR).
+
+usr/bin/suricata
+usr/bin/suricata-update
+usr/bin/suricatactl
+usr/bin/suricatasc
+usr/lib/x86_64-linux-gnu/libsuricata*
+# Bundled libhtp.so.2 (suricata 7 ships its own htp under libhtp/
+# because Ubuntu noble's libhtp-dev is too old).  Without this glob
+# the binary can't load and fails at startup with:
+#   suricata: error while loading shared libraries: libhtp.so.2:
+#   cannot open shared object file: No such file or directory
+usr/lib/x86_64-linux-gnu/libhtp*
+# Python suricata-update module.  /usr/bin/suricata-update wrapper
+# does:
+#   libpath = realpath(__file__/../lib/suricata/python)
+#   if exists(libpath/suricata/update): sys.path.insert(0, libpath)
+#   from suricata.update import main
+# So as long as we ship /usr/lib/suricata/python/suricata/update/...
+# the wrapper finds it via the relative-path probe.  `make install`
+# in suricata-7.x's python/ and suricata-update/ subdirs installs
+# the modules directly to /usr/lib/suricata/python/ — no setup.py
+# step needed.  Caught when build.sh attempted `python3 setup.py
+# install` and failed (no setup.py exists at that path in 7.x).
+usr/lib/suricata/python
+usr/share/suricata
+etc/suricata/suricata.yaml
+etc/suricata/classification.config
+etc/suricata/reference.config
+etc/suricata/threshold.config

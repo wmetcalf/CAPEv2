@@ -1,0 +1,140 @@
+name: suricata-build
+
+# Builds the patched Suricata `.deb` (cape-suricata) from source. Triggered
+# on changes to aws-nested-virt/suricata-build/ / aws-nested-virt/debian/cape-suricata.*
+# on main, or manually via workflow_dispatch.
+#
+# Why a dedicated workflow: the compile takes ~6 min cold and Suricata
+# rarely changes (we pin a specific upstream version). Splitting it out
+# of cape-build keeps every cape-core/cape-signatures push fast (~1-2 min)
+# and only fires when the build actually has new inputs.
+#
+# Caching: actions/cache restores the populated DESTDIR keyed on the
+# tree hash of aws-nested-virt/suricata-build/ + aws-nested-virt/debian/cape-suricata.* +
+# the configured SURICATA_VERSION. Cache hit → skip the compile, just re-run package.sh
+# (cheap). The .deb itself is uploaded as a workflow artifact that
+# apt-publish.yml fans in.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/suricata-build/**'
+      - 'aws-nested-virt/debian/cape-suricata.*'
+      - '.github/workflows/suricata-build.yml'
+  workflow_dispatch:
+    inputs:
+      suricata_version:
+        description: 'Upstream Suricata version (default 7.0.13)'
+        type: string
+        required: false
+        default: '7.0.13'
+      cape_revision:
+        description: 'Package revision suffix (e.g. "1" → 7.0.13+cape.1)'
+        type: string
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suricata-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ubuntu:24.04
+    env:
+      SURICATA_VERSION: ${{ inputs.suricata_version || '7.0.13' }}
+      CAPE_REVISION: ${{ inputs.cape_revision || '1' }}
+      DESTDIR: ${{ github.workspace }}/build/cape-suricata-destdir
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install base toolchain
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          # Build dependencies for Suricata 7.x. Notes:
+          # - libhtp-dev intentionally omitted: Ubuntu 24.04 ships 0.5.41
+          #   (too old). Use suricata's bundled libhtp.
+          # - python3 + python3-yaml needed for suricata-update build step.
+          # - PCRE2-JIT instead of hyperscan (deprecated upstream).
+          apt-get install -y -qq --no-install-recommends \
+              build-essential autoconf automake libtool pkg-config \
+              libpcap-dev libnet1-dev libyaml-0-2 libyaml-dev zlib1g-dev \
+              libcap-ng-dev libmagic-dev libjansson-dev liblz4-dev \
+              libpcre2-dev libnss3-dev libnspr4-dev \
+              libnetfilter-queue-dev libnfnetlink-dev \
+              rustc cargo \
+              python3 python3-yaml \
+              git curl ca-certificates dpkg-dev fakeroot file
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Mark workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute cache key
+        id: cachekey
+        run: |
+          set -euo pipefail
+          # Hash the build inputs: scripts, install manifest, postinst, version.
+          h=$(cat \
+                aws-nested-virt/suricata-build/build.sh \
+                aws-nested-virt/suricata-build/package.sh \
+                aws-nested-virt/debian/cape-suricata.install \
+                aws-nested-virt/debian/cape-suricata.postinst \
+                <(echo "$SURICATA_VERSION") \
+              | sha256sum | awk '{print $1}')
+          echo "key=suricata-destdir-${h:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DESTDIR cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DESTDIR }}
+          key: ${{ steps.cachekey.outputs.key }}
+
+      - name: Compile Suricata (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$DESTDIR"
+          cd aws-nested-virt && bash suricata-build/build.sh
+
+      - name: Sanity-check cached DESTDIR (cache hit)
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          test -x "$DESTDIR/usr/bin/suricata" \
+            || { echo "::error::cached DESTDIR is incomplete; cache key collision?"; exit 1; }
+          "$DESTDIR/usr/bin/suricata" --build-info | grep -q "Unix socket enabled:.*yes" \
+            || { echo "::error::cached suricata missing unix-socket support"; exit 1; }
+
+      - name: Build cape-suricata.deb
+        env:
+          PACKAGE_VERSION: ${{ env.SURICATA_VERSION }}+cape.${{ env.CAPE_REVISION }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          cd aws-nested-virt && bash suricata-build/package.sh
+          ls -la "$OUT_DIR"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-suricata-debs-${{ github.sha }}
+          path: aws-nested-virt/dist/cape-suricata_*.deb
+          if-no-files-found: error
+          retention-days: 90

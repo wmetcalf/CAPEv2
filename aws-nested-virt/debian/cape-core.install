@@ -1,0 +1,37 @@
+# cape-core file installation map.
+#
+# The CAPE source tree ships as a whole to /opt/CAPEv2/ via an rsync
+# step in debian/rules's override_dh_install (equivalent to the legacy
+# `git clone <cape-repo> /opt/CAPEv2/` shape minus .git*).  Non-runtime
+# cruft (docs, tests, KnowledgeBaseBot, *.md, LICENSE, *.lock) gets
+# stripped from /opt/CAPEv2/ after the copy; see the strip step in
+# override_dh_install.
+#
+# Path model (fork re-root): CAPE source is the source-package ROOT, so
+# paths here are ROOT-relative (systemd/… not cape/systemd/…).  The
+# sandbox pipeline machinery lives under aws-nested-virt/ at the fork
+# root, so sandbox-owned paths (scripts/) are referenced from there.
+#
+# Reason for the whole-tree approach: shipping CAPE subdirs
+# individually here bit us repeatedly when CAPE source referenced
+# a subdir we forgot to enumerate.  In one session we shipped four
+# follow-up PRs (#82 dev_utils, #79 conf/default, #81 extra, #96
+# cuckoo.py, #99 analyzer + custom) for things shipped piecemeal.
+# Whole-tree copy avoids that class of bug entirely.
+#
+# This file lists paths OUTSIDE /opt/CAPEv2/ that dh_install
+# handles directly:
+
+# systemd units → /lib/systemd/system/
+systemd/cape.service              /lib/systemd/system/
+systemd/cape-web.service          /lib/systemd/system/
+systemd/cape-rooter.service       /lib/systemd/system/
+systemd/cape-processor.service    /lib/systemd/system/
+systemd/guac-web.service          /lib/systemd/system/
+
+# AMI-bake + nestedvirt host scripts (clone-win11-vms.sh, etc.).
+# These live in the sandbox pipeline tree — not part of the upstream
+# CAPE source — which sits at aws-nested-virt/ at the fork root.
+# ami-bake-clone-phase.sh expects /opt/CAPEv2/scripts/clone-win11-vms.sh
+# at runtime; we ship that dir from aws-nested-virt/scripts/.
+aws-nested-virt/scripts        /opt/CAPEv2/

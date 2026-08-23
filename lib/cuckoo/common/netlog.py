@@ -276,7 +276,7 @@ class BsonParser:
                     log.warning("Inconsistent arg count (compared to arg names) on %s: %s names %s", dec, argnames, apiname)
                     continue
 
-                argdict = {name: conv(arg) for name, conv, arg in zip(argnames, converters, args)}
+                argdict = {argnames[i]: converters[i](arg) for i, arg in enumerate(args)}
 
                 if apiname == "__process__":
                     # Special new process message from cuckoomon.
@@ -408,7 +408,8 @@ class ProtobufParser:
 
             arguments = []
             if len(call.arguments) == len(argnames):
-                arguments = [(name, conv(val)) for name, conv, val in zip(argnames, converters, call.arguments)]
+                 for i, val in enumerate(call.arguments):
+                     arguments.append((argnames[i], converters[i](val)))
 
             self.fd.log_call(context, apiname, category, arguments)
 

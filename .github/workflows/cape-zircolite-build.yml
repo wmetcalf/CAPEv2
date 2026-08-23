@@ -1,0 +1,129 @@
+name: cape-zircolite-build
+
+# Builds `cape-zircolite.deb` — the Zircolite sigma-detection engine
+# (github.com/wagga40/Zircolite) installed to /opt/zircolite.  Paired
+# with cape-sigma-rules (rule packs) + cape-core's pysigma venv deps +
+# the [sigma] processing config to make sigma detections work.
+#
+# Engine, not threat content: cape-zircolite is in apt-publish's
+# OS-affecting deb set, so a version bump triggers an AMI rebake (it
+# can't be hot-swapped via cape-threat-update.timer the way the rule
+# packs can).
+#
+# Triggers:
+#   - monthly cron (Zircolite releases infrequently)
+#   - workflow_dispatch (ad-hoc / pinned-tag rebuilds)
+#   - push to aws-nested-virt/cape-zircolite-build/ or this workflow file
+#
+# Artifact: cape-zircolite-debs-<tag>  (consumed by apt-publish fan-in)
+
+on:
+  schedule:
+    - cron: '41 6 1 * *'   # 06:41 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      pinned_tag:
+        description: 'Pin to a specific Zircolite release tag (blank = latest)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/cape-zircolite-build/**'
+      - '.github/workflows/cape-zircolite-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cape-zircolite-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed:      ${{ steps.check.outputs.changed }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare upstream Zircolite tag vs. apt repo version
+        id: check
+        env:
+          # Probe the DEV deb release's flat Packages.gz (its own release
+          # tag, addressed as a full base — no channel sub-path). Dev
+          # publishes first; prod follows via promote, so the check stays
+          # aligned with the latest version the pipeline shipped.
+          APT_REPO_URL:  ${{ vars.APT_DEV_REPO_URL }}
+          FORCE_REBUILD: ${{ github.event_name != 'schedule' }}
+          ZIRCOLITE_TAG: ${{ inputs.pinned_tag }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash cape-zircolite-build/check-changed.sh | tee /tmp/check.out
+          grep -E '^(changed|upstream_tag)=' /tmp/check.out >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + upload artifact
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev git ca-certificates curl python3 jq
+
+      - name: Fetch Zircolite
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIRCOLITE_TAG: ${{ inputs.pinned_tag }}
+          WORK_DIR: ${{ github.workspace }}/.work
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash cape-zircolite-build/fetch.sh
+
+      - name: Capture tag for version + artifact name
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="$(cat .work/release-tag)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          ver="${tag#v}"
+          ver="$(printf '%s' "$ver" | tr -c 'A-Za-z0-9.+~:-' '-')"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$tag version=$ver"
+
+      - name: Package cape-zircolite.deb
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+          PACKAGE_VERSION: ${{ steps.tag.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash cape-zircolite-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-zircolite_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb" | grep -q "opt/zircolite/zircolite.py" \
+            || { echo "::error::zircolite.py not in the deb"; exit 1; }
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-zircolite-debs-${{ steps.tag.outputs.tag }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

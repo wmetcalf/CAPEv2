@@ -1,0 +1,35 @@
+[Unit]
+Description=OpenVPN PIA Tunnel for CAPE
+After=network.target
+Wants=network.target
+
+# Only start the tunnel if PIA credentials have actually been provisioned.
+# An empty / missing credentials file would cause openvpn to auth-fail in
+# a tight restart loop and downstream cape services would hang on tun0.
+# Operators that want VPN routing supply credentials via the
+# pia_credentials_file tfvar (Terraform-managed) or by dropping the file
+# on a running host and `systemctl enable --now openvpn-pia.service`.
+ConditionPathExists=/etc/openvpn/pia/credentials
+
+[Service]
+Type=forking
+PIDFile=/run/openvpn/pia-cape.pid
+ExecStartPre=-/usr/bin/pkill -f 'openvpn.*pia-cape'
+ExecStartPre=-/sbin/ip tuntap del dev tun0 mode tun
+ExecStartPre=-/sbin/ip link delete tun0
+ExecStartPre=/bin/sh -c '/sbin/ip route add default via 0.0.0.0 dev lo table 100 || true'
+ExecStart=/usr/sbin/openvpn --daemon ovpn-pia-cape --writepid /run/openvpn/pia-cape.pid --status /run/openvpn/pia-cape.status 10 --cd /etc/openvpn --script-security 2 --config /etc/openvpn/pia-cape.conf
+ExecStartPost=/bin/sleep 15
+ExecStartPost=/bin/sh -c '/sbin/ip route add default dev tun0 table 100 || true'
+ExecStartPost=/bin/sh -c '/sbin/ip route add 10.0.0.0/8 via 0.0.0.0 dev lo table 100 || true'
+ExecStartPost=/bin/sh -c '/sbin/ip route add 172.16.0.0/12 via 0.0.0.0 dev lo table 100 || true'
+ExecStartPost=/bin/sh -c '/sbin/ip route add 192.168.0.0/16 via 0.0.0.0 dev lo table 100 || true'
+ExecStop=/bin/kill -TERM $MAINPID
+ExecStopPost=-/sbin/ip tuntap del dev tun0 mode tun
+ExecStopPost=-/sbin/ip link delete tun0
+Restart=on-failure
+RestartSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

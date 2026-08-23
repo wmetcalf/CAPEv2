@@ -1,0 +1,9 @@
+sandbox-cape (0.1.0~unreleased) UNRELEASED; urgency=medium
+
+  * Initial scaffolding of debian/ packaging for cape-core, cape-signatures,
+    cape-qemu, and cape-suricata.
+  * Source tree, fork branch, and CI publish path are still in flight; no
+    binary builds yet. This package is not buildable until the cape/ and
+    community/ subtrees are populated.
+
+ -- CAPEv2 AWS Nested-Virt <noreply@example.invalid>  Tue, 06 May 2026 13:55:00 -0500

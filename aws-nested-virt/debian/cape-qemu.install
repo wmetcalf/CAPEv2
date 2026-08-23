@@ -1,0 +1,29 @@
+# cape-qemu: QEMU + SeaBIOS binaries staged under
+# debian/cape-qemu/ by the build-cape-qemu rule (kvm-qemu.sh DESTDIR).
+# The script installs to standard FHS paths under DESTDIR; we just
+# need dh_install to consume the resulting tree.
+
+usr/bin/qemu-system-x86_64
+usr/bin/qemu-img
+usr/bin/qemu-io
+usr/bin/qemu-nbd
+usr/share/qemu/bios.bin
+usr/share/qemu/bios-256k.bin
+usr/share/qemu/vgabios*.bin
+usr/share/qemu/efi-*.rom
+usr/share/qemu/kvmvapic.bin
+usr/share/qemu/linuxboot*.bin
+usr/share/qemu/multiboot*.bin
+usr/share/qemu/pxe-*.rom
+usr/share/qemu/sgabios.bin
+usr/share/qemu/petitboot-*.bin
+# Keymaps for the -vnc/-display backends.  The win11 template XML
+# uses a VNC graphics device; qemu errors at attach with
+#   -vnc 127.0.0.1:0,audiodev=audio1: could not read keymap file: 'en-us'
+# when this directory is absent.  Surfaced on a validation deploy off
+# a baked AMI after an earlier XML fix unblocked the earlier
+# vmx-invvpid-single-context-noglobals failure — same class as an earlier
+# libaio/liburing miss: hand-rolled manifest skipped a file the
+# upstream `make install` produced.
+usr/share/qemu/keymaps/*
+usr/lib/x86_64-linux-gnu/qemu/*

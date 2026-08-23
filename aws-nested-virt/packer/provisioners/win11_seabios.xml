@@ -1,0 +1,214 @@
+<domain type='kvm'>
+  <name>win11_seabios</name>
+  <uuid>a1b2c3d4-e5f6-7890-abcd-ef1234567890</uuid>
+  <metadata xmlns:ns0="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+    <ns0:libosinfo>
+      <ns0:os id="http://microsoft.com/win/11"/>
+    </ns0:libosinfo>
+  </metadata>
+  <memory unit='KiB'>4194304</memory>
+  <currentMemory unit='KiB'>4194304</currentMemory>
+  <vcpu placement='static'>2</vcpu>
+  <resource>
+    <partition>/machine</partition>
+  </resource>
+  <sysinfo type='smbios'>
+    <bios>
+      <entry name='vendor'>Dell Inc.</entry>
+      <entry name='version'>2.15.0</entry>
+      <entry name='date'>08/14/2021</entry>
+    </bios>
+    <system>
+      <entry name='manufacturer'>Dell Inc.</entry>
+      <entry name='product'>Precision 5820</entry>
+      <entry name='version'>1.0</entry>
+      <entry name='serial'>9DKXKZ1</entry>
+      <entry name='uuid'>a1b2c3d4-e5f6-7890-abcd-ef1234567890</entry>
+      <entry name='sku'>Precision 5820</entry>
+      <entry name='family'>Precision</entry>
+    </system>
+    <baseBoard>
+      <entry name='manufacturer'>Dell Inc.</entry>
+      <entry name='product'>0MCCHN</entry>
+      <entry name='version'>A00</entry>
+      <entry name='serial'>9DKXKZ1</entry>
+    </baseBoard>
+    <chassis>
+      <entry name='manufacturer'>Dell Inc.</entry>
+      <entry name='version'>1.0</entry>
+      <entry name='serial'>9DKXKZ1</entry>
+      <entry name='asset'>Dell</entry>
+      <entry name='sku'>Precision 5820</entry>
+    </chassis>
+  </sysinfo>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-4.0'>hvm</type>
+    <boot dev='cdrom'/>
+    <boot dev='hd'/>
+    <bootmenu enable='no'/>
+    <smbios mode='sysinfo'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vendor_id state='on' value='GenuineIntel'/>
+    </hyperv>
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+    <vmport state='off'/>
+  </features>
+  <cpu mode='custom' match='exact' check='none'>
+    <model fallback='forbid'>Skylake-Server-noTSX-IBRS</model>
+    <topology sockets='1' dies='1' clusters='1' cores='2' threads='1'/>
+    <feature policy='disable' name='hypervisor'/>
+    <feature policy='disable' name='mpx'/>
+    <feature policy='require' name='vmx'/>
+    <feature policy='require' name='vme'/>
+    <feature policy='require' name='arat'/>
+    <feature policy='require' name='xsaveopt'/>
+    <feature policy='require' name='vmx-ins-outs'/>
+    <feature policy='require' name='vmx-true-ctls'/>
+    <feature policy='require' name='vmx-store-lma'/>
+    <feature policy='require' name='vmx-activity-hlt'/>
+    <feature policy='require' name='vmx-apicv-xapic'/>
+    <feature policy='require' name='vmx-ept'/>
+    <feature policy='require' name='vmx-desc-exit'/>
+    <feature policy='require' name='vmx-rdtscp-exit'/>
+    <feature policy='require' name='vmx-apicv-x2apic'/>
+    <feature policy='require' name='vmx-vpid'/>
+    <feature policy='require' name='vmx-wbinvd-exit'/>
+    <feature policy='require' name='vmx-unrestricted-guest'/>
+    <feature policy='require' name='vmx-ept-execonly'/>
+    <feature policy='require' name='vmx-page-walk-4'/>
+    <feature policy='require' name='vmx-ept-2mb'/>
+    <feature policy='require' name='vmx-ept-1gb'/>
+    <feature policy='require' name='vmx-invept'/>
+    <feature policy='require' name='vmx-invept-single-context'/>
+    <feature policy='require' name='vmx-invept-all-context'/>
+    <feature policy='require' name='vmx-invvpid'/>
+    <feature policy='require' name='vmx-invvpid-single-addr'/>
+    <feature policy='require' name='vmx-invvpid-all-context'/>
+    <!-- vmx-invvpid-single-context-noglobals: removed.  Not a real CPU
+         feature; qemu 9.2.4 does not expose a property by this name
+         (only vmx-invept-single-context-noglobals exists — INVEPT, not
+         INVVPID).  Some older QEMU forks may have accepted the unknown
+         name silently; mainline 9.2.4 errors with:
+           can't apply global Skylake-Server-noTSX-IBRS-x86_64-cpu.
+           vmx-invvpid-single-context-noglobals=on: Property ... not found
+         which makes qemu exit before the guest starts.  Every win11
+         clone bake then ran the 15-minute warmup against shutoff
+         domains and snapshotted them in shutoff state, which CAPE
+         later rejects with "Snapshot is not in a 'running' state". -->
+    <feature policy='require' name='vmx-intr-exit'/>
+    <feature policy='require' name='vmx-nmi-exit'/>
+    <feature policy='require' name='vmx-vnmi'/>
+    <feature policy='require' name='vmx-preemption-timer'/>
+    <feature policy='require' name='vmx-vintr-pending'/>
+    <feature policy='require' name='vmx-tsc-offset'/>
+    <feature policy='require' name='vmx-hlt-exit'/>
+    <feature policy='require' name='vmx-invlpg-exit'/>
+    <feature policy='require' name='vmx-mwait-exit'/>
+    <feature policy='require' name='vmx-rdpmc-exit'/>
+    <feature policy='require' name='vmx-rdtsc-exit'/>
+    <feature policy='require' name='vmx-cr3-load-noexit'/>
+    <feature policy='require' name='vmx-cr3-store-noexit'/>
+    <feature policy='require' name='vmx-cr8-load-exit'/>
+    <feature policy='require' name='vmx-cr8-store-exit'/>
+    <feature policy='require' name='vmx-flexpriority'/>
+    <feature policy='require' name='vmx-vnmi-pending'/>
+    <feature policy='require' name='vmx-movdr-exit'/>
+    <feature policy='require' name='vmx-io-exit'/>
+    <feature policy='require' name='vmx-io-bitmap'/>
+    <feature policy='require' name='vmx-mtf'/>
+    <feature policy='require' name='vmx-msr-bitmap'/>
+    <feature policy='require' name='vmx-monitor-exit'/>
+    <feature policy='require' name='vmx-pause-exit'/>
+    <feature policy='require' name='vmx-secondary-ctls'/>
+    <feature policy='require' name='vmx-exit-nosave-debugctl'/>
+    <feature policy='require' name='vmx-exit-load-perf-global-ctrl'/>
+    <feature policy='require' name='vmx-exit-ack-intr'/>
+    <feature policy='require' name='vmx-exit-save-pat'/>
+    <feature policy='require' name='vmx-exit-load-pat'/>
+    <feature policy='require' name='vmx-exit-save-efer'/>
+    <feature policy='require' name='vmx-exit-load-efer'/>
+    <feature policy='require' name='vmx-exit-save-preemption-timer'/>
+    <feature policy='require' name='vmx-entry-noload-debugctl'/>
+    <feature policy='require' name='vmx-entry-ia32e-mode'/>
+    <feature policy='require' name='vmx-entry-load-perf-global-ctrl'/>
+    <feature policy='require' name='vmx-entry-load-pat'/>
+    <feature policy='require' name='vmx-entry-load-efer'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='tsc' present='yes' mode='native'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap' detect_zeroes='on'/>
+      <source file='/var/lib/libvirt/images/win11_seabios.qcow2'/>
+      <target dev='sda' bus='sata'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <controller type='sata' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </controller>
+    <controller type='usb' index='0' model='piix3-uhci'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+    </controller>
+    <controller type='pci' index='0' model='pci-root'/>
+    <interface type='network'>
+      <mac address='02:16:3e:5d:6c:00'/>
+      <source network='default'/>
+      <model type='e1000'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <input type='tablet' bus='usb'>
+      <address type='usb' bus='0' port='1'/>
+    </input>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <audio id='1' type='none'/>
+    <video>
+      <model type='vmvga' vram='16384' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </memballoon>
+  </devices>
+  <seclabel type='dynamic' model='apparmor' relabel='yes'/>
+  <seclabel type='dynamic' model='dac' relabel='yes'/>
+</domain>

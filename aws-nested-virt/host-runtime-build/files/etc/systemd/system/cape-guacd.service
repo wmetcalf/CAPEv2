@@ -1,0 +1,50 @@
+# cape-guacd.service — run the guacamole/guacd VNC-proxy container.
+#
+# cape-web's guac WebSocket consumer (web/guac/consumers.py) connects
+# to guacd on localhost:4822 to proxy browser→VM VNC traffic.  Without
+# this service running, every guac WS connect dies with HTTP 403 + an
+# ECONNREFUSED in the guac-web log.
+#
+# Container vs. apt: Ubuntu 24.04's apt guacd is 1.3.0, too old for the
+# 1.4.0+ JS client cape's guac/templates use (handshake mismatch
+# silently drops the session).  Docker gets us the matching 1.5.5
+# release without compiling from source.
+#
+# --network host: guacd needs to reach the per-VM VNC ports on
+# 127.0.0.1:5900+, which only works if it shares the host network
+# namespace.  Bridge networking would require port-publishing every
+# VM's VNC port individually.
+
+[Unit]
+Description=CAPE Guacamole daemon (VNC proxy) in Docker
+Documentation=https://guacamole.apache.org/doc/gug/guacamole-docker.html
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+
+# Pre-start: remove any stale container with the same name so
+# `docker run` doesn't fail with "container already exists".
+# Idempotent — exits 0 even if no stale container is present.
+ExecStartPre=-/usr/bin/docker rm -f guacd
+
+# Foreground container run.  `--rm` cleans up on exit so the next
+# start is clean.  Log driver: json-file with 10m rotation so we don't
+# burn disk on a long-running container with chatty per-task connect
+# logs.
+ExecStart=/usr/bin/docker run --rm \
+    --name guacd \
+    --network host \
+    --log-driver json-file \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
+    guacamole/guacd:1.5.5
+
+ExecStop=/usr/bin/docker stop guacd
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,319 @@
+#!/bin/sh
+# cape-core postinst: create cape user/group, then handle service
+# restarts on upgrade.
+#
+# On fresh install ($1=configure with no $2): services aren't auto-
+# started; bootstrap or operator brings them up.
+# On upgrade ($1=configure with $2=old-version): try-restart any
+# already-running services so the new code takes effect.
+
+set -e
+
+CAPE_HOME=/home/cape
+
+create_cape_user() {
+    # Create the cape group + user idempotently. CAPE systemd units
+    # (cape.service, cape-web.service, cape-processor.service, etc.)
+    # run as User=cape Group=cape; if either is missing, the services
+    # fail to start and any chown cape:cape (e.g. host userdata staging
+    # ssh keys) errors out with "invalid user". Older
+    # bootstrap-from-QCOW2 paths created the user via install-nestedvirt.sh
+    # and the deb assumed it would already be there; that assumption
+    # broke when ami-bake.yml started installing the deb on a stock
+    # Ubuntu base AMI.
+    if ! getent group cape >/dev/null 2>&1; then
+        addgroup --system cape
+    fi
+    if ! getent passwd cape >/dev/null 2>&1; then
+        # --home /home/cape + --shell /bin/bash so operators can SSH in
+        # as cape (matches the original bootstrap path's `useradd`
+        # invocation in install-nestedvirt.sh). adduser --system without
+        # --no-create-home drops a writable home for the cape services.
+        adduser --system --ingroup cape \
+                --home "$CAPE_HOME" \
+                --shell /bin/bash \
+                --gecos "CAPEv2 sandbox service account" \
+                cape
+    fi
+    # Group memberships required at runtime:
+    #   libvirt, libvirt-qemu  → manage VMs through libvirtd
+    #   kvm                    → /dev/kvm group ACL on Ubuntu
+    # Each is conditional because not every host has libvirt installed
+    # at the moment cape-core is configured (cape-qemu pulls in
+    # libvirt-daemon-system; install order may vary).
+    for g in libvirt libvirt-qemu kvm; do
+        if getent group "$g" >/dev/null 2>&1; then
+            adduser cape "$g" >/dev/null 2>&1 || true
+        fi
+    done
+    # CAPE writes into many places under /opt/CAPEv2/ at runtime, not
+    # all of which are declared in cape-core.dirs:
+    #   data/feeds/        cuckoo.py startup creates this (RC1 — fresh
+    #                      a validation deploy crashed cape.service here)
+    #   storage/           analyses written by cape-processor
+    #   log/               cuckoo.log + rooter.log + dist.log
+    #                      (lib/cuckoo/core/startup.py:233,
+    #                      utils/dist.py:1893-1895)
+    #   db/                SQLite fallback when no postgres conn-string
+    #   custom/, analyzer/ runtime-writable analyzer modules
+    #
+    # Enumerating each subtree by name has bitten us repeatedly —
+    # a cape-deb-e2e run passed Layer 4 (host smoke, no
+    # service start) yet a validation deploy crashed cape.service with
+    # "Unable to create folder: /opt/CAPEv2/data/feeds".  Chown the
+    # entire tree to cape:cape so the runtime user owns its full
+    # working directory.  dpkg upgrades restore root:root on
+    # package-owned files; this postinst re-chowns them on every
+    # configure.
+    #
+    # /opt/CAPEv2/web/web/secret_key.py is recreated by
+    # ensure_django_secret_key() below with root:cape mode 0640 after
+    # this chown, so cape can read but not rewrite the Django secret
+    # key across upgrades.
+    if [ -d /opt/CAPEv2 ]; then
+        chown -R cape:cape /opt/CAPEv2
+    fi
+}
+
+setup_postgres_database() {
+    # Idempotently create the local `cape` postgres role + `cape`
+    # database that cape services expect.  Replaces the legacy
+    # nestedvirt bootstrap path which relied on the live-host overlay
+    # tree (terraform/nestedvirt/files/live-host/opt/CAPEv2/conf/
+    # cuckoo.conf) to ship a pre-baked connection string AND assumed
+    # a pre-existing role on the underlying QCOW2 image.  Neither is
+    # available on a clean Ubuntu base AMI baked with this deb.
+    #
+    # Password lifecycle:
+    #   /var/lib/cape/postgres-password is the source of truth.
+    #   Created with `openssl rand -hex 24` on first install, mode
+    #   0600.  Re-running postinst (upgrade or dpkg-reconfigure)
+    #   reuses what's already on disk; nothing rotates the password
+    #   without the operator deleting that file first.
+    #
+    # postgres connection model:
+    #   role `cape` LOGIN owns db `cape`; localhost-only TCP via
+    #   psycopg2.  Stock Ubuntu pg_hba.conf already accepts md5 on
+    #   127.0.0.1 so no pg_hba.conf editing is required.
+    #
+    # cuckoo.conf wiring:
+    #   /etc/cape/cuckoo.conf is a conffile owned by this deb
+    #   (debian/cape-core.conffiles).  We only sed in the connection
+    #   string when the operator hasn't already set it — the
+    #   `^connection = $` regex matches the upstream default
+    #   (empty value) and nothing else.
+
+    # postgresql.service may not be running yet on a fresh AMI bake:
+    # postgresql-16's own postinst typically starts the cluster, but
+    # in chroot-style packer environments without systemd it doesn't.
+    # On the AMI-bake EC2 host and on the live cape host, systemd is
+    # running so `systemctl start` is a no-op when already active.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl start postgresql.service 2>/dev/null || true
+        # Give the cluster a few seconds to accept connections; psql
+        # against a freshly-started cluster otherwise races.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    # /var/lib/cape is the cape state dir.  Mode 0750 root:cape so the
+    # cape user/group can traverse + list it (needed for /var/lib/cape/
+    # django/siteauth.sqlite that ensure_django_siteauth_sqlite() drops
+    # in later).  The secret /var/lib/cape/postgres-password below is
+    # individually mode 0600 root:root so traversal access doesn't leak
+    # the password.  The old 0700 root:root setup blocked cape from
+    # reaching anything under /var/lib/cape/* and was the proximate
+    # cause of a cape-deb-e2e run's "unable to open database
+    # file" (the Django sqlite was at the right path with the right
+    # owner, but cape couldn't traverse the parent to reach it).
+    install -d /var/lib/cape
+    chown root:cape /var/lib/cape
+    chmod 0750 /var/lib/cape
+    if [ ! -s /var/lib/cape/postgres-password ]; then
+        # `od -An -tx1 -N 24 /dev/urandom` is the portable alternative
+        # to `openssl rand -hex 24` and avoids adding openssl to this
+        # deb's runtime Depends.  od ships in coreutils which is
+        # Essential: yes.
+        umask 077
+        od -An -tx1 -N 24 /dev/urandom | tr -d ' \n' > /var/lib/cape/postgres-password
+        chmod 0600 /var/lib/cape/postgres-password
+    fi
+    pg_password=$(cat /var/lib/cape/postgres-password)
+
+    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='cape'" 2>/dev/null | grep -q 1; then
+        # Resync password from the on-disk source of truth.  Safe even
+        # if it didn't change — postgres just records the same hash.
+        sudo -u postgres psql -c "ALTER ROLE cape WITH LOGIN PASSWORD '${pg_password}'" >/dev/null
+    else
+        sudo -u postgres psql -c "CREATE ROLE cape WITH LOGIN PASSWORD '${pg_password}'" >/dev/null
+    fi
+
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='cape'" 2>/dev/null | grep -q 1; then
+        sudo -u postgres createdb -O cape cape
+    fi
+
+    if [ -f /etc/cape/cuckoo.conf ] && grep -qE '^connection\s*=\s*$' /etc/cape/cuckoo.conf; then
+        # Sed only rewrites the upstream default (empty value).  An
+        # operator who's already set `connection = ...` keeps their
+        # value untouched across cape-core upgrades.
+        sed -i "s|^connection\s*=\s*$|connection = postgresql://cape:${pg_password}@localhost:5432/cape|" /etc/cape/cuckoo.conf
+    fi
+}
+
+ensure_django_siteauth_sqlite() {
+    # cape/web/web/settings.py points Django's auth/sessions/admin
+    # SQLite database at /var/lib/cape/django/siteauth.sqlite (the
+    # legacy upstream value of "siteauth.sqlite" — relative to
+    # WorkingDirectory=/opt/CAPEv2/web — fails on the deb-baked
+    # layout because /opt/CAPEv2/web is dpkg-owned root:root and
+    # SQLite requires write access to the enclosing directory for
+    # journal/WAL companion files, not just to the .sqlite file).
+    #
+    # Create /var/lib/cape/django/ as cape:cape mode 0750 so SQLite
+    # can write the DB + its WAL/journal companions; pre-create the
+    # empty .sqlite file with the same ownership.  The `[ ! -e ]`
+    # guard keeps the DB stable across cape-core upgrades.
+    install -d -m 0750 -o cape -g cape /var/lib/cape/django
+    local sqlite_path="/var/lib/cape/django/siteauth.sqlite"
+    if [ ! -e "$sqlite_path" ]; then
+        umask 027
+        : > "$sqlite_path"
+        chown cape:cape "$sqlite_path"
+        chmod 0660 "$sqlite_path"
+    fi
+}
+
+ensure_django_secret_key() {
+    # cape/web/web/settings.py has an `except ImportError:` fallback
+    # that auto-generates secret_key.py at first import time, but the
+    # write goes into the dpkg-owned /opt/CAPEv2/web/web/ directory.
+    # The migrate step below runs as the `cape` user, who can't write
+    # there → PermissionError → cape-core.postinst exits non-zero.
+    #
+    # Pre-generate the file here as root, mode 0640 root:cape, so
+    # cape can READ it (Django's import works) without being able to
+    # rewrite it across upgrades.  The key persists across cape-core
+    # upgrades because of the `[ ! -s ... ]` guard.
+    local key_file="/opt/CAPEv2/web/web/secret_key.py"
+
+    if [ -d /opt/CAPEv2/web/web ] && [ ! -s "$key_file" ]; then
+        # 50 chars from Django's get_random_string alphabet, but using
+        # /dev/urandom + tr to avoid pulling in any Python at postinst
+        # time.  Format matches what cape/web/web/settings.py would
+        # write: `SECRET_KEY = "<50 chars>"`.
+        #
+        # NB: tr interprets `-` as a range delimiter unless it's at the
+        # end of the set.  Django's alphabet string `(-_=+)` happens to
+        # be Python's secrets.choice-iterated and treats `-` as a
+        # literal character, but tr would expand `(-_` to a range
+        # `( ... _` (ASCII 40..95) including all uppercase letters, `[`,
+        # `\`, `]`, `^` — which writes a SECRET_KEY containing `\7`,
+        # `\i`, etc. that Python parses as escape sequences and warns
+        # with SyntaxWarning on every settings.py import.  Move `-` to
+        # the end of the set so tr keeps it literal.  A cape-deb-e2e
+        # run caught this via the SyntaxWarning + visible
+        # uppercase/[/\ chars in the displayed SECRET_KEY.
+        secret=$(tr -dc 'abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_=+-' </dev/urandom | head -c 50)
+        umask 027
+        printf 'SECRET_KEY = "%s"\n' "$secret" > "$key_file"
+        chown root:cape "$key_file"
+        chmod 0640 "$key_file"
+    fi
+}
+
+run_django_migrations() {
+    # Migrations are idempotent — `migrate --noinput` no-ops if the
+    # schema is up to date.  Safe to run on every configure.  Without
+    # this the first cape-web hit lands at /admin/login and Django
+    # 500s on auth_user being missing.
+    if [ ! -f /opt/CAPEv2/web/manage.py ] || [ ! -x /etc/poetry/bin/poetry ]; then
+        return 0
+    fi
+
+    sudo -H -u cape bash -c '
+        set -e
+        export HOME=/home/cape
+        cd /opt/CAPEv2/web
+        /etc/poetry/bin/poetry run python manage.py migrate --noinput
+    '
+}
+
+install_poetry_wrapper() {
+    # All cape systemd units shell into /etc/poetry/bin/poetry — that
+    # path comes from the legacy install-nestedvirt.sh which pip-installs
+    # poetry under POETRY_HOME=/etc/poetry.  On the deb-baked AMI we
+    # already have poetry (apt python3-poetry, installed via Depends:),
+    # but at /usr/bin/poetry.  Drop a thin wrapper at /etc/poetry/bin/
+    # so the existing systemd unit ExecStart= lines (and operator
+    # muscle memory) keep working unchanged.
+    #
+    # The wrapper sets VIRTUAL_ENV=/opt/CAPEv2 so poetry uses the
+    # dh-virtualenv tree the deb already shipped, instead of trying
+    # to create its own venv when it doesn't find one alongside the
+    # pyproject.toml at /opt/CAPEv2/.
+    install -d -m 0755 /etc/poetry/bin
+    cat > /etc/poetry/bin/poetry <<'POETRY_WRAP'
+#!/bin/sh
+# /etc/poetry/bin/poetry — cape wrapper.
+#
+# Drop-in for the install-nestedvirt.sh-era POETRY_HOME=/etc/poetry
+# install.  Tells poetry to use the dh-virtualenv tree at /opt/CAPEv2/
+# as the active venv (which is what dh_virtualenv produced when
+# cape-core was built) and forwards to the apt-installed poetry.
+export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/CAPEv2}"
+exec /usr/bin/poetry "$@"
+POETRY_WRAP
+    chmod 0755 /etc/poetry/bin/poetry
+
+    # System-wide poetry knob: never auto-create a fresh venv.  Without
+    # this, `poetry install`/`poetry env use` invocations on this host
+    # could land in ~/.cache/pypoetry/virtualenvs/ and drift from the
+    # deb-managed /opt/CAPEv2/ tree.
+    install -d -m 0755 /etc/poetry
+    cat > /etc/poetry/config.toml <<'POETRY_CONF'
+# managed — written by cape-core.postinst.
+# Override per-user with `poetry config <key> <val> --local` if needed.
+[virtualenvs]
+create = false
+in-project = false
+POETRY_CONF
+}
+
+case "$1" in
+    configure)
+        create_cape_user
+        install_poetry_wrapper
+        setup_postgres_database
+        ensure_django_secret_key
+        ensure_django_siteauth_sqlite
+        run_django_migrations
+
+        # Always reload systemd so unit changes are picked up.
+        systemctl daemon-reload || true
+
+        if [ -n "$2" ]; then
+            # Upgrade. Restart only services that are currently running.
+            for svc in cape.service cape-web.service cape-rooter.service \
+                       cape-processor.service guac-web.service; do
+                systemctl try-restart "$svc" || true
+            done
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        # No action; the next configure will re-run.
+        ;;
+
+    *)
+        echo "cape-core postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

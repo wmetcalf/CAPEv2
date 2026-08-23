@@ -1,0 +1,123 @@
+#!/usr/sbin/nft -f
+# rules-isolation.nft — guest sandbox containment for virbr100.
+#
+# Loaded by /etc/cape/firewall/load-rules.sh out of cape-firewall-
+# isolation.service at boot.
+#
+# WHY THIS LIVES IN A DEDICATED TABLE AT MANGLE PRIORITY
+# -----------------------------------------------------
+# CAPE's rooter.py adds/removes iptables rules in the `filter` and
+# `nat` tables every time an analysis starts/finishes (POSTROUTING
+# SNAT/MASQUERADE for the per-task routing mode, FORWARD ACCEPT/DROP
+# for FakeNet/inetsim/tor/vpn). If we put our containment rules in
+# `filter`, a rooter cleanup pass could delete or shadow them. By
+# living in our own `cape-isolation` table:
+#
+#   - rooter only iterates rules it owns; ours are untouched.
+#   - mangle forward priority (-150) fires BEFORE filter forward
+#     (priority 0), so a drop here is authoritative regardless of
+#     what rooter adds later in filter.
+#
+# WHY TWO TABLES (inet + bridge)
+# ------------------------------
+# Layer-3 routed traffic from guest → outside world goes through the
+# `inet`/forward hook (host as router). Layer-2 traffic *within* the
+# virbr100 bridge (guest-to-guest, broadcast flooding) never reaches
+# L3 forwarding — it's bridge-forwarded — and only the `bridge`
+# family's forward hook sees it. We need both to fully isolate.
+
+# ----------------------------------------------------------------------
+# Layer-3: guest egress through the host router
+# ----------------------------------------------------------------------
+table inet cape-isolation
+delete table inet cape-isolation
+table inet cape-isolation {
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+
+        # EC2 instance metadata. Any AWS API token CAPE itself uses
+        # would be retrievable here, so this is a credential leak.
+        iifname "virbr100" ip daddr 169.254.169.254 drop
+
+        # Host services on the bridge IP. CAPE's result-agent listens
+        # on 192.168.100.1:2042 inside the VM's view of the world; the
+        # CAPE agent inside the guest reaches it via the guest-network-
+        # local gateway, which on this host is the bridge IP itself.
+        # Allow 2042; block everything else exposed on 192.168.100.1.
+        iifname "virbr100" ip daddr 192.168.100.1 tcp dport 2042 accept
+        iifname "virbr100" ip daddr 192.168.100.1 drop
+
+        # FakeNet exception — VMs need to reach 172.28.100.2 (the
+        # docker br-fakenet container's listener) when routing.conf is
+        # set to fakenet for the task. fakenet-raw-fix.sh provides the
+        # raw-table accept; this filter-equivalent keeps us consistent.
+        iifname "virbr100" ip daddr 172.28.100.2 accept
+
+        # AWS VPC + RFC1918 lateral movement. Allow the guest subnet
+        # itself (guest-to-guest blocking is enforced in the bridge
+        # family below, not here, because guest-to-guest is L2
+        # bridged not L3 routed).
+        iifname "virbr100" ip daddr 192.168.100.0/24 accept
+        iifname "virbr100" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } drop
+
+        # Outbound SMTP. Malware families with worm/spam payloads
+        # (Emotet, TrickBot, Phorpiex, etc.) routinely try to deliver
+        # mail via direct-to-MX 25 + submission 465/587 + plaintext
+        # 2525. Blocking outbound SMTP keeps the cape host off SBL
+        # listings and prevents any actual victim mailing.
+        iifname "virbr100" tcp dport { 25, 465, 587, 2525 } drop
+
+        # Outbound BitTorrent. Sandbox VMs shouldn't be advertising
+        # for peers; this avoids the cape host's egress IP getting
+        # flagged by anti-piracy scanners + blocks one common worm
+        # propagation channel.
+        #
+        # Range 6881-6999 covers the historical default client port
+        # range; 6969 is the well-known UDP tracker port. DHT can run
+        # on arbitrary high ports — connection-tracking on those is a
+        # separate problem we don't try to solve here.
+        iifname "virbr100" tcp dport 6881-6999 drop
+        iifname "virbr100" udp dport 6881-6999 drop
+        iifname "virbr100" udp dport 6969 drop
+    }
+}
+
+# ----------------------------------------------------------------------
+# Layer-2: guest-to-guest + broadcast filtering on virbr100
+# ----------------------------------------------------------------------
+# This catches what the inet table can't see. Bridge forwarding (one
+# bridge port → another bridge port on the same bridge) bypasses the
+# host's L3 routing entirely, so guest-to-guest unicast + broadcast
+# flooding only show up in the `bridge` family's forward hook.
+table bridge cape-isolation
+delete table bridge cape-isolation
+table bridge cape-isolation {
+    chain forward {
+        type filter hook forward priority filter;
+
+        # DHCP must continue to work. libvirt's dnsmasq on 192.168.100.1
+        # serves DHCPOFFER back to VMs via L2 unicast; VM-initiated
+        # DHCPDISCOVER is broadcast (ff:ff:ff:ff:ff:ff) and gets
+        # flooded across the bridge. Both directions need to pass.
+        meta protocol ip udp dport { 67, 68 } accept
+        meta protocol ip udp sport { 67, 68 } accept
+
+        # Guest-to-guest unicast + non-DHCP broadcast/multicast.
+        # iifname/oifname both == "virbr100" means a frame ingressing
+        # the bridge from one VM port being flooded/forwarded to
+        # another VM port on the same bridge. Drop catches:
+        #   - VM-1 → VM-2 unicast (sandbox segmentation)
+        #   - VM-1 → ff:ff:ff:ff:ff:ff broadcast flood to other VM
+        #     ports (NetBIOS, WS-Discovery, mDNS, SSDP — chatty
+        #     things that leak the VM's identity to peer VMs)
+        # Host-bound traffic (e.g. DHCPDISCOVER → dnsmasq on host)
+        # goes via INPUT, not FORWARD, so it isn't affected.
+        #
+        # iifname/oifname (string match at packet-eval time) rather
+        # than iif/oif (numeric ifindex resolved at rule-load time)
+        # so `nft -c -f` parses the ruleset cleanly even where
+        # virbr100 doesn't exist (GHA runner, fresh ami-bake before
+        # libvirtd starts).
+        iifname "virbr100" oifname "virbr100" drop
+    }
+}

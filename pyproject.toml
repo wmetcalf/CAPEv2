@@ -29,7 +29,7 @@ dependencies = [
     "orjson>=3.9.15",
     # "maec==4.1.0.17",
     # "regex==2021.7.6",
-    "SFlock2[linux,shellcode]>=0.3.84",
+    "SFlock2[linux,shellcode]>=0.3.76",
     # "volatility3==2.11.0",
     # "XLMMacroDeobfuscator==0.2.7",
     "pyzipper==0.3.6",
@@ -68,7 +68,7 @@ dependencies = [
     # "socks5man @ git+https://github.com/CAPESandbox/socks5man.git@7b335d027297b67abdf28f38cc7d5d42c9d810b5",
     # "httpreplay @ git+https://github.com/CAPESandbox/httpreplay.git@0d5a5b3144ab15f93189b83ca8188afde43db134",
     # "bingraph @ git+https://github.com/CAPESandbox/binGraph.git@552d1210ac6770f8b202d0d1fc4610cc14d878ec",
-    "psycopg[binary]>=3.2.4",
+    "psycopg2-binary>=2.9.10",
     "ruff>=0.7.2",
     "paramiko==3.5.0",
     "psutil==6.1.1",
@@ -89,6 +89,66 @@ dependencies = [
     "setproctitle==1.3.2",
     "CAPE-parsers>=0.1.36",
     "maco==1.1.8",
+    # --- cape-project additions (preserved across upstream subtree merges) ---
+    # libvirt Python bindings — lib/cuckoo/core/startup.py imports libvirt
+    # during init_modules()/check_snapshot_state() for KVM/QEMU machinery
+    # probing.  Without this in the venv, both cape-processor and
+    # cape.service (cuckoo.py) crash at startup with
+    # CuckooStartupError("'libvirt-python' library is required for
+    # KVM/QEMU machinery but could not be imported").  Built against
+    # libvirt-dev (already in debian/control Build-Depends).
+    "libvirt-python>=11.0.0",
+    # ClamAV integration — lib/cuckoo/common/integrations/clamav.py imports
+    # pyclamd when processing.detections.clamav is enabled.  Without this
+    # HAVE_CLAMAV falls back to False and every clamav scan silently
+    # returns no matches.
+    "pyclamd",
+    # Static-string extraction module (modules/processing/strings/floss.py
+    # consumes flare-floss).  Replaces install-nestedvirt.sh's
+    # `poetry run pip install -U flare-floss` post-install step.
+    "flare-floss",
+    # Python 3.12 removed the stdlib asyncore/asynchat modules; the CAPE
+    # smtp sinkhole module + legacy plumbing still import them.
+    # pyasyncore backports them as drop-in pip packages.
+    "pyasyncore",
+    # Threat-intel attack-pattern lookup used by signatures and reporting.
+    "pyattck",
+    # Windows EVTX (event log) parser — web/analysis/views.py imports
+    # `from evtx import PyEvtxParser` to render the per-task Event Log
+    # tab.  Without this in the venv the analyzer collects EVTX archives
+    # from the guest (analyzer/windows/modules/auxiliary/evtx.py) and
+    # writes them to evtx/evtx.zip, but the web UI fails to load any
+    # of them with "EVTX parser not installed on the web node".
+    # omerbenamram/pyevtx-rs — Rust-backed, ships PyO3 bindings.
+    "evtx",
+    # Sigma detection over guest EVTX/Sysmon logs via Zircolite
+    # (community/modules/processing/sigma.py).  sigma.py shells out to
+    # /opt/zircolite/zircolite.py using sys.executable (THIS venv), so
+    # Zircolite's runtime deps must live here.  The authoritative dep set
+    # is Zircolite v3.2.0's requirements.txt — the version pinned by
+    # cape-zircolite-build/fetch.sh and proven on the reference host
+    # to run inside this exact shared venv producing real sigma
+    # detections.  We do NOT track Zircolite "latest": v3.7.x tightened
+    # `chardet` -> `>=5.0,<6`, which is unsatisfiable against cape's
+    # chardet==4.0.0 pin (load-bearing in our own report encoding
+    # detection).  v3.2.0 leaves chardet unpinned, so cape's 4.0.0
+    # satisfies it.
+    #
+    # Of v3.2.0's requirements, orjson/chardet/requests/jinja2/psutil and
+    # evtx are already declared above and rich/urllib3/pyyaml come in
+    # transitively (the reference build host runs rich 13.9.4 fine despite the aspirational
+    # >=14.2.0 — don't force it and risk a transitive clash).  The rest:
+    "xxhash",
+    "lxml",
+    "pysigma",
+    "pysigma-pipeline-sysmon",
+    "pysigma-pipeline-windows",
+    "pysigma-backend-sqlite",
+    # The one dep that bit us: Zircolite's detector compiles Sigma field-
+    # mapping expressions through RestrictedPython.  Missing it aborted
+    # every analysis with `ModuleNotFoundError: No module named
+    # 'RestrictedPython'` (caught on the 2026-06-03 sigma AMI deploy).
+    "RestrictedPython",
 ]
 
 [project.optional-dependencies]
@@ -96,9 +156,6 @@ maco = ["maco"]
 gcp = ["google-cloud-storage", "google-cloud-pubsub"]
 yara = ["plyara"]
 mcp = ["fastmcp", "httpx"]
-dist = [
-    "fastapi",
-]
 
 [dependency-groups]
 dev = [

@@ -1,0 +1,23 @@
+services:
+  fakenet-ng:
+    build: .
+    container_name: fakenet-ng
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      cape-fakenet:
+        ipv4_address: 172.28.100.2
+
+networks:
+  cape-fakenet:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-fakenet
+    ipam:
+      config:
+        - subnet: 172.28.100.0/24
+          gateway: 172.28.100.1

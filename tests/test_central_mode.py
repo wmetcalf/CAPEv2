@@ -4,12 +4,7 @@ import os
 
 import pytest
 
-from lib.cuckoo.common.central_mode import _parse, _as_bool, _as_int, _as_port, upload_target_realpath
-from lib.cuckoo.common.central_guac import (
-    _libvirt_ssh_dsn,
-    _worker_api_token,
-    _worker_machine_url,
-)
+from lib.cuckoo.common.central_mode import _parse, _as_bool, upload_target_realpath
 from lib.cuckoo.common.hunt_query import build_hunt_facets
 from lib.cuckoo.common.storage_backend import (
     ArtifactNotFound,
@@ -32,24 +27,6 @@ def test_as_bool():
     assert _as_bool("no") is False
     assert _as_bool(None, False) is False
     assert _as_bool(True) is True
-
-
-def test_as_int():
-    assert _as_int("42", 0) == 42
-    assert _as_int(7, 0) == 7
-    assert _as_int("  9443 ", 0) == 9443  # stripped
-    assert _as_int(None, 8000) == 8000
-    assert _as_int("notaport", 8000) == 8000  # garbage -> default, no crash
-
-
-def test_as_port():
-    assert _as_port("9443", 8000) == 9443
-    assert _as_port(443, 8000) == 443
-    # int() accepts these but they're not real ports -> fall back to the default (not a broken URL)
-    assert _as_port("0", 8000) == 8000
-    assert _as_port("-1", 8000) == 8000
-    assert _as_port("99999", 8000) == 8000
-    assert _as_port("nope", 8000) == 8000
 
 
 def test_central_mode_defaults_off():
@@ -188,7 +165,7 @@ def test_s3store_is_lazy_no_client_on_construct():
 
 def test_central_mode_job_directory_fields_parse():
     d = _parse({})
-    assert d.job_directory == "broker_http"  # default backend (vendor-neutral)
+    assert d.job_directory == "dynamodb"  # default backend
     assert d.broker_url == "" and d.broker_api_token == ""
     c = _parse({
         "enabled": "yes",
@@ -208,37 +185,16 @@ def test_loc_from_item_maps_and_normalizes():
     assert loc_from_item({"sandbox_worker_ip": "", "cape_task_id": 0}) == JobLocation(None, 0)
     assert loc_from_item({}) == JobLocation(None, None)
     assert loc_from_item(None) == JobLocation(None, None)
-    # IPv6 is a valid IP too (kept as-is)
-    assert loc_from_item({"sandbox_worker_ip": "fd00::1", "cape_task_id": 5}) == JobLocation("fd00::1", 5)
-
-
-def test_loc_from_item_rejects_non_ip_worker_ip():
-    # sandbox_worker_ip becomes the netloc of a libvirt DSN + an authenticated apiv2 URL. A poisoned
-    # broker record must NOT flow through: a non-IP value (injection payload, hostname, garbage) is
-    # dropped to None so the caller keeps the localhost path — closes the DSN/URL-injection vector.
-    payload = "1.2.3.4/system?keyfile=/attacker/key&no_verify=1&x="
-    assert loc_from_item({"sandbox_worker_ip": payload, "cape_task_id": 7}) == JobLocation(None, 7)
-    assert loc_from_item({"sandbox_worker_ip": "attacker.host:9999/x?a=", "cape_task_id": 1}) == JobLocation(None, 1)
-    assert loc_from_item({"sandbox_worker_ip": "not-an-ip", "cape_task_id": 2}) == JobLocation(None, 2)
-    # cape_task_id survives even when the IP is rejected (the job exists; it's just unroutable here)
-    assert loc_from_item({"sandbox_worker_ip": "999.999.999.999", "cape_task_id": 0}) == JobLocation(None, 0)
 
 
 def test_get_job_directory_off_returns_none():
     assert get_job_directory(_parse({})) is None  # central mode off
-    # enabled but default backend (broker_http) with no broker_url -> None (caller keeps localhost)
+    # enabled but no broker_table and default backend -> None (matches pre-abstraction gate)
     assert get_job_directory(_parse({"enabled": "yes"})) is None
 
 
-def test_get_job_directory_default_is_broker_http():
-    # default backend is now broker_http (vendor-neutral); with a broker_url it resolves to BrokerHttp
-    d = get_job_directory(_parse({"enabled": "yes", "broker_url": "https://broker.local"}))
-    assert isinstance(d, BrokerHttpJobDirectory)
-
-
-def test_get_job_directory_dynamodb_explicit():
-    # dynamodb is opt-in (AWS); must be selected explicitly now
-    d = get_job_directory(_parse({"enabled": "yes", "job_directory": "dynamodb", "broker_table": "tbl", "s3_region": "eu-west-1"}))
+def test_get_job_directory_dynamodb_default():
+    d = get_job_directory(_parse({"enabled": "yes", "broker_table": "tbl", "s3_region": "eu-west-1"}))
     assert isinstance(d, DynamoJobDirectory)
     assert d.table == "tbl" and d.region == "eu-west-1"
 
@@ -310,169 +266,6 @@ def test_upload_target_realpath(tmp_path):
     assert upload_target_realpath(str(link2), base_real, trusted) is None
 
 
-def test_central_mode_worker_access_fields_parse():
-    # Interactive-guac worker access: config-driven (was hardcoded deb paths in central_guac).
-    d = _parse({})
-    assert d.worker_api_token_file == "/etc/cape/api-token"
-    assert d.worker_api_port == 8000 and isinstance(d.worker_api_port, int)
-    assert d.worker_ssh_user == "cape"
-    assert d.worker_ssh_keyfile == "/home/cape/.ssh/id_ed25519"
-    c = _parse({
-        "worker_api_token_file": "/opt/secrets/tok",
-        "worker_api_port": "9443",   # string in conf -> int
-        "worker_ssh_user": "sandbox",
-        "worker_ssh_keyfile": "/home/sandbox/.ssh/id_rsa",
-    })
-    assert c.worker_api_token_file == "/opt/secrets/tok"
-    assert c.worker_api_port == 9443 and isinstance(c.worker_api_port, int)
-    assert c.worker_ssh_user == "sandbox"
-    assert c.worker_ssh_keyfile == "/home/sandbox/.ssh/id_rsa"
-    # a bad/out-of-range port degrades to the default, not a startup crash or a broken URL
-    assert _parse({"worker_api_port": "nope"}).worker_api_port == 8000
-    assert _parse({"worker_api_port": "0"}).worker_api_port == 8000
-    assert _parse({"worker_api_port": "99999"}).worker_api_port == 8000
-
-
-def test_central_guac_worker_url_and_dsn():
-    # port + task id substitute; the deb defaults no longer live in the code path.
-    # tasks/machine is the control-plane infra endpoint (authorized by the shared
-    # [api] control_plane_token, or an is_local_admin principal) returning ONLY the VM
-    # label, so this lookup isn't blocked by the worker's per-tenant scoping.
-    assert _worker_machine_url("10.0.0.5", 8000, 42) == "http://10.0.0.5:8000/apiv2/tasks/machine/42/"
-    assert _worker_machine_url("10.0.0.5", "9443", "7") == "http://10.0.0.5:9443/apiv2/tasks/machine/7/"
-    # an IPv6 worker IP is bracketed so its ':'s don't collide with the port separator
-    assert _worker_machine_url("fd00::5", 8000, 42) == "http://[fd00::5]:8000/apiv2/tasks/machine/42/"
-    assert _libvirt_ssh_dsn("fd00::9", "cape", "/home/cape/.ssh/id_ed25519") == \
-        "qemu+ssh://cape@[fd00::9]/system?keyfile=/home/cape/.ssh/id_ed25519&no_verify=1"
-    # DSN carries the CONFIGURED user + keyfile (not hardcoded cape / id_ed25519)
-    assert _libvirt_ssh_dsn("10.0.0.9", "cape", "/home/cape/.ssh/id_ed25519") == \
-        "qemu+ssh://cape@10.0.0.9/system?keyfile=/home/cape/.ssh/id_ed25519&no_verify=1"
-    assert _libvirt_ssh_dsn("10.0.0.9", "sandbox", "/home/sandbox/.ssh/id_rsa") == \
-        "qemu+ssh://sandbox@10.0.0.9/system?keyfile=/home/sandbox/.ssh/id_rsa&no_verify=1"
-    # a keyfile with a URI metachar is quoted so it can't corrupt the query string
-    dsn = _libvirt_ssh_dsn("10.0.0.9", "cape", "/home/cape/my key&x")
-    assert "my%20key%26x" in dsn and dsn.endswith("&no_verify=1")
-
-
-def test_central_guac_worker_api_token(tmp_path):
-    tok = tmp_path / "api-token"
-    tok.write_text("  s3cr3t\n")
-    assert _worker_api_token(str(tok)) == "s3cr3t"  # stripped
-    # missing/unreadable -> "" (=> no auth header downstream), never raises
-    assert _worker_api_token(str(tmp_path / "nope")) == ""
-
-
-def test_worker_vm_for_task_status_guard_and_success(monkeypatch):
-    """worker_vm_for_task resolves task -> broker job -> worker apiv2 tasks/machine. A non-200
-    from the worker (auth misconfig / no such task) must degrade to (None, None) -- never raise,
-    never return a bogus label -- and a 200 must surface ONLY the VM label (guest IP stays None;
-    central guac uses the worker's own localhost for VNC). The broker directory being absent
-    (single-node / central off) or the job not-yet-dispatched must also short-circuit WITHOUT
-    hitting the worker. This is the one production branch the other guac tests don't exercise."""
-    import lib.cuckoo.common.central_mode as cm
-    import lib.cuckoo.common.job_directory as jd
-    import requests
-    from lib.cuckoo.common.central_guac import worker_vm_for_task
-
-    cfg = _parse({"enabled": "yes", "worker_api_token_file": "/nonexistent-token", "worker_api_port": "8000"})
-    monkeypatch.setattr(cm, "central_mode_config", lambda: cfg)
-
-    class _Dir:
-        def __init__(self, loc):
-            self._loc = loc
-
-        def lookup(self, job_id):
-            assert job_id == "ui-42"  # derived from the AUTHORIZED task id, never task.custom
-            return self._loc
-
-    class _Resp:
-        def __init__(self, status, body):
-            self.status_code = status
-            self._body = body
-
-        def json(self):
-            return self._body
-
-    def _boom(*a, **k):
-        raise AssertionError("worker must not be contacted on the local/undispatched path")
-
-    # directory resolves the job to a worker + worker-local cape_task_id ...
-    monkeypatch.setattr(jd, "get_job_directory", lambda cfg: _Dir(JobLocation("10.0.0.7", 3)))
-    # ... worker 200 -> only the VM label surfaces (guest IP intentionally None)
-    monkeypatch.setattr(requests, "get", lambda url, **kw: _Resp(200, {"error": False, "machine": "win11_seabios_101"}))
-    assert worker_vm_for_task(42) == ("win11_seabios_101", None)
-    # ... worker 404 (auth misconfig / no such task) -> (None, None), no raise
-    monkeypatch.setattr(requests, "get", lambda url, **kw: _Resp(404, {"error": True}))
-    assert worker_vm_for_task(42) == (None, None)
-
-    # no broker directory (single-node / central off) -> (None, None) WITHOUT touching the worker
-    monkeypatch.setattr(jd, "get_job_directory", lambda cfg: None)
-    monkeypatch.setattr(requests, "get", _boom)
-    assert worker_vm_for_task(42) == (None, None)
-
-    # job resolved but not yet dispatched to a worker (no worker_ip) -> (None, None), no worker call
-    monkeypatch.setattr(jd, "get_job_directory", lambda cfg: _Dir(JobLocation(None, None)))
-    assert worker_vm_for_task(42) == (None, None)
-
-
-def test_worker_vnc_port_for_task_parsing(monkeypatch):
-    """worker_vnc_port_for_task returns the VNC port the WORKER reported (resolved worker-locally,
-    no libvirt-over-SSH). Accepts a positive int (str or int); rejects None / -1 / 0 / garbage and a
-    missing body -> None, so a bogus/absent port never reaches guacd (that was the guac-519 class)."""
-    import lib.cuckoo.common.central_guac as cg
-    from lib.cuckoo.common.central_guac import worker_vnc_port_for_task
-
-    cases = {5900: 5900, "5901": 5901, -1: None, 0: None, None: None, "nope": None, "__nobody__": None}
-    for given, want in cases.items():
-        monkeypatch.setattr(
-            cg, "_worker_machine_body",
-            lambda tid, _g=given: (None if _g == "__nobody__" else {"machine": "win11_seabios_1", "vnc_port": _g}),
-        )
-        assert worker_vnc_port_for_task(7) == want, f"vnc_port={given!r} -> expected {want!r}"
-
-
-def test_centralstore_done_marker_local_and_uploaded(tmp_path):
-    # The completion marker must be BOTH written locally (the worker's NVMe-cleanup gate) AND
-    # uploaded to the central store (the read seam's .central_staged completion signal). Regression:
-    # it was local-only, so artifact_storage._stage_tree never saw it and re-staged every view.
-    from modules.reporting.centralstore import _emit_done_marker
-
-    analysis = tmp_path / "analyses" / "77"
-    analysis.mkdir(parents=True)
-    store = LocalFSStore(str(tmp_path / "central"))
-    cfg = _parse({"enabled": "yes", "s3_bucket": "bkt", "s3_prefix": "results"})
-    container = "results/ui-77"
-
-    _emit_done_marker(store, container, str(analysis), cfg, "ui-77", 12)
-
-    # local marker present (cleanup gate) with the expected metadata ...
-    local_marker = analysis / ".centralstore.done"
-    assert local_marker.exists()
-    import json
-    meta = json.loads(local_marker.read_text())
-    assert meta["job_id"] == "ui-77" and meta["artifacts"] == 12
-    assert meta["location"] == "s3://bkt/results/ui-77/"
-    # ... AND uploaded to the store under the exact key the read seam checks for
-    assert store.exists(container, ".centralstore.done") is True
-
-
-def test_centralstore_done_marker_upload_failure_keeps_local(tmp_path):
-    # A store put_file failure must NOT raise (the artifacts are already durable) and must leave
-    # the local marker intact so the worker's cleanup gate still fires.
-    from modules.reporting.centralstore import _emit_done_marker
-
-    analysis = tmp_path / "analyses" / "88"
-    analysis.mkdir(parents=True)
-
-    class BoomStore:
-        def put_file(self, *a, **k):
-            raise RuntimeError("s3 down")
-
-    cfg = _parse({"enabled": "yes", "s3_bucket": "bkt"})
-    _emit_done_marker(BoomStore(), "results/ui-88", str(analysis), cfg, "ui-88", 3)  # must not raise
-    assert (analysis / ".centralstore.done").exists()
-
-
 def test_hunt_facets_per_category_no_facet():
     sent = []
 
@@ -490,55 +283,3 @@ def test_hunt_facets_per_category_no_facet():
     assert not any(any("$facet" in stage for stage in p) for p in sent)
     assert sent[0][0] == {"$match": {"$and": [{}, {"info.visibility": "public"}]}}
     assert facets["domains"][0]["_id"] == "evil.com"
-
-
-def test_centralstore_refuses_non_bridged_under_mt(monkeypatch):
-    """Bridge-required (central+MT): CentralStore.run refuses a non-bridged doc ('local-<id>' / bare-token
-    job_id) BEFORE the S3 upload, so a doomed (soon-to-be-rejected) non-bridged analysis doesn't push artifacts
-    to the shared store. This is defence-in-depth at order 9998; the doc-PERSIST prevention (the actual write
-    site) is the mongodb-reporter backstop at 9999 -- see test_reject_unbridged_under_mt, which is the guard
-    that guarantees no unkeyed doc is ever inserted regardless of centralstore's state."""
-    import modules.reporting.centralstore as cs
-    from lib.cuckoo.common.exceptions import CuckooReportError
-
-    cfg = type("C", (), {"enabled": True, "storage_backend": "local", "central_local_root": "/tmp/cs-test",
-                         "s3_bucket": "", "s3_prefix": "results"})()
-    monkeypatch.setattr(cs, "central_mode_config", lambda: cfg)
-    monkeypatch.setattr(cs, "get_artifact_store", lambda c: (object(), True))
-    monkeypatch.setattr(cs, "central_bridge_required", lambda: True)
-
-    store = cs.CentralStore()
-    with pytest.raises(CuckooReportError, match="non-bridged"):
-        store.run({"info": {"id": 5, "custom": "campaign1"}})     # bare-token -> non-bridged -> refused
-    with pytest.raises(CuckooReportError, match="non-bridged"):
-        store.run({"info": {"id": 6}})                            # no custom -> local-6 -> refused
-
-    # OVER-FIRING guard: with the bridge NOT required (single-node / MT-off), the same non-ui doc must NOT hit
-    # the "non-bridged" refusal. The guard is BEFORE any analysis_path use, so this is observable regardless of
-    # the bare store's empty analysis_path; any downstream upload/path error is irrelevant -- we assert only
-    # that the BRIDGE guard did not over-fire (catches a future refactor that drops the central_bridge_required
-    # conjunct and starts failing every single-node direct-submit report).
-    monkeypatch.setattr(cs, "central_bridge_required", lambda: False)
-    try:
-        store.run({"info": {"id": 7, "custom": "campaign1"}})
-    except CuckooReportError as e:
-        assert "non-bridged" not in str(e), "the bridge guard must not fire when the bridge is not required"
-    except Exception:
-        pass  # any downstream upload/path error on the bare store is fine -- not the guard
-
-
-def test_reject_unbridged_under_mt(monkeypatch):
-    """The mongodb-reporter backstop predicate: under central+MT every persisted doc must be bridged
-    (ui-<central_id>). A non-bridged job_id (local-<id> / bare-token / None) is rejected; a ui- doc is not;
-    and when the bridge is not required (single-node / MT-off) nothing is rejected."""
-    import modules.reporting.mongodb as m
-    import lib.cuckoo.common.central_mode as cm
-
-    monkeypatch.setattr(cm, "central_bridge_required", lambda: True)
-    assert m._reject_unbridged_under_mt("local-5") is True
-    assert m._reject_unbridged_under_mt("campaign1") is True     # bare-token custom
-    assert m._reject_unbridged_under_mt(None) is True            # centralstore disabled -> no job_id stamped
-    assert m._reject_unbridged_under_mt("ui-5") is False         # bridged -> allowed
-
-    monkeypatch.setattr(cm, "central_bridge_required", lambda: False)
-    assert m._reject_unbridged_under_mt("local-5") is False      # single-node / MT-off -> never blocked

@@ -1,0 +1,139 @@
+name: host-runtime-build
+
+# Builds `cape-host-runtime.deb` — the host-level glue (systemd units,
+# helper scripts, libvirt network XML, OpenVPN PIA config) that the
+# legacy nestedvirt deployment rsync'd onto a fresh CAPE host from the
+# live-host overlay tree.
+#
+# The deb itself is tiny (a few KB) so this workflow is fast (~30s on
+# ubuntu-latest).  Most of the build cost lives in the integration
+# tests downstream (cape-deb-e2e exercises the units against a real
+# nestedvirt instance).
+#
+# Triggers:
+#   - workflow_dispatch (ad-hoc rebuilds — e.g. unit-file change)
+#   - push to aws-nested-virt/host-runtime-build/ or this workflow file
+#
+# Artifact: cape-host-runtime-debs-<version>
+#   Consumed by apt-publish.yml fan-in (same shape as cape-host-config-
+#   debs-* / cape-yara-forge-debs-*).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override package version (default: YYYYMMDD)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/host-runtime-build/**'
+      - '.github/workflows/host-runtime-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-runtime-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev ca-certificates nftables
+
+      - name: Validate rules-isolation.nft parses cleanly
+        run: |
+          set -euo pipefail
+          # `nft -c -f` is "check" mode — parse + dry-run against the
+          # kernel without committing changes.  Catches typos/regressions
+          # before they land in the deb.  GHA ubuntu-latest has nft +
+          # netfilter loaded, so this exercises a real compile.
+          sudo nft -c -f aws-nested-virt/host-runtime-build/files/etc/cape/firewall/rules-isolation.nft
+
+      - name: Resolve package version
+        id: ver
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          if [ -z "$ver" ]; then
+              ver="$(date -u +%Y%m%d)"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved package_version=$ver"
+
+      - name: Package cape-host-runtime.deb
+        env:
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash host-runtime-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-host-runtime_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "===file list==="
+          dpkg-deb -c "$deb"
+
+          # Spot-check every unit + script is present.  If any disappears
+          # the AMI bake silently regresses — better to fail loudly here.
+          required="
+            ./etc/systemd/system/cape-routing.service
+            ./etc/systemd/system/cape-firewall-isolation.service
+            ./etc/systemd/system/cape-fakenet-fix.service
+            ./etc/systemd/system/cape-libvirt-restore.service
+            ./etc/systemd/system/openvpn-pia.service
+            ./etc/libvirt/qemu/networks/cape-100.xml
+            ./etc/openvpn/pia-cape.conf
+            ./etc/openvpn/pia/ca.rsa.2048.crt
+            ./etc/openvpn/pia/crl.rsa.2048.pem
+            ./usr/local/bin/setup-cape-routing.sh
+            ./usr/local/bin/restore-cape-libvirt-state.sh
+            ./usr/local/bin/reset-cape-analysis-state.sh
+            ./etc/cape/firewall/load-rules.sh
+            ./etc/cape/firewall/fakenet-raw-fix.sh
+            ./etc/cape/firewall/rules-isolation.nft
+          "
+          listing=$(dpkg-deb -c "$deb" | awk '{print $NF}')
+          for f in $required; do
+              if ! echo "$listing" | grep -qx "$f"; then
+                  echo "::error::missing $f from $deb"
+                  exit 1
+              fi
+          done
+
+          # Scripts must be executable.
+          for s in ./usr/local/bin/setup-cape-routing.sh \
+                   ./usr/local/bin/restore-cape-libvirt-state.sh \
+                   ./usr/local/bin/reset-cape-analysis-state.sh \
+                   ./etc/cape/firewall/load-rules.sh \
+                   ./etc/cape/firewall/fakenet-raw-fix.sh; do
+              mode=$(dpkg-deb -c "$deb" | awk -v p="$s" '$NF==p {print $1}')
+              echo "$mode  $s"
+              echo "$mode" | grep -qE '^-rwxr-xr-x' \
+                || { echo "::error::$s is not executable in $deb (mode=$mode)"; exit 1; }
+          done
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-host-runtime-debs-${{ steps.ver.outputs.version }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

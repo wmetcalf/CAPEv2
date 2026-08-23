@@ -1,0 +1,12 @@
+[Unit]
+Description=Fix Docker raw table rule for CAPE FakeNet
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /etc/cape/firewall/fakenet-raw-fix.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

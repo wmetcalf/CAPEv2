@@ -1,6 +1,5 @@
 from .db_common import _utcnow_naive
 import logging
-from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta, timezone
 
@@ -33,10 +32,9 @@ try:
         not_,
         or_,
         select,
-        text,
         update,
     )
-    from sqlalchemy.orm import joinedload, selectinload
+    from sqlalchemy.orm import joinedload, subqueryload
 except ImportError:  # pragma: no cover
     raise CuckooDependencyError("Unable to import sqlalchemy (install with `poetry install`)")
 
@@ -45,92 +43,8 @@ try:
 except Exception:  # mongo optional
     mongo_update_one = None
 
-
-def _mongo_reporting_enabled() -> bool:
-    """True when mongodb is the enabled report store, so a visibility toggle must
-    sync the stamped info.visibility the aggregate/search/stats surfaces read.
-    Isolated (module-level) for testability."""
-    try:
-        from lib.cuckoo.common.config import Config
-
-        return bool(Config("reporting").mongodb.enabled)
-    except Exception:
-        return False
-
 log = logging.getLogger(__name__)
-
 conf = Config("cuckoo")
-
-
-def _advisory_lock(lock_engine, key):
-    """Best-effort cross-process serialization of per-task visibility toggles.
-
-    Acquires a Postgres SESSION-level advisory lock on a DEDICATED connection from
-    ``lock_engine`` — the Database's dedicated NullPool engine (built in database.py
-    alongside the app engine, carrying the same connect_args). It is deliberately NOT
-    the pooled ORM session (whose connection the mid-operation commit returns to the
-    pool — that would make the lock re-entrant on a reused connection or leak on a
-    different one) and NOT the shared app QueuePool (which the lock, held across the slow
-    mongo round-trip, could otherwise starve). The connection is pinned for the whole
-    critical section so lock+unlock land on one backend. Session-level (not xact) is
-    required because it must outlive the mid-operation commit.
-
-    ``lock_engine`` is None on non-Postgres backends (sqlite is single-writer — no
-    serialization needed) -> returns None. On Postgres a failure to acquire the lock is
-    RAISED (fail closed — the caller must abort rather than proceed unserialized), NOT
-    swallowed to None."""
-    if lock_engine is None:
-        return None
-    conn = lock_engine.connect()
-    try:
-        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": int(key)})
-        return conn
-    except Exception:
-        conn.close()
-        raise
-
-
-def _advisory_unlock(conn, key) -> None:
-    """Release + close the dedicated connection taken by _advisory_lock. Returning a
-    still-locked physical connection to the pool would leak the lock (pooling keeps the
-    backend alive), so if the explicit unlock can't run, invalidate the connection to
-    force backend termination (which releases the session-level lock)."""
-    if conn is None:
-        return
-    try:
-        conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": int(key)})
-    except Exception as _e:
-        log.warning("advisory unlock failed for task %s (invalidating connection): %s", key, _e)
-        try:
-            conn.invalidate()
-        except Exception:
-            pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-@contextmanager
-def task_visibility_lock(lock_engine, task_id):
-    """Hold the per-task visibility advisory lock for the duration of the block, so
-    a second writer of info.visibility (the mongo report stamper) can't interleave
-    with a set_task_visibility toggle and leave the mongo store more permissive than
-    SQL. Mirrors set_task_visibility's serialization (same key = task_id, same
-    lock_engine). No-op when lock_engine is None (non-Postgres / sqlite / MT off).
-
-    Yields the pinned advisory-lock connection (None on the no-op path) so the caller can
-    run its writer-primary re-check and the authoritative tenancy re-read on the SAME
-    backend that holds the lock — probe, lock, and read then cannot disagree under an
-    in-place failover or a multi-host URL."""
-    conn = _advisory_lock(lock_engine, task_id)
-    try:
-        yield conn
-    finally:
-        _advisory_unlock(conn, task_id)
-
-
 distconf = Config("distributed")
 web_conf = Config("web")
 
@@ -252,7 +166,7 @@ class TasksMixIn:
             sample = self.session.scalar(select(Sample).where(Sample.sha256 == file_sha256))
             if not sample:
                 try:
-                    with self.session.begin():
+                    with self.session.begin_nested():
                         sample = Sample(
                             md5=file_md5,
                             crc32=fileobj.get_crc32(),
@@ -307,23 +221,6 @@ class TasksMixIn:
         task.package = package
         task.options = options
         task.priority = priority
-        # NOTE: a client-supplied job_id in `custom` is NOT scrubbed here. An earlier "root fix" stripped it
-        # at this ingest chokepoint, but add() is the SHARED ingest for external submissions AND the broker's
-        # own legitimate job_id delivery (the dispatcher POSTs /tasks/create with custom="job_id=ui-<tid>")
-        # AND internal re-submitters (reschedule / dist / gcp copy task.custom) -- add() can't tell them
-        # apart, so stripping here breaks the central pipeline. Containment lives at the CONSUMER instead:
-        # centralstore.resolve_job_id honours a job_id= token ONLY in the RAW first comma-position and never a
-        # bare 'ui-<N>', matching the submit-bridge's prefix-anchored `custom NOT LIKE 'job_id=%'` filter --
-        # so a client custom that would EVADE that filter (non-first-position 'job_id=' or a bare 'ui-<N>')
-        # can't steer info.job_id / the info.id rewrite / the S3 prefix / the pre-insert delete to a foreign
-        # id. (A FIRST-position 'custom=job_id=ui-<victim>' is still honoured; on a bridge-LESS deployment it
-        # remains contained only by topology, NOT closed -- see resolve_job_id's durable-fix note.) On the
-        # broker path the bridge also OVERWRITES
-        # custom with its own 'job_id=ui-<own_tid>' and the dispatcher builds custom from the SQS job_id (not
-        # the RDS custom), so a forgery doesn't reach a worker there in the first place; workers are not
-        # user-facing; and every central WRITE keyed on a task's own doc DERIVES 'ui-<task_id>' from the
-        # authorized id rather than reading custom (set_task_visibility, central_guac). See
-        # centralstore.resolve_job_id + mongodb.py's pre-insert delete for the sites that consume this value.
         task.custom = custom
         task.machine = machine
         task.platform = platform
@@ -334,9 +231,10 @@ class TasksMixIn:
         task.cape = cape
         task.tags_tasks = tags_tasks
 
-        # Use a transaction so that we can return an ID.
-        with self.session.begin():
+        # Use a nested transaction so that we can return an ID.
+        with self.session.begin_nested():
             self.session.add(task)
+            self.session.flush()
 
         # Deal with tags format (i.e., foo,bar,baz)
         if tags:
@@ -454,57 +352,29 @@ class TasksMixIn:
             parent_sample=parent_sample,
         )
 
-    def identify_submission_package(
-        self,
-        file: bytes,
-        package: str = "",
-        check_shellcode: bool = True,
-    ) -> tuple:
-        """Resolve package handling and whether generic demux should run."""
-        requested_package = package
-        identified_package = False
-
-        if not requested_package:
-            sf_file = SflockFile.from_path(file)
+    def _identify_aux_func(self, file: bytes, package: str, check_shellcode: bool = True) -> tuple:
+        # before demux we need to check as msix has zip mime and we don't want it to be extracted:
+        tmp_package = False
+        if not package:
+            f = SflockFile.from_path(file)
             try:
-                identified_package = sflock_identify(
-                    sf_file,
-                    check_shellcode=check_shellcode,
-                )
+                tmp_package = sflock_identify(f, check_shellcode=check_shellcode)
             except Exception as e:
-                log.error("Failed to identify submission with SFlock: %s", e)
-                identified_package = "generic"
+                log.error("Failed to sflock_ident due to %s", str(e))
+                tmp_package = "generic"
 
-        if identified_package and identified_package in sandbox_packages:
-            if identified_package in ("iso", "udf", "vhd"):
+        if tmp_package and tmp_package in sandbox_packages:
+            # This probably should be way much bigger list of formats
+            if tmp_package in ("iso", "udf", "vhd"):
                 package = "archive"
-            elif identified_package in ("zip", "rar"):
+            elif tmp_package in ("zip", "rar"):
                 package = ""
-            elif identified_package == "html":
+            elif tmp_package in ("html",):
                 package = web_conf.url_analysis.package
             else:
-                package = identified_package
+                package = tmp_package
 
-        generic_demux = (
-            not requested_package
-            and not package
-            and identified_package not in (False, None, "", "generic")
-        )
-
-        return package, identified_package, generic_demux
-
-    def _identify_aux_func(
-        self,
-        file: bytes,
-        package: str,
-        check_shellcode: bool = True,
-    ) -> tuple:
-        package, identified_package, _ = self.identify_submission_package(
-            file,
-            package,
-            check_shellcode=check_shellcode,
-        )
-        return package, identified_package
+        return package, tmp_package
 
     def demux_sample_and_add_to_db(
         self,
@@ -647,30 +517,7 @@ class TasksMixIn:
 
                     config = static_config_lookup(file, viewer=_Viewer(user_id=user_id or None, tenant_id=tenant_id))
                     if config:
-                        # Defense-in-depth: re-verify against the AUTHORITATIVE SQL
-                        # task (not the mongo stamp the dedup query trusted) that
-                        # this submitter may read the deduped analysis before
-                        # surfacing its task id — so a mongo stamp gap can't leak
-                        # another tenant's task id / config-exists oracle. No-op
-                        # when MT disabled (can_read -> is_local_admin break-glass).
-                        from lib.cuckoo.common.tenancy import can_read as _can_read, Job as _Job, multitenancy_config as _mtc
-
-                        _dt = self.session.get(Task, int(config["id"]))
-                        # MT disabled -> restore the documented see-all dedup: can_read alone would reject
-                        # a different-user's task even MT-off (visibility defaults 'private'), forcing a
-                        # needless re-extraction. If MT-state can't be confirmed, fall through to can_read
-                        # (fail-safe, no see-all).
-                        try:
-                            _mt_off = not _mtc().enabled
-                        except Exception:
-                            _mt_off = False
-                        if _dt is not None and (_mt_off or _can_read(
-                            _Viewer(user_id=user_id or None, tenant_id=tenant_id),
-                            _Job(owner_id=_dt.user_id, tenant_id=_dt.tenant_id, visibility=_dt.visibility),
-                        )):
-                            task_ids.append(config["id"])
-                        else:
-                            config = static_extraction(file)
+                        task_ids.append(config["id"])
                     else:
                         config = static_extraction(file)
                 if config or only_extraction:
@@ -706,41 +553,30 @@ class TasksMixIn:
                     else:
                         options = "dist_extract=1"
 
-                if machine == "all":
-                    task_machines = [
-                        vm.label
-                        for vm in self.list_machines(platform=platform)
-                    ]
-                else:
-                    task_machines = [machine]
-
-                for task_machine in task_machines:
-                    task_id = self.add_path(
-                        file_path=file.decode(),
-                        timeout=timeout,
-                        priority=priority,
-                        options=options,
-                        package=package,
-                        machine=task_machine,
-                        platform=platform,
-                        memory=memory,
-                        custom=custom,
-                        enforce_timeout=enforce_timeout,
-                        tags=tags,
-                        clock=clock,
-                        tlp=tlp,
-                        source_url=source_url,
-                        route=route,
-                        tags_tasks=tags_tasks,
-                        cape=cape,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        visibility=visibility,
-                        parent_sample=parent_sample,
-                    )
-                    if task_id:
-                        task_ids.append(task_id)
+                task_id = self.add_path(
+                    file_path=file.decode(),
+                    timeout=timeout,
+                    priority=priority,
+                    options=options,
+                    package=package,
+                    machine=machine,
+                    platform=platform,
+                    memory=memory,
+                    custom=custom,
+                    enforce_timeout=enforce_timeout,
+                    tags=tags,
+                    clock=clock,
+                    tlp=tlp,
+                    source_url=source_url,
+                    route=route,
+                    tags_tasks=tags_tasks,
+                    cape=cape,
+                    user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                    parent_sample=parent_sample,
+                )
                 package = None
+            if task_id:
+                task_ids.append(task_id)
 
         if config and isinstance(config, dict):
             details = {"config": config.get("cape_config", {})}
@@ -974,7 +810,7 @@ class TasksMixIn:
         @param status: status string
         @return: operation status
         """
-        log.debug("setstat task %s status %s", task_id, status)
+        log.info("setstat task %s status %s", task_id, status)
         task = self.session.get(Task, task_id)
 
         if not task:
@@ -982,20 +818,14 @@ class TasksMixIn:
 
         return self.set_task_status(task, status)
 
-    def set_task_visibility(self, task_id: int, visibility: str, expected_prior: Optional[str] = None) -> Optional[Task]:
+    def set_task_visibility(self, task_id: int, visibility: str) -> Optional[Task]:
         """Set a task's visibility (public/tenant/private).
         @param task_id: task identifier
         @param visibility: one of public|tenant|private
-        @param expected_prior: optimistic compare-and-swap guard. If given, the caller AUTHORIZED the
-            transition against a task whose visibility was `expected_prior`; if a concurrent toggle
-            changed it before we take the serialization lock, the pre-lock authorization may no longer
-            hold (e.g. a tenant-admin's widen authorized on 'tenant' must NOT land on a now-'private'
-            job the caller can't touch), so abort with CuckooVisibilityConflict instead of writing.
         @return: the Task, or None if not found
         @raise ValueError: if visibility is not a known level — defense in depth
             so no caller (web, broker, or future) can persist a bogus value even
             if it skips the view-layer check.
-        @raise CuckooVisibilityConflict: expected_prior given but the current (post-lock) value differs.
         """
         from lib.cuckoo.common.tenancy import VISIBILITIES
 
@@ -1004,185 +834,14 @@ class TasksMixIn:
         task = self.session.get(Task, task_id)
         if not task:
             return None
-        # Two-store (SQL + mongo) consistency without a distributed transaction. The
-        # ONE invariant we must never violate is "mongo more permissive than SQL" —
-        # the cross-tenant leak, since the mongo aggregate/search/stats surfaces scope
-        # on the info.visibility stamp. Per request we order the two writes by the
-        # DIRECTION of the change (RESTRICTIVE first, PERMISSIVE last) so a crash /
-        # concurrent READ in the window fails CLOSED. Concurrent WRITES to the SAME
-        # task are serialized by a session-level advisory lock held across BOTH the SQL
-        # commit and the mongo publish, so two interleaved toggles (A commits SQL and
-        # stalls; B writes both stores; A resumes publishing its STALE mongo value)
-        # can't leave mongo more permissive than SQL either.
-        from lib.cuckoo.common.exceptions import CuckooOperationalError, CuckooVisibilityConflict
-
-        _RANK = {"private": 0, "tenant": 1, "public": 2}
-        _mongo_on = mongo_update_one is not None and _mongo_reporting_enabled()
-
-        def _sync_mongo(_vis):
-            # mongo_update_one is wrapped by graceful_auto_reconnect, which swallows
-            # AutoReconnect/ServerSelectionTimeoutError and RETURNS None (no re-raise)
-            # when mongo stays down; a success returns an UpdateResult (even
-            # matched_count=0). Treat None or a raised error as failure.
-            #
-            # Also (re)assert tenant_id/user_id from the task, not just visibility: a doc
-            # orphaned by a crash between the fail-closed insert and the reporter's
-            # reconcile is left unowned (tenant_id/user_id null); a visibility-only sync
-            # would then make it {visibility: tenant, tenant_id: null} — matching NO
-            # viewer scope (invisible even to the owner). Restamping ownership here is
-            # idempotent for a normal toggle and repairs that orphan.
-            # Central mode: key the write on the task's OWN doc via the SHARED derived filter
-            # central_own_analysis_filter(task_id, task.tenant_id). Under central+MT (bridge-required) it is
-            # ui-only ({info.job_id: ui-<task_id>} + tenant guard): only a bridged doc has a tenant-isolated
-            # identity, so a non-bridged/direct-submit doc is single-tenant and is intentionally NOT addressed
-            # here (see central_bridge_required). Single-node / MT-off keeps the three-arm form (ui- OR info.id)
-            # to also cover direct-submit docs. DERIVED from the authorized id (never the forgeable custom); the
-            # same helper backs the central DELETE + comment write, so they can't drift. Non-central: bare info.id.
-            _mine = getattr(task, "tenant_id", None)
-            _filt = {"info.id": task_id}
-            _own_filter = None
+        task.visibility = visibility
+        self.session.commit()
+        if mongo_update_one is not None:
             try:
-                from lib.cuckoo.common.central_mode import central_mode_config, central_own_analysis_filter
-
-                _own_filter = central_own_analysis_filter
-                _central = central_mode_config().enabled
+                mongo_update_one("analysis", {"info.id": task_id}, {"$set": {"info.visibility": visibility}})
             except Exception:
-                # Can't determine mode -> assume central and sync SOMETHING (never skip the mongo sync on a
-                # restrictive toggle), but do NOT re-run the failed import (it would raise out of _sync_mongo,
-                # leaving the SQL toggle un-reverted). TWO sub-cases with DIFFERENT filters, both handled below:
-                # (a) the config PROBE raised but the import succeeded -> _own_filter is already set (line 1003)
-                #     -> the shared helper is used (ui-only fail-CLOSED under bridge-required);
-                # (b) the IMPORT itself failed -> _own_filter is None -> the inline three-arm (permissive) form.
-                # So this path is NOT uniformly "fail closed"; see the per-branch note on _filt below.
-                _central = True
-            if _central:
-                # Inline fallback ONLY when the central_mode import itself failed -> the mode is genuinely
-                # UNKNOWN. Mirror central_own_analysis_filter's NON-bridge-required (three-arm, job_id-qualified)
-                # shape exactly -- NOT a bare {info.id} arm (which would re-admit a FOREIGN worker-local doc that
-                # has a job_id, the "audit HIGH" the helper's docstring calls out; an import glitch is exactly
-                # when the mongodb persist-backstop is ALSO down, so unbridged docs CAN exist). The three arms
-                # match an own doc in EITHER mode (non-central: no job_id field -> the {$in:[None,...]} arm) and
-                # exclude a foreign STAMPED-'local-' collision. DELIBERATE trade / residual: this picks the
-                # non-bridge-required (permissive) shape while central_bridge_required() fails CLOSED (ui-only)
-                # on an indeterminate probe -- because a ui-only key would 0-match every doc in a genuinely
-                # non-central install (silent fail-open there). The residual it inherits from the three-arm form
-                # is the same one the helper documents "acceptable only when MT is off": arm 2 still matches a
-                # foreign worker-local doc that has NO job_id at all (Mongo null-equality matches an absent
-                # field) -- fully closing that needs the info.origin_id data-model discriminator.
-                _filt = _own_filter(task_id, _mine) if _own_filter is not None else {"$and": [
-                    {"$or": [
-                        {"info.job_id": f"ui-{int(task_id)}"},
-                        {"info.id": int(task_id), "info.job_id": {"$in": [None, f"ui-{int(task_id)}"]}},
-                        {"info.id": int(task_id), "info.job_id": f"local-{int(task_id)}", "info.tenant_id": _mine},
-                    ]},
-                    {"$or": [{"info.tenant_id": None}, {"info.tenant_id": _mine}]},
-                ]}
-            try:
-                _res = mongo_update_one(
-                    "analysis", _filt,
-                    {"$set": {
-                        "info.visibility": _vis,
-                        "info.tenant_id": _mine,
-                        "info.user_id": getattr(task, "user_id", None),
-                    }},
-                )
-            except Exception as _e:
-                log.warning("visibility mongo sync errored for task %s: %s", task_id, _e)
-                return False
-            if _res is None:
-                # graceful_auto_reconnect exhausted its retries (driver failure) -> abort so the caller rolls
-                # the SQL change back rather than leaving the stores divergent.
-                return False
-            # A 0-match: under bridge-required (ui-only) it means either the bridged report is not written yet
-            # (reconcile stamps it from the authoritative SQL value on report) OR the task is non-bridged
-            # (single-tenant by design -- deliberately not addressed by the tenant-scoped filter). Either way
-            # SQL stays authoritative for access; surface for observability, do NOT abort. NOTE: a RESTRICTIVE
-            # toggle of a non-bridged doc under MT therefore does not reach Mongo -- acceptable only because a
-            # non-bridged doc is single-tenant (central_bridge_required); a bridged doc always has the ui- key.
-            if _central and getattr(_res, "matched_count", 1) == 0:
-                log.warning("visibility mongo sync matched 0 docs for task %s (report not yet written, or a "
-                            "non-bridged single-tenant doc); SQL is authoritative, reconcile re-stamps on report",
-                            task_id)
-            return True
-
-        try:
-            _lock_conn = _advisory_lock(getattr(self, "lock_engine", None), task_id)
-        except Exception as _le:
-            # Postgres and the serialization lock could NOT be acquired (e.g. pool /
-            # connection exhaustion): fail CLOSED rather than proceed unserialized,
-            # which would reopen the concurrent-toggle race this lock exists to close.
-            log.error("visibility serialization lock unavailable for task %s: %s", task_id, _le)
-            raise CuckooOperationalError(
-                f"task {task_id} visibility change aborted: serialization lock unavailable"
-            ) from _le
-        try:
-            if _lock_conn is not None:
-                # Re-read the latest committed value now that we hold the lock — a
-                # concurrent toggle may have changed it between load and lock, and both
-                # the direction decision and _prev must reflect the CURRENT truth.
-                self.session.refresh(task)
-            _prev_visibility = task.visibility
-            # Optimistic compare-and-swap: the caller authorized this transition against `expected_prior`.
-            # If a concurrent toggle changed the row before we acquired the lock, the pre-lock authorization
-            # may no longer hold, so abort WITHOUT writing rather than commit a possibly-unauthorized
-            # end-state (e.g. a tenant-admin's widen authorized on 'tenant' landing on a now-'private' job).
-            # The finally below still releases the lock. The caller re-reads + re-authorizes and retries.
-            if expected_prior is not None and _prev_visibility != expected_prior:
-                raise CuckooVisibilityConflict(
-                    f"task {task_id} visibility changed concurrently ({expected_prior!r} -> {_prev_visibility!r}); retry"
-                )
-            task.visibility = visibility
-
-            if _RANK.get(visibility, 0) > _RANK.get(_prev_visibility, 0):
-                # MORE PERMISSIVE (e.g. private->public): make SQL durable FIRST, then
-                # publish the mongo stamp. A crash or concurrent aggregate in the window
-                # sees mongo still at the OLD, less-permissive value -> fail closed. If
-                # the mongo publish then fails, the stores are momentarily inconsistent
-                # but STILL fail closed (mongo less permissive than SQL); it reconciles
-                # on reprocess, so log rather than roll back a durable authorized change.
-                try:
-                    self.session.commit()
-                except Exception as _ce:
-                    try:
-                        self.session.rollback()
-                    except Exception:
-                        pass
-                    raise CuckooOperationalError(f"task {task_id} visibility change aborted: SQL commit failed") from _ce
-                if _mongo_on and not _sync_mongo(visibility):
-                    log.error(
-                        "visibility mongo publish lagging for task %s (SQL committed %r, mongo still %r); "
-                        "fail-closed, reconciles on reprocess", task_id, visibility, _prev_visibility,
-                    )
-                return task
-
-            # MORE RESTRICTIVE or unchanged (e.g. public->private): update the mongo
-            # stamp FIRST (still uncommitted in SQL) so the restrictive value reaches
-            # the mongo surfaces before SQL drops the restriction. If the sync fails,
-            # revert the in-memory SQL change and raise WITHOUT committing (no SQL was
-            # committed; a commit could persist unrelated pending work, a rollback would
-            # discard it).
-            if _mongo_on and not _sync_mongo(visibility):
-                task.visibility = _prev_visibility
-                log.error("visibility mongo sync FAILED for task %s (mongo unreachable); left at %r", task_id, _prev_visibility)
-                raise CuckooOperationalError(f"task {task_id} visibility change aborted: report store sync failed")
-            # Commit SQL; if THIS fails after a successful sync, best-effort revert the
-            # mongo stamp to the previous value (so mongo is never left more permissive
-            # than the un-committed SQL), roll back the poisoned session, and raise.
-            try:
-                self.session.commit()
-            except Exception as _ce:
-                try:
-                    self.session.rollback()
-                except Exception:
-                    pass
-                if _mongo_on and not _sync_mongo(_prev_visibility):
-                    log.error("visibility SQL commit failed AND mongo revert FAILED for task %s (stores may disagree)", task_id)
-                elif _mongo_on:
-                    log.error("visibility SQL commit failed for task %s; reverted mongo stamp to %r", task_id, _prev_visibility)
-                raise CuckooOperationalError(f"task {task_id} visibility change aborted: SQL commit failed") from _ce
-            return task
-        finally:
-            _advisory_unlock(_lock_conn, task_id)
+                log.warning("failed to sync visibility to mongo for task %s", task_id)
+        return task
 
     def fetch_task(self, categories: list = None):
         """Fetches a task waiting to be processed and locks it for running.
@@ -1395,7 +1054,7 @@ class TasksMixIn:
         @return: list of tasks.
         """
         tasks: List[Task] = []
-        stmt = select(Task).options(joinedload(Task.guest), selectinload(Task.errors), selectinload(Task.tags))
+        stmt = select(Task).options(joinedload(Task.guest), subqueryload(Task.errors), subqueryload(Task.tags))
         if include_hashes:
             stmt = stmt.options(joinedload(Task.sample))
         if status:
@@ -1461,16 +1120,12 @@ class TasksMixIn:
         @param task_id: ID of the task to query.
         @return: operation status.
         """
-        try:
-            with self.session.begin():
-                task = self.session.get(Task, task_id)
-                if task is None:
-                    return False
-                self.session.delete(task)
-            return True
-        except SQLAlchemyError as e:
-            log.error("Error deleting task %s: %s", task_id, str(e))
+        task = self.session.get(Task, task_id)
+        if task is None:
             return False
+        self.session.delete(task)
+        # ToDo missed commits everywhere, check if autocommit is possible
+        return True
 
     def delete_tasks(
         self,
@@ -1564,12 +1219,13 @@ class TasksMixIn:
         # but the more idiomatic SQLAlchemy 2.0 approach would be to wrap the execution
         # in a with self.session.begin(): block, which handles transactions automatically.
         try:
-            with self.session.begin():
-                result = self.session.execute(delete_stmt)
-                log.info("Deleted %d tasks matching the criteria.", result.rowcount)
+            result = self.session.execute(delete_stmt)
+            log.info("Deleted %d tasks matching the criteria.", result.rowcount)
+            self.session.commit()
             return True
         except SQLAlchemyError as e:
             log.error("Error deleting tasks: %s", str(e))
+            self.session.rollback()
             return False
 
     # ToDo replace with delete_tasks
@@ -1683,10 +1339,10 @@ class TasksMixIn:
         query = select(Task).where(Task.id == task_id)
         if details:
             query = query.options(
-                joinedload(Task.guest), selectinload(Task.errors), selectinload(Task.tags), joinedload(Task.sample)
+                joinedload(Task.guest), subqueryload(Task.errors), subqueryload(Task.tags), joinedload(Task.sample)
             )
         else:
-            query = query.options(selectinload(Task.tags), joinedload(Task.sample))
+            query = query.options(subqueryload(Task.tags), joinedload(Task.sample))
         return self.session.scalar(query)
 
     # This function is used by the runstatistics community module.

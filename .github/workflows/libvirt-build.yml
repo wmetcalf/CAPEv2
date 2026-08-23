@@ -1,0 +1,161 @@
+name: libvirt-build
+
+# Builds libvirt $LIBVIRT_VERSION (cape-libvirt) from source. Triggered
+# on changes to aws-nested-virt/libvirt-build/ / aws-nested-virt/debian/cape-libvirt.*
+# on main, or manually via workflow_dispatch.
+#
+# Why we ship our own libvirt: Ubuntu noble's libvirt 10.0.0 is missing
+# virStreamFinish (added in 11.x), which CAPE's QemuScreenshots aux
+# module needs. See aws-nested-virt/libvirt-build/build.sh's header for the full why.
+#
+# Caching: actions/cache restores the populated DESTDIR keyed on the
+# tree hash of aws-nested-virt/libvirt-build/ + aws-nested-virt/debian/cape-libvirt.* +
+# LIBVIRT_VERSION.
+# Cold compile of libvirt 11.x is ~15 min on the standard runner;
+# warm-cache builds reduce to seconds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/libvirt-build/**'
+      - 'aws-nested-virt/debian/cape-libvirt.*'
+      - '.github/workflows/libvirt-build.yml'
+  workflow_dispatch:
+    inputs:
+      libvirt_version:
+        description: 'Upstream libvirt version (default 11.1.0)'
+        type: string
+        required: false
+        default: '11.1.0'
+      cape_revision:
+        description: 'Package revision suffix (e.g. "1" → 11.1.0+cape.1)'
+        type: string
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libvirt-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ubuntu:24.04
+    env:
+      LIBVIRT_VERSION: ${{ inputs.libvirt_version || '11.1.0' }}
+      CAPE_REVISION: ${{ inputs.cape_revision || '1' }}
+      DESTDIR: ${{ github.workspace }}/build/cape-libvirt-destdir
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install libvirt build toolchain
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          # libvirt 11.x build dependencies for Ubuntu 24.04 (noble).
+          #
+          # libvirt 11.x uses nftables natively (libnftnl-dev +
+          # libnftables-dev).  Ubuntu noble removed the iptables-dev
+          # transitional package, so we don't try to install it —
+          # libvirt falls back gracefully or skips the iptables
+          # firewall backend at configure time.
+          #
+          # python3-rpm dropped: not in noble (only python3-rpm-build
+          # exists), and not needed for the libvirt build itself —
+          # would only matter if we were enabling the storage_rpm
+          # driver, which we are not (driver_qemu only).
+          apt-get install -y -qq --no-install-recommends \
+              meson ninja-build pkg-config \
+              gcc g++ make \
+              libxml2-dev libxml2-utils \
+              libgnutls28-dev gnutls-bin \
+              libnl-3-dev libnl-route-3-dev \
+              libyajl-dev libtirpc-dev \
+              libdevmapper-dev libpciaccess-dev \
+              libcurl4-openssl-dev libnuma-dev \
+              libsasl2-dev libcap-ng-dev libreadline-dev \
+              libosinfo-1.0-dev libjansson-dev libjson-c-dev \
+              libapparmor-dev apparmor-utils \
+              python3 python3-docutils python3-pip \
+              xsltproc rpcsvc-proto gettext \
+              libfuse-dev libacl1-dev libattr1-dev \
+              libxslt1-dev \
+              libnftnl-dev libnftables-dev \
+              dnsmasq-base \
+              git curl ca-certificates dpkg-dev fakeroot file xz-utils
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Mark workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute cache key
+        id: cachekey
+        run: |
+          set -euo pipefail
+          h=$(cat \
+                aws-nested-virt/libvirt-build/build.sh \
+                aws-nested-virt/libvirt-build/package.sh \
+                aws-nested-virt/debian/cape-libvirt.install \
+                aws-nested-virt/debian/cape-libvirt.postinst \
+                <(echo "$LIBVIRT_VERSION") \
+              | sha256sum | awk '{print $1}')
+          echo "key=libvirt-destdir-${h:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DESTDIR cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DESTDIR }}
+          key: ${{ steps.cachekey.outputs.key }}
+
+      - name: Compile libvirt (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$DESTDIR"
+          cd aws-nested-virt && bash libvirt-build/build.sh
+
+      - name: Sanity-check cached DESTDIR (cache hit)
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          test -x "$DESTDIR/usr/sbin/libvirtd" \
+            || { echo "::error::cached DESTDIR is incomplete; cache key collision?"; exit 1; }
+          LIBVIRT_BUILT_VERSION=$(
+              LD_LIBRARY_PATH="$DESTDIR/usr/lib/x86_64-linux-gnu" \
+              "$DESTDIR/usr/sbin/libvirtd" --version 2>/dev/null | awk '{print $NF}'
+          )
+          case "$LIBVIRT_BUILT_VERSION" in
+              11.*) ;;
+              *) echo "::error::cached libvirtd reports $LIBVIRT_BUILT_VERSION — expected 11.x"; exit 1 ;;
+          esac
+
+      - name: Build cape-libvirt.deb
+        env:
+          PACKAGE_VERSION: ${{ env.LIBVIRT_VERSION }}+cape.${{ env.CAPE_REVISION }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          cd aws-nested-virt && bash libvirt-build/package.sh
+          ls -la "$OUT_DIR"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-libvirt-debs-${{ github.sha }}
+          path: aws-nested-virt/dist/cape-libvirt_*.deb
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,30 @@
+[Unit]
+Description=Daily threat-content deb refresh
+Documentation=https://github.com/kevoreilly/CAPEv2/tree/main/cape-community-build
+
+[Timer]
+# Fresh AMI hosts (and reboots) refresh the deb-packaged threat content
+# (cape-yara-forge / cape-sigma-rules / cape-community) ~15 min after boot, so a
+# freshly-snapshotted host converges to current rules within minutes instead of
+# waiting up to ~24h for the next daily tick. Staggered behind
+# cape-suricata-update.timer (OnBootSec=10min) so the two don't contend for the
+# dpkg lock / apt repo at once.
+OnBootSec=15min
+# OnCalendar=04:30 in UTC.  Off-peak vs typical analyst hours and
+# staggered from:
+#   - unattended-upgrades (apt-daily-upgrade.timer fires ~06:00 UTC)
+#   - cape-suricata-update.timer (every 6h starting at boot)
+#   - clamav-freshclam (24x/day, every hour-ish)
+# Stagger gives the dpkg lock a clean window for the apt
+# install --only-upgrade.
+OnCalendar=*-*-* 04:30:00
+# RandomizedDelaySec=600 spreads the load across hosts when this
+# eventually serves a fleet — no thundering herd against the apt
+# repo at 04:30 sharp.
+RandomizedDelaySec=600
+# If the host was down at 04:30, fire once on boot 5 min after the
+# timer activates rather than skipping until the next day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

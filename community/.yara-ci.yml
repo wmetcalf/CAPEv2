@@ -1,0 +1,12 @@
+files:
+  accept:
+  - "data/yara/**.yar"
+  ignore:
+  - "data/yara/deprecated/**.yar"
+  - "data/yara/CAPE/deprecated/**.yar"
+
+false_positives:
+  disabled: true
+
+false_negatives:
+  disabled: true

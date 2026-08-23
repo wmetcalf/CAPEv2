@@ -1,0 +1,22 @@
+Intentionally empty.
+
+cape-qemu.deb ships bios.bin / bios-256k.bin / vgabios*.bin built from
+QEMU's bundled SeaBIOS (under qemu/roms/seabios/). qemu-build/build.sh
+applies anti-VM-detection patches to the bundled SeaBIOS source before
+`make bios` + `make vgabios` runs, so the bios files inside cape-qemu
+are already patched.
+
+A separate seabios-build workflow would let us bump SeaBIOS independently
+of QEMU (~5 min compile vs ~25 min for QEMU). Day 1 doesn't need that —
+the qemu-bundled SeaBIOS satisfies CAPE's analysis VM needs.
+
+When to revisit:
+
+- SeaBIOS version newer than QEMU bundles is needed.
+- SeaBIOS-only patches need rolling without rebuilding QEMU.
+- Operators want to roll back SeaBIOS independent of QEMU.
+
+The live-installer's `qemu-build/kvm-qemu.sh install_seabios()` is the
+reference for that path. apt-publish.yml's fan-in already has a slot for
+seabios-build artifacts (cape-seabios-debs-*) that becomes active once
+this workflow lands.

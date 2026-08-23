@@ -106,8 +106,16 @@ NETWORK_PROC_MAP = pro_cfg.network.process_map
 # python3 manage.py runserver_plus 0.0.0.0:8000 --traceback --keep-meta-shutdown
 DEBUG = True
 
-# Database settings. We don't need it.
-DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "siteauth.sqlite"}}
+# Django's auth/sessions/admin SQLite DB.  The cape-core deb ships
+# /opt/CAPEv2/web as root:root via dpkg, so the upstream relative
+# "siteauth.sqlite" default lands cape-services unable to write the
+# SQLite journal/WAL companion files in that directory (SQLite
+# requires write on the enclosing dir, not just the file).  Anchor
+# at the cape state directory under /var/lib/cape/django/, which
+# cape-core.postinst creates with cape:cape ownership.  CAPE's own
+# analysis DB still lives at postgres://cape:...@localhost/cape; this
+# SQLite handles only Django's auth/sessions tables.
+DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "/var/lib/cape/django/siteauth.sqlite"}}
 
 SITE_ID = 1
 
@@ -356,16 +364,12 @@ if api_cfg.api.token_auth_enabled:
     REST_FRAMEWORK = {
         "DEFAULT_AUTHENTICATION_CLASSES": _api_auth_classes,
         "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+        "DEFAULT_THROTTLE_CLASSES": ["apiv2.throttling.SubscriptionRateThrottle"],
+        "DEFAULT_THROTTLE_RATES": {
+            "user": api_cfg.api.default_user_ratelimit,
+            "subscription": api_cfg.api.default_subscription_ratelimit,
+        },
     }
-
-    if api_cfg.api.ratelimit:
-        REST_FRAMEWORK.update({
-            "DEFAULT_THROTTLE_CLASSES": ["apiv2.throttling.SubscriptionRateThrottle"],
-            "DEFAULT_THROTTLE_RATES": {
-                "user": api_cfg.api.default_user_ratelimit,
-                "subscription": api_cfg.api.default_subscription_ratelimit,
-            },
-        })
 
 else:
     REST_FRAMEWORK = {
@@ -537,12 +541,3 @@ except NameError:
 from lib.cuckoo.core.database import init_database
 
 init_database()
-
-# Prevent Django's auto-reloader from watching/reloading when files inside workers/ folder change
-from django.dispatch import receiver
-from django.utils.autoreload import file_changed
-
-@receiver(file_changed)
-def ignore_workers_changes(sender, file_path, **kwargs):
-    if "/workers/" in str(file_path).replace("\\", "/"):
-        return True

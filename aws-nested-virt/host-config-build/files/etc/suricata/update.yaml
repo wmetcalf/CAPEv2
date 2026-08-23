@@ -1,0 +1,39 @@
+# /etc/suricata/update.yaml — managed suricata-update config.
+#
+# suricata-update is the native consumer for high-cadence Suricata
+# rule updates. We point it at the the ruleset CDN's sources index for
+# the curated `cape/rules` ruleset (ET Open + cape-project
+# rules, repackaged via suricata-update at build time).
+#
+# Build pipeline: sandbox-code suricata-rules-build → threat-content
+# release (flat, bare-named assets) at https://apt.example.invalid/
+#   cape-rules.tar.gz
+#   cape-rules.tar.gz.md5    ← change-detection sidecar
+#   index.yaml                       ← THIS file references it
+#
+# Operator runtime: cape-suricata-update.timer (shipped by this deb)
+# fires `suricata-update` every 6h; honor the md5 sidecar so unchanged
+# upstreams skip the download entirely.
+
+# Enabled sources by name. Names match the index.yaml advertised at
+# update-sources URLs below.
+sources:
+  - cape/rules
+
+# Where to fetch source-set metadata from. Replaces the default
+# (OISF index) with the curated cape/rules index.
+update-sources:
+  - https://apt.example.invalid/index.yaml
+
+# Where the assembled ruleset lands. Suricata's default suricata.yaml
+# `rule-files:` block reads `suricata.rules` from this directory.
+output: /etc/suricata/rules/
+
+# After-update hook: signal suricata to reload (USR2) rather than
+# fully restart. Faster + preserves flow state.
+reload-command: systemctl reload suricata
+
+# Don't shell out to `suricata -T` for output validation on this host.
+# We trust the upstream build's validation; redundant validation here
+# burns ~30 sec per refresh.
+no-test: yes

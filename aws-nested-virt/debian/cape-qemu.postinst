@@ -1,0 +1,26 @@
+#!/bin/sh
+# cape-qemu postinst: quiescent — no service restart.
+#
+# libvirt picks up the new qemu-system-x86_64 binary on next domain
+# cold start. Existing snapshot1 snapshots stay valid because the
+# snapshot is at the qcow2 level, not the qemu binary level. CAPE's
+# natural VM rotation between analyses is the upgrade vector.
+
+set -e
+
+case "$1" in
+    configure)
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "cape-qemu postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

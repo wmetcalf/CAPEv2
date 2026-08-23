@@ -251,7 +251,7 @@ def load_vms_tags(force: bool = False):
         return _all_vms_tags or []
 
 
-def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> "list | bool":
+def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: dict = None) -> dict:
     """
     Retrieves the top Autonomous System Numbers (ASNs) based on the number of occurrences in the database.
 
@@ -261,10 +261,9 @@ def top_asn(date_since: datetime = False, results_limit: int = 20, scope_match: 
     Args:
         date_since (datetime, optional): A datetime object to filter results starting from this date. Defaults to False.
         results_limit (int, optional): The maximum number of ASNs to return. Defaults to 20.
-        scope_match (dict, optional): A mongo $match restricting the aggregation to the caller's entitled tenant scope (multitenancy). Defaults to None (no scoping / break-glass).
 
     Returns:
-        list | bool: A list of {"total": count, "asn": asn} rows, or False if MongoDB is not enabled or the "top_asn" configuration is disabled.
+        dict: A dictionary containing the top ASNs and their counts. Returns False if the MongoDB is not enabled or if the "top_asn" configuration is disabled.
     """
     if web_cfg.general.get("top_asn", False) is False:
         return False
@@ -333,11 +332,8 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     t = int(time.time())
 
     # caches results for 10 minutes; scoped calls bypass the cache entirely to
-    # prevent cross-tenant leaks (cache is shared across all callers). Bypass when
-    # EITHER scope_match OR viewer is set — the ES branch scopes via `viewer`
-    # (not scope_match), so keying only on scope_match would serve/poison the
-    # shared global cache with tenant-scoped data.
-    if not scope_match and not viewer and hasattr(top_detections, "cache"):
+    # prevent cross-tenant leaks (cache is shared across all callers).
+    if not scope_match and hasattr(top_detections, "cache"):
         ct, data = top_detections.cache
         if t - ct < 600:
             return data
@@ -377,15 +373,10 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
         if date_since:
             q["query"]["bool"]["must"].append({"range": {"info.started": {"gte": date_since.isoformat()}}})
 
-        # Tenant scope on Elasticsearch: apply the viewer's ENTITLED-UNION filter
-        # (public OR own-tenant OR mine) so an ES-backed install doesn't return the
-        # GLOBAL per-family landscape. NOTE: unlike the mongo branch (which applies
-        # the per-scope scope_match), this is the union, so per-scope stat panels on
-        # ES show the viewer's union rather than strictly public/tenant/mine. It
-        # never exposes another tenant's data (it is the viewer's own entitled
-        # union), and ES + multitenancy is a documented not-yet-supported combo
-        # (see docs/MULTITENANCY-SUPPORT.md) — mongo is the supported store. No-op
-        # for break-glass / MT-disabled.
+        # Tenant scope (parity with the mongo branch's scope_match): without this
+        # a locked-mode tenant's My-Tenant/Mine stat panels return the GLOBAL
+        # per-family malware landscape on an ES-backed install. No-op for
+        # break-glass / MT-disabled.
         _esf = _viewer_scope_es_filter(viewer)
         if _esf:
             q["query"]["bool"].setdefault("filter", []).append(_esf)
@@ -398,9 +389,8 @@ def top_detections(date_since: datetime = False, results_limit: int = 20, scope_
     if data:
         data = list(data)
 
-    # save to cache only for unscoped (global) calls — never when scope_match OR
-    # viewer is set, or a tenant-scoped result would poison the shared cache.
-    if not scope_match and not viewer:
+    # save to cache only for unscoped (global) calls
+    if not scope_match:
         top_detections.cache = (t, data)
 
     return data
@@ -488,7 +478,7 @@ def statistics(s_days: int, scope=None, viewer=None) -> dict:
             - distributed_tasks: Statistics related to distributed tasks (if applicable).
             - asns: Top Autonomous System Numbers (ASNs).
     """
-    from lib.cuckoo.common.tenancy_optional import scope_match as _scope_match_fn
+    from lib.cuckoo.common.tenancy import scope_match as _scope_match_fn
 
     # Derive the mongo $match dict from scope+viewer; None → no filter (global, backward-compat).
     sm = _scope_match_fn(scope, viewer) if scope and scope != "global" else None
@@ -972,32 +962,13 @@ def download_file(**kwargs):
     if not kwargs.get("task_machines", []):
         kwargs["task_machines"] = [None]
 
-    generic_demux = False
     if DYNAMIC_PLATFORM_DETERMINATION:
-        check_shellcode = "check_shellcode=0" not in kwargs["options"]
-        path_bytes = kwargs["path"] if isinstance(kwargs["path"], bytes) else kwargs["path"].encode()
-        _, _, generic_demux = db.identify_submission_package(
-            path_bytes,
-            package,
-            check_shellcode=check_shellcode,
-        )
-
-        # file= intentionally submits the container to the guest-side package.
-        if "file=" in kwargs["options"]:
-            generic_demux = False
-
-        platform = "" if generic_demux else File(kwargs["path"]).get_platform()
+        platform = File(kwargs["path"]).get_platform()
     if platform == "linux" and not linux_enabled and "Python" not in magic_type:
         return "error", {"error": "Linux binaries analysis isn't enabled"}
 
     if machine.lower() == "all":
-        if generic_demux:
-            # Preserve the user's intent until demux determines the platform.
-            kwargs["task_machines"] = ["all"]
-        else:
-            kwargs["task_machines"] = [
-                vm.label for vm in db.list_machines(platform=platform)
-            ]
+        kwargs["task_machines"] = [vm.label for vm in db.list_machines(platform=platform)]
     elif machine:
         machine_details = db.view_machine(machine)
         if platform and hasattr(machine_details, "platform") and not machine_details.platform == platform:
@@ -1175,7 +1146,7 @@ def _download_file(route: str, url: str, options: str):
     return response
 
 
-def category_all_files(task_id: str, category: str, base_path: str, analysis_filter=None):
+def category_all_files(task_id: str, category: str, base_path: str):
     """
     Retrieve all file paths for a given task and category.
 
@@ -1197,11 +1168,8 @@ def category_all_files(task_id: str, category: str, base_path: str, analysis_fil
     if category == "CAPE":
         category = "CAPE.payloads"
     if repconf.mongodb.enabled:
-        # analysis_filter: caller-supplied central-mode-scoped filter (web layer's scoped_analysis_query,
-        # not importable here -- lib->web). None -> bare {info.id}. Prevents the returned sha256 membership
-        # list being derived from a colliding tenant's doc in central mode (audit MEDIUM metadata leak).
         analysis = mongo_find_one(
-            "analysis", analysis_filter or {"info.id": int(task_id)}, {f"{category}.{FILE_REF_KEY}": 1, "_id": 0}, sort=[("_id", -1)]
+            "analysis", {"info.id": int(task_id)}, {f"{category}.{FILE_REF_KEY}": 1, "_id": 0}, sort=[("_id", -1)]
         )
     # if es_as_db:
     #    # ToDo missed category
@@ -1363,7 +1331,6 @@ search_term_map_repetetive_blocks = {
     "crc32": "crc32",
     "die": "die",
     "trid": "trid",
-    "magika": "magika.label",
     "imphash": "imphash",
 }
 
@@ -1486,20 +1453,15 @@ def perform_search(
             if term == "ids":
                 ids = value
             elif term == "tags_tasks":
-                # Scope the SQL prequery to the viewer's VISIBLE tasks BEFORE the
-                # limit — otherwise other tenants' matches fill search_limit and the
-                # (tenant-scoped) mongo query below returns nothing even when the
-                # viewer has older visible matches. visible_to=None is a no-op
-                # (multitenancy disabled / break-glass), preserving legacy behavior.
-                ids = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=search_limit, visible_to=viewer)]
+                ids = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=search_limit)]
             elif term == "user_tasks":
                 if not user_id:
                     ids = 0
                 else:
                     # ToDo allow to admin search by user tasks
-                    ids = [int(v.id) for v in db.list_tasks(user_id=user_id, limit=search_limit, visible_to=viewer)]
+                    ids = [int(v.id) for v in db.list_tasks(user_id=user_id, limit=search_limit)]
             else:
-                ids = [int(v.id) for v in db.list_tasks(options_like=value, limit=search_limit, visible_to=viewer)]
+                ids = [int(v.id) for v in db.list_tasks(options_like=value, limit=search_limit)]
             if ids:
                 if len(ids) > 1:
                     term = "ids"
@@ -1526,8 +1488,6 @@ def perform_search(
         query_val = {"$gte": float(value)}
     else:
         if re.search(r"[\^\$\|\?\*\+\(\)\[\]\{\}]", value):
-            if len(value) > 256:
-                raise ValueError("Regex too long")
             query_val = {"$regex": value, "$options": "i"}
         else:
             query_val = value
@@ -1563,15 +1523,12 @@ def perform_search(
                 # Join with the analysis collection
                 {"$lookup": {"from": "analysis", "localField": "_id", "foreignField": "info.id", "as": "task_doc"}},
                 {"$unwind": "$task_doc"},
-                # Stage 8: Make the task doc the new root (type check to prevent $replaceRoot crashes)
-                {"$match": {"task_doc": {"$type": "object"}}},
                 {"$replaceRoot": {"newRoot": "$task_doc"}},
             ]
 
             # Tenant scope — applied regardless of `privs` (Django is_staff is NOT
             # the tenancy break-glass; only is_local_admin is, handled inside
-            # _viewer_scope_match). Mode-INDEPENDENT: scopes in shared mode too;
-            # None only when multitenancy is disabled or the viewer is break-glass.
+            # _viewer_scope_match). No-op when multitenancy is disabled/shared.
             _scope = _viewer_scope_match(viewer)
             if _scope:
                 pipeline.append({"$match": _scope})
@@ -1621,8 +1578,7 @@ def perform_search(
                     mongo_search_query["info.user_id"] = user_id
 
             # Tenant scope — applied regardless of `privs` (is_staff is not the
-            # tenancy break-glass). Mode-INDEPENDENT: scopes in shared mode too;
-            # None only when multitenancy is disabled or the viewer is break-glass.
+            # tenancy break-glass). No-op when multitenancy disabled/shared.
             _scope = _viewer_scope_match(viewer)
             if _scope:
                 mongo_search_query = {"$and": [mongo_search_query, _scope]}
@@ -1849,7 +1805,7 @@ def process_new_task_files(request, samples: list, details: dict, opt_filename: 
                 )
                 continue
 
-            from lib.cuckoo.common.tenancy_optional import viewer_for as _viewer_for
+            from users.tenancy import viewer_for as _viewer_for
 
             if (
                 not request.user.is_staff

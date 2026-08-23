@@ -1,0 +1,98 @@
+name: host-config-build
+
+# Builds `cape-host-config.deb` — host-side config for the
+# host's threat-content consumer daemons (freshclam, suricata-update).
+# See aws-nested-virt/host-config-build/package.sh for the file list.
+#
+# Triggers:
+#   - push-on-edit (this is static content, no upstream to mirror —
+#     edits to aws-nested-virt/host-config-build/files/ are the only signal that
+#     needs rebuild)
+#   - workflow_dispatch (manual rebuild w/ optional version override)
+#
+# No cron — there's nothing upstream that changes that we'd track.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Override deb Version (default: <date>+cape.1)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/host-config-build/**'
+      - '.github/workflows/host-config-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-config-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends dpkg-dev
+
+      - name: Determine PACKAGE_VERSION
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version_override }}" ]; then
+              VER="${{ inputs.version_override }}"
+          else
+              # Date-stamped + package revision. Daily push edits get
+              # a new Version naturally; force_rebuilds via workflow_
+              # dispatch can be re-stamped with an override.
+              VER="$(date -u +%Y%m%d)+cape.1"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VER"
+
+      - name: Package cape-host-config.deb
+        env:
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: cd aws-nested-virt && bash host-config-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-host-config_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          echo "=== deb metadata ==="
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "=== deb file list ==="
+          dpkg-deb -c "$deb"
+          # Required files must all be present.
+          for f in \
+              ./etc/clamav/freshclam.conf \
+              ./etc/suricata/update.yaml \
+              ./etc/systemd/system/cape-suricata-update.service \
+              ./etc/systemd/system/cape-suricata-update.timer
+          do
+              dpkg-deb -c "$deb" | awk '{print $6}' | grep -qF "$f" \
+                  || { echo "::error::missing $f in deb"; exit 1; }
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-host-config-debs-${{ steps.ver.outputs.version }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

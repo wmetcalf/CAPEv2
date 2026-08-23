@@ -1,0 +1,44 @@
+[Unit]
+Description=Pull threat-content deb upgrades from the apt repo
+Documentation=https://github.com/kevoreilly/CAPEv2/tree/main/cape-community-build
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Apt runs that touch dpkg need to be serialized with the daily
+# unattended-upgrades / man-db cron — DPkg::Lock-Timeout makes us
+# wait instead of hard-erroring.  Most threat-deb upgrades complete
+# in <30 sec; 5 min lock-wait covers concurrent unattended-upgrades.
+ExecStart=/usr/bin/apt-get update -qq
+ExecStart=/usr/bin/apt-get install -y --only-upgrade \
+    -o DPkg::Lock-Timeout=300 \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    cape-yara-forge cape-sigma-rules
+# Why `--only-upgrade`: never *install* missing debs here, only bump
+# existing ones.  Both debs are baked into the AMI by the install
+# path; the timer's job is the upgrade path.
+#
+# NB: cape-signatures + cape-core are NOT in this list because they're
+# tightly coupled to each other (community/ subtree imports from
+# cape/), they're co-versioned via cape-build, and they're in the
+# OS-affecting deb set — so a community-content bump goes through
+# ami-bake → AMI replacement, not this timer.  yara-forge and
+# sigma-rules are genuinely independent threat content (their upstreams
+# are YARAHQ/yara-forge + Zircolite respectively, no cape internals).
+#
+# Why `--force-confdef --force-confold`: any /etc conffile changes
+# inside a threat deb (rare, but cape-sigma-rules ships none today)
+# keep operator's local edits; the deb's new version goes to .dpkg-
+# dist instead of overwriting.  Threat content lives outside /etc,
+# so these flags are belt-and-suspenders.
+#
+# Service restarts (cape, cape-processor, cape-web) happen via the
+# cape-processor-reload dpkg trigger handled by cape-host-runtime's
+# postinst — coalesced into a single restart at end of transaction
+# even when all three debs upgrade in the same run.
+
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal

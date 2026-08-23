@@ -1,0 +1,305 @@
+#!/usr/bin/make -f
+#
+# Single source package, two binary packages:
+#   - cape-core       — Python via dh-virtualenv
+#   - cape-signatures — pure-Python (community subtree), arch-all
+#
+# cape-qemu and cape-suricata used to live here but were split out
+# because their compile times (~25 min for QEMU, ~6 min for Suricata)
+# were paying the full price on every cape-core/cape-signatures push.
+# They're now built by dedicated workflows that trigger only on
+# changes to qemu-build/ and suricata-build/ respectively. The .debs
+# end up in the same apt repo via apt-publish.yml's fan-in.
+
+export DH_VIRTUALENV_INSTALL_ROOT = /opt
+export PYTHONUNBUFFERED = 1
+
+%:
+	dh $@ --with python-virtualenv
+
+# ---- cape-core: dh-virtualenv ---------------------------------------------
+
+# Export Poetry's resolved deps to debian/cape-core/requirements.txt before
+# dh_virtualenv runs, so the venv installs from a frozen, lockfile-backed
+# manifest rather than from pyproject.toml directly.
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -f debian/cape-core/requirements.txt
+
+override_dh_virtualenv:
+	# Generate frozen requirements.txt from Poetry. Source-of-truth is
+	# the root pyproject.toml + poetry.lock (CAPE source is the package
+	# root now); no other path writes to debian/cape-core/requirements.txt.
+	poetry export -f requirements.txt --without-hashes \
+	    --output debian/cape-core/requirements.txt
+
+	# CAPE's root pyproject.toml declares `[tool.poetry] package-mode = false`
+	# because upstream runs CAPE as an application (`python manage.py ...`),
+	# not as a library. dh_virtualenv unconditionally invokes
+	# `pip install <sourcedirectory>` after installing requirements.txt,
+	# which makes pip ask poetry-core to build a wheel — and poetry-core
+	# refuses because of package-mode=false.
+	#
+	# Workaround: swap in a stub pyproject.toml that pip can build (an
+	# empty setuptools no-op pkg). Real CAPE source ships via
+	# debian/cape-core.install at /opt/CAPEv2/{lib,web,modules,...} so
+	# the venv only needs the runtime deps, not CAPE itself as a wheel.
+	#
+	# Always restore the original pyproject.toml even if dh_virtualenv
+	# fails so subsequent runs don't see a corrupted source tree.
+	mv pyproject.toml pyproject.toml.orig
+	printf '%s\n' \
+	    '[build-system]' \
+	    'requires = ["setuptools>=61"]' \
+	    'build-backend = "setuptools.build_meta"' \
+	    '[project]' \
+	    'name = "cape-core-runtime"' \
+	    'version = "0.1.0"' \
+	    '[tool.setuptools]' \
+	    'py-modules = []' \
+	    > pyproject.toml
+	# dh_virtualenv builds the venv + installs the stub pyproject.toml
+	# above. Its `--requirements` flag is intentionally NOT passed
+	# here: historically with `--sourcedirectory=cape` the path resolved
+	# relative to cape/ (not the project root), and the cape-debs published
+	# from 2026-05-11 onwards shipped a venv with ONLY pip + the stub
+	# because the requirements file was silently missed. CAPE is now the
+	# package root (no --sourcedirectory), but the explicit pip-install
+	# step below still pins down the contract: the venv's own pip runs
+	# from the project-root cwd against the resolved requirements file
+	# path, with no chdir ambiguity.
+	{ \
+	    dh_virtualenv \
+	        --package=cape-core \
+	        --python /usr/bin/python3.12 \
+	        --upgrade-pip \
+	        --install-suffix CAPEv2 \
+	        --extra-pip-arg --no-binary=lief \
+	        --extra-pip-arg --no-binary=yara-python \
+	        --extra-pip-arg --no-binary=libvirt-python; \
+	    rc=$$?; \
+	    mv pyproject.toml.orig pyproject.toml; \
+	    exit $$rc; \
+	}
+	# Explicitly install the resolved runtime deps into the venv.
+	# Invoking via `python -m pip` rather than the bin/pip wrapper:
+	# dh-virtualenv 1.2.2 with --upgrade-pip leaves a venv where the
+	# `pip` package is in site-packages but the standalone bin/pip
+	# executable isn't always created (a cape-build run
+	# hit 'No such file or directory' on debian/cape-core/opt/
+	# CAPEv2/bin/pip).  `python -m pip` is bulletproof — it just
+	# needs python and the pip module, both of which dh_virtualenv
+	# always installs.
+	#
+	# --no-deps: the requirements.txt is poetry-resolved (so every
+	# transitive is already listed as its own line) and we MUST skip
+	# pip's own resolver because poetry export emits direct-URL deps
+	# (pyattck, pyattck-data, httpreplay) where parent and child have
+	# different URL forms — pyattck 7.2.1's wheel metadata declares
+	# 'pyattck-data @ git+https://github.com/CAPESandbox/pyattck-data'
+	# (no SHA pin) while requirements.txt has the same package with
+	# an explicit SHA-pinned URL.  pip's resolver compares URL
+	# strings literally and refuses to merge those, exiting with
+	# ResolutionImpossible (a cape-build run).  --no-deps
+	# sidesteps the resolver entirely; we trust poetry.lock to have
+	# already done the resolution.
+	debian/cape-core/opt/CAPEv2/bin/python -m pip install --disable-pip-version-check \
+	    --no-deps \
+	    --no-binary lief --no-binary yara-python --no-binary libvirt-python \
+	    -r debian/cape-core/requirements.txt
+	# Sanity-check the venv ended up with the deps we expect.  django
+	# is a high-signal marker — if it's missing the requirements step
+	# silently no-op'd and we'd otherwise ship an empty venv (the
+	# 2026-05-11 regression).
+	if ! debian/cape-core/opt/CAPEv2/bin/python -c 'import django, alembic, psycopg2, pyclamd' >/dev/null 2>&1; then \
+	    echo '::error::cape-core venv is missing expected runtime deps (django/alembic/psycopg2/pyclamd)'; \
+	    exit 1; \
+	fi
+	# Strip the .gitignore that virtualenv (run by dh_virtualenv just
+	# above) writes to the venv root /opt/CAPEv2/.gitignore. Upstream
+	# virtualenv adds it so source trees don't accidentally check the
+	# venv into git; we don't need it inside the deb.
+	# This must run AFTER dh_virtualenv (the file gets created at
+	# venv-create time, not in dh_install where I originally put the
+	# strip).
+	if [ -f debian/cape-core/opt/CAPEv2/.gitignore ]; then \
+	    rm -f debian/cape-core/opt/CAPEv2/.gitignore; \
+	fi
+	# /opt/CAPEv2 must be on the venv's sys.path so the systemd-driven
+	# `python manage.py ...` invocations can import cape's
+	# lib/web/modules/utils packages — those ship at /opt/CAPEv2/{...}
+	# via cape-core.install, NOT inside the venv's site-packages (the
+	# venv was built from a stub pyproject.toml because cape's real
+	# one has package-mode=false). A .pth file at site-packages adds
+	# the path on every venv-python invocation.
+	site_packages=$$(ls -d debian/cape-core/opt/CAPEv2/lib/python*/site-packages 2>/dev/null | head -1); \
+	    if [ -n "$$site_packages" ]; then \
+	        echo /opt/CAPEv2 > "$$site_packages/cape.pth"; \
+	    fi
+
+# Stage conf/default/<name>.conf.default → /etc/cape/<name>.conf
+# before dh_install runs. Keeps the conffile paths in
+# debian/cape-core.conffiles aligned with what's actually shipped.
+# CAPE expects the in-tree .default suffix to be stripped on install;
+# upstream's `installer/cape2.sh` does the same rename.
+override_dh_install:
+	install -d debian/cape-core/etc/cape
+	for f in conf/default/*.conf.default; do \
+	    base=$$(basename "$$f" .default); \
+	    install -m 0644 "$$f" "debian/cape-core/etc/cape/$$base"; \
+	done
+	# Ship the entire CAPE source tree to /opt/CAPEv2/ — equivalent
+	# to the legacy `git clone <cape-repo> /opt/CAPEv2/` shape that
+	# install-nestedvirt.sh used to do.  Enumerating CAPE subdirs
+	# individually in cape-core.install kept missing files (cuckoo.py,
+	# analyzer + custom, dev_utils, conf/default, extra/ — 5 separate
+	# misses in one session).
+	# Whole-tree copy avoids that class of bug.
+	#
+	# CAPE source is the source-package ROOT now (fork re-root): the CI
+	# stages debian/ at the fork root (`cp -r aws-nested-virt/debian
+	# ./debian`), so `.` here is the CAPE tree.  Exclude the packaging /
+	# non-CAPE siblings that sit beside CAPE at the root and must NOT
+	# land in /opt/CAPEv2/:
+	#   aws-nested-virt/  — all the pipeline machinery (debian/, packer/,
+	#                       *-build/, scripts/, .github/, terraform/ …)
+	#   debian/           — the staged source-package dir itself
+	#   community/        — cape-signatures' tree; ships via its own
+	#                       cape-signatures.install, not into cape-core
+	#   .git*             — git metadata (.git, .gitignore, .github, …)
+	# rsync anchors the first three to the transfer root with a leading
+	# slash so a same-named subdir deeper in CAPE (if one ever appears)
+	# is unaffected; `.git*` is unanchored to strip git metadata at any
+	# depth (the find-based strip below still runs as a backstop).
+	#
+	# Non-runtime cruft is stripped after this copy (docs, tests,
+	# KnowledgeBaseBot RAG corpus, *.md, LICENSE, build-only locks).
+	install -d debian/cape-core/opt/CAPEv2
+	rsync -a \
+	    --exclude='/aws-nested-virt' \
+	    --exclude='/debian' \
+	    --exclude='/community' \
+	    --exclude='.git*' \
+	    ./ debian/cape-core/opt/CAPEv2/
+	dh_install
+	# Strip .git* metadata from both packages (carried along by
+	# dh_install's directory copy of the CAPE + community subtrees).
+	# cape-core /opt/CAPEv2/.gitignore from virtualenv is handled
+	# separately in override_dh_virtualenv (generated AFTER dh_install).
+	# Make recipe quirk: blank lines terminate the recipe — keep all
+	# follow-up steps tab-indented with no fully-empty lines between.
+	for d in debian/cape-core debian/cape-signatures; do \
+	    [ -d "$$d" ] || continue; \
+	    find "$$d" \( -name '.gitignore' -o -name '.gitmodules' \
+	                  -o -name '.git' -o -name '.github' \
+	                  -o -name '.gitkeep' \) -prune -exec rm -rf {} +; \
+	done
+	# Strip non-runtime cruft from /opt/CAPEv2/.  Top-level entries
+	# the CAPE tree drops that we don't want on the runtime host:
+	#   tests/             — test suite + malware corpus submodule
+	#   docs/              — Sphinx documentation
+	#   KnowledgeBaseBot/  — RAG corpus, large
+	#   installer/         — legacy install scripts (cape2.sh etc)
+	#   admin/             — admin helper scripts, not runtime
+	#   uwsgi/             — alternate deploy config we don't use
+	#   mcp/               — MCP integration we don't activate
+	#   agent/             — VM-side agent; the host doesn't run it,
+	#                        it's uploaded to the VM via analyzer/
+	#   *.md, LICENSE, CITATION.cff — docs + license boilerplate
+	#   poetry.lock, uv.lock — build-time only; venv already baked
+	#   report.html        — top-level leftover; the real template
+	#                        lives at data/html/report.html
+	#   requirements.txt   — build-time artifact dh-virtualenv drops
+	#                        at /opt/CAPEv2/.  Operator references
+	#                        the version pins via Poetry; remove.
+	if [ -d debian/cape-core/opt/CAPEv2 ]; then \
+	    find debian/cape-core/opt/CAPEv2 -maxdepth 1 \
+	        \( -name 'tests' -o -name 'docs' \
+	           -o -name 'KnowledgeBaseBot' \
+	           -o -name 'installer' -o -name 'admin' \
+	           -o -name 'uwsgi' -o -name 'mcp' \
+	           -o -name 'agent' \
+	           -o -name '*.md' -o -name 'LICENSE' \
+	           -o -name 'CITATION.cff' \
+	           -o -name 'poetry.lock' -o -name 'uv.lock' \
+	           -o -name 'report.html' \) \
+	        -exec rm -rf {} +; \
+	fi
+	# "Community wins" overrides BEFORE the generic overlap-strip below.
+	# These are data files where cape source ships an older / less-
+	# complete copy and community has the canonical version (the
+	# upstream maintains the rule in community/, cape source's copy
+	# was a vendored snapshot that drifted).  Strip from cape-core's
+	# staging so the cape-signatures version survives the generic
+	# step below — without this, the generic logic would silently
+	# delete community's newer file and leave cape source's stale
+	# one on disk.
+	#
+	# Audit cadence: when adding new community/data/* overlay paths
+	# to cape-signatures.install, run
+	#   comm -12 <(ls data/yara/CAPE/) <(ls community/data/yara/CAPE/)
+	# (and equivalents) to spot new collisions; either add a strip
+	# here (community wins) or move the file out of community in the
+	# subtree pull (cape wins).
+	if [ -d debian/cape-core/opt/CAPEv2 ]; then \
+	    rm -f debian/cape-core/opt/CAPEv2/data/yara/CAPE/DarkCloud.yar \
+	          debian/cape-core/opt/CAPEv2/data/yara/CAPE/NetSupport.yar \
+	          debian/cape-core/opt/CAPEv2/data/yara/binaries/HeavensGate.yar; \
+	fi
+	# Resolve cape-core ↔ cape-signatures path overlaps: cape ships
+	# stub modules/{signatures,processing,reporting,feeds}/__init__.py,
+	# community ships actual content under those same subdirs. dpkg
+	# rejects the second-installed package's overlapping files. Since
+	# the overlapping files are byte-identical 3-line copyright
+	# markers, drop them from cape-signatures and let cape-core own
+	# the path. cape-signatures' value-add (the actual signatures /
+	# parsers / processing modules) lives in deeper subdirs that don't
+	# overlap.
+	if [ -d debian/cape-core/opt/CAPEv2 ] && [ -d debian/cape-signatures/opt/CAPEv2 ]; then \
+	    cd debian/cape-signatures && \
+	    find opt/CAPEv2 -type f | while read -r f; do \
+	        if [ -e "../cape-core/$$f" ]; then \
+	            rm -f "$$f"; \
+	        fi; \
+	    done && \
+	    find opt/CAPEv2 -type d -empty -delete; \
+	    cd ../..; \
+	fi
+
+# Skip dh_strip across the dh-virtualenv venv.  PyPI wheels for
+# C-extension modules (pyre2, lief, etc.) sometimes ship with
+# already-stripped or malformed-for-objcopy ELF sections, and
+# pre-built native binaries dropped into the venv's bin/ (ruff is
+# a Rust-compiled binary; lief, libvirt-python etc bring their own
+# .so files) carry formats GNU binutils strip won't recognise.
+#
+# Exclude the whole opt/CAPEv2 tree rather than just site-packages
+# — a cape-build run caught dh_strip choking on
+# bin/ruff after the earlier site-packages-only exclude.  The cape
+# source we ship at /opt/CAPEv2/{lib,web,modules,utils,data,
+# scripts} is pure Python anyway, no ELF to strip.
+override_dh_strip:
+	dh_strip --exclude=opt/CAPEv2
+
+# Same story for dh_makeshlibs: it runs `objdump -p` on every ELF in
+# the staging dir to harvest SONAMEs and emit a shlibs file for
+# downstream apt-resolvable shared-lib deps.  ruff's wheel-shipped
+# Rust binary trips objdump just like it tripped strip in #77.
+# Skip the whole venv tree — those binaries aren't producing shlibs
+# downstream consumers should depend on (the venv is self-contained
+# at /opt/CAPEv2/, not on the linker search path).
+override_dh_makeshlibs:
+	dh_makeshlibs --exclude=opt/CAPEv2
+
+# dh_shlibdeps walks the same binaries to determine RUNTIME shared-lib
+# deps to write into the deb's Depends.  Same exclusion logic — the
+# venv carries its own .so files and we don't want pip-wheel-shipped
+# C extensions adding bogus libfoo entries to cape-core's Depends.
+override_dh_shlibdeps:
+	dh_shlibdeps --exclude=opt/CAPEv2
+
+# Skip dh_dwz: CAPE's data/ tree includes prebuilt Go binaries
+# (gogorobocap, etc.) with compressed .debug_abbrev sections that dwz
+# can't recompress. We don't author those binaries; skip the whole
+# DWARF-compression step.
+override_dh_dwz:

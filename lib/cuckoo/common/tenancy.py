@@ -4,11 +4,8 @@ views, the SQLAlchemy task store, and (separately) validated by the broker.
 No Django, no SQLAlchemy imports here — only plain dataclasses so it stays a
 pure function set testable against tests/tenancy_vectors.py.
 """
-import logging
 from dataclasses import dataclass
 from typing import Optional
-
-log = logging.getLogger(__name__)
 
 PUBLIC, TENANT, PRIVATE = "public", "tenant", "private"
 VISIBILITIES = (PUBLIC, TENANT, PRIVATE)
@@ -64,39 +61,6 @@ def can_toggle(v: Viewer, j: Job) -> bool:
     return False
 
 
-def can_delete(v: Viewer, j: Job) -> bool:
-    """Authorize an irreversible task DELETE. Stricter than can_toggle for PUBLIC jobs: a public
-    task is a shared/instance resource, so only its ORIGINAL SUBMITTER or a break-glass box admin
-    may delete it -- a tenant-admin may toggle/manage a public job in their tenant but NOT delete
-    it. TENANT jobs: submitter, that tenant's tenant-admin, or box admin. PRIVATE: submitter or box
-    admin. (Reversible ops stay on can_toggle; deletion gets the tighter rule.)"""
-    if v.is_local_admin:
-        return True
-    if _is_owner(v, j):
-        return True
-    if j.visibility == TENANT and v.is_tenant_admin and _same_tenant(v, j):
-        return True
-    return False
-
-
-def can_set_visibility(v: Viewer, j: Job, new_visibility: str) -> bool:
-    """Authorize a visibility TRANSITION. Baseline is can_toggle, plus a direction guard that keeps
-    can_delete's PUBLIC boundary from being reachable by a two-step move: a principal authorized ONLY
-    by the tenant-admin path (not the owner, not a break-glass box admin) may not make a PUBLIC job
-    MORE restrictive (public -> tenant/private). Without this, a tenant-admin -- who can_delete
-    deliberately bars from deleting a public job -- could flip it to 'tenant' (can_toggle allows that)
-    and then delete it via can_delete's tenant branch. Widening (tenant -> public) and same-value
-    writes remain allowed; the owner and break-glass may set any value they could already toggle."""
-    if not can_toggle(v, j):
-        return False
-    if _is_owner(v, j) or v.is_local_admin:
-        return True
-    # Authorized purely as tenant-admin here: block only the escalating downgrade of a PUBLIC job.
-    if j.visibility == PUBLIC and new_visibility in (TENANT, PRIVATE):
-        return False
-    return True
-
-
 def scope_match(scope: str, v: "Viewer"):
     """Mongo $match (dict) selecting the analysis docs in a stat SCOPE for viewer v.
     Mirrors the can_read branches. Returns None for 'global' (no filter). Keys target
@@ -137,52 +101,16 @@ def _as_bool(v, default: bool) -> bool:
 def multitenancy_config() -> MTConfig:
     """Read the [multitenancy] section of cuckoo.conf (server-side policy)."""
     from lib.cuckoo.common.config import Config
-    from lib.cuckoo.common.exceptions import CuckooOperationalError
 
     try:
         sec = Config("cuckoo").get("multitenancy")
-    except CuckooOperationalError:
-        # [multitenancy] section absent => not configured => MT off. The legitimate
-        # single-tenant default, NOT an error (Config.get raises this on a missing
-        # section). This branch keeps single-tenant deployments working.
-        sec = {}
     except Exception:
-        # A malformed/unreadable cuckoo.conf (parse/IO error — NOT a merely-absent
-        # section, which is the CuckooOperationalError branch above) must NOT silently
-        # drop tenant isolation. Fail CLOSED — assume MT ON + the most restrictive
-        # mode until the config reads cleanly — mirroring the mode normalization below
-        # and the backfill node-role guard, which fail closed on the same class of
-        # error rather than defaulting to the permissive branch. Log loudly so an
-        # operator sees isolation was preserved defensively.
-        log.exception(
-            "multitenancy_config: [multitenancy] unreadable; failing CLOSED "
-            "(MT enabled, mode=locked) to preserve tenant isolation"
-        )
-        # Fail closed on EVERY knob, not just enabled/mode: local_admins_manage_all_tenants
-        # False is the RESTRICTIVE value (a deployment that set it 'no' must not have a
-        # local Django superuser regain full break-glass on the fail-closed path; IdP
-        # superusers still keep reach via viewer_for's socialaccount branch).
-        # default_visibility="private" (NOT "" — which would resolve through
-        # default_visibility()'s per-mode fallback to TENANT under mode=locked, widening
-        # submit-time exposure during a config outage). private is the most restrictive
-        # VISIBILITIES member, so pin it directly on the fail-closed path.
-        return MTConfig(enabled=True, mode="locked", default_visibility="private",
-                        local_admins_manage_all_tenants=False)
+        sec = {}
     get = sec.get if hasattr(sec, "get") else (lambda k, d=None: d)
-    # Validate/normalize mode: an unknown/typo value must NOT silently disable
-    # scoping. Case/whitespace-normalize and fail closed to the more restrictive
-    # "locked" on anything unrecognized.
-    mode = str(get("mode", "shared") or "shared").strip().lower()
-    if mode not in ("shared", "locked"):
-        mode = "locked"
     return MTConfig(
         enabled=_as_bool(get("enabled", False), False),
-        mode=mode,
-        # Normalize like `mode` above: an un-normalized "Private"/" private " fails the
-        # exact `in VISIBILITIES` check in default_visibility() and silently falls back to
-        # the per-mode default (PUBLIC in shared) — the one knob whose misparse WIDENS
-        # exposure, so strip/lowercase it too.
-        default_visibility=str(get("default_visibility", "") or "").strip().lower(),
+        mode=str(get("mode", "shared") or "shared"),
+        default_visibility=str(get("default_visibility", "") or ""),
         local_admins_manage_all_tenants=_as_bool(get("local_admins_manage_all_tenants", True), True),
     )
 
@@ -191,30 +119,21 @@ def default_visibility(cfg: MTConfig) -> str:
     """The submit-time default visibility for the configured mode."""
     if cfg.default_visibility in VISIBILITIES:
         return cfg.default_visibility
-    if cfg.default_visibility:
-        # Explicitly set but unrecognized (typo like "privte" / templating artifact):
-        # fail CLOSED like the `mode` knob does, never fall open to the widest per-mode
-        # default. Blank stays the documented per-mode-default sentinel below.
-        log.warning("default_visibility %r unrecognized; failing closed to private",
-                    cfg.default_visibility)
-        return PRIVATE
     return PUBLIC if cfg.mode == "shared" else TENANT
 
 
 def viewer_scope_match(viewer):
     """Mongo $match restricting an analysis-collection query to the viewer's
     entitled tenant scopes (public OR own-tenant TENANT OR mine), or None when no
-    filter applies — multitenancy disabled or break-glass (is_local_admin). THE
-    single source of truth (imported by web_utils, cape_utils, …) so the
-    search/dedup/stats by-scope query builders can't drift. Mode-INDEPENDENT,
-    mirroring can_read and the SQL list_tasks filter: shared mode still hides
-    explicitly-private and other-tenant TENANT analyses (only PUBLIC is the shared
-    pool) — it does NOT mean see-all. Keys target the report's stamped info.*.
+    filter applies — multitenancy disabled, shared mode, or break-glass
+    (is_local_admin). THE single source of truth (imported by web_utils,
+    cape_utils, …) so the search/dedup/stats by-scope query builders can't drift.
+    Keys target the report's stamped info.* fields.
     """
     if viewer is None:
         return None
     cfg = multitenancy_config()
-    if not cfg.enabled or getattr(viewer, "is_local_admin", False):
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
         return None
     clauses = [m for m in (scope_match(PUBLIC, viewer), scope_match(TENANT, viewer), scope_match(MINE, viewer)) if m is not None]
     # No entitled scope resolved (tenant-less/anon) -> match nothing, never global.
@@ -223,14 +142,13 @@ def viewer_scope_match(viewer):
 
 def viewer_scope_es_filter(viewer):
     """Elasticsearch bool-filter analogue of viewer_scope_match (public OR
-    own-tenant TENANT OR mine), or None when no filter applies (multitenancy
-    disabled or break-glass). Mode-INDEPENDENT, same as viewer_scope_match. Uses
-    the term/info.* idiom. A tenant-less/anonymous viewer sees only public.
+    own-tenant TENANT OR mine), or None when no filter applies. Uses the term/
+    info.* idiom. A tenant-less/anonymous locked-mode viewer sees only public.
     """
     if viewer is None:
         return None
     cfg = multitenancy_config()
-    if not cfg.enabled or getattr(viewer, "is_local_admin", False):
+    if not cfg.enabled or cfg.mode != "locked" or getattr(viewer, "is_local_admin", False):
         return None
     shoulds = [{"term": {"info.visibility": PUBLIC}}]
     if getattr(viewer, "tenant_id", None) is not None:

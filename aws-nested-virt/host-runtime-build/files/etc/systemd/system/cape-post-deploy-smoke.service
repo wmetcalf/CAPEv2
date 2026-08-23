@@ -1,0 +1,66 @@
+# /etc/systemd/system/cape-post-deploy-smoke.service
+#
+# One-shot post-deploy functional smoke test.  Runs once after
+# cape.service is up + a brief settle window, submits a URL task,
+# and writes pass/fail JSON to /var/log/cape-smoke.json.  Terraform's
+# null_resource (in nestedvirt-ami/main.tf) polls that file via SSM
+# and fails `terraform apply` if smoke=false.
+#
+# Why a separate unit rather than running from cape.service:
+#   - cape.service starts before its own task processor warms up;
+#     a same-unit ExecStartPost would race the analyzer
+#   - one-shot semantics let operators re-run the test on demand
+#     via `systemctl start cape-post-deploy-smoke.service`
+#   - failure here doesn't restart-loop cape.service
+#
+# After= chain: cape.service brings up the analyzer, cape-web hosts
+# /apiv2 (used by submit.py only via local socket so this is more for
+# ordering correctness than functional dep), guac-web is async to
+# everything but worth waiting for so the full deploy story is
+# online before we declare smoke OK.
+
+[Unit]
+Description=CAPE post-deploy functional smoke test (URL task)
+After=cape.service cape-web.service cape-processor.service cape-rooter.service
+Requires=cape.service
+ConditionPathExists=/opt/CAPEv2/utils/submit.py
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Wait for cape.service to actually be ACTIVE before submitting.
+# Just `After=cape.service` orders us behind cape.service in the
+# start-up queue, but doesn't wait for it to reach `active` state —
+# systemd considers After= satisfied as soon as cape.service is
+# "started" (which for Type=simple is immediately after fork).
+# cape.service itself has ExecStartPre that waits up to 60s for tun0
+# and up to 10s for the libvirt network — so the real "cape.service
+# active and accepting work" moment is 30-90s after the unit starts.
+#
+# Loop-poll `systemctl is-active` for up to 5 min.  Falls through if
+# cape.service ever activates; exits 1 if it never does (smoke
+# correctly fails the deploy in that case — cape is broken).
+#
+# Caught on a validation deploy 2026-05-26 where the initial 30s sleep wasn't
+# enough; smoke ran while cape.service was still in its ExecStartPre
+# tun0-wait phase, produced "service cape.service not active" pass=
+# false, terraform apply failed the deploy.  cape came up cleanly
+# ~2 min after smoke first tried — the script just needed to wait.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do systemctl is-active --quiet cape.service && exit 0; sleep 5; done; echo "cape.service did not become active in 5 min" >&2; exit 1'
+
+# Additional settle: cape.service active doesn't mean its result-
+# server multiworker pool is ready to receive task uploads.  10s buffer.
+ExecStartPre=/bin/sleep 10
+
+ExecStart=/usr/local/bin/cape-post-deploy-smoke.sh
+StandardOutput=journal
+StandardError=journal
+
+# Don't retry on failure — the result file is the source of truth and
+# a fail is a real signal, not a transient.  Operator can manually
+# re-run if they're sure.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

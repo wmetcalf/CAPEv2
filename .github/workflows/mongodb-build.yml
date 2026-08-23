@@ -1,0 +1,94 @@
+name: mongodb-build
+
+# Builds `cape-mongodb.deb`. The package itself is essentially metadata
+# + a tuned systemd unit; the heavy lifting (the actual mongod binary)
+# lives in mongodb-org-server which the deb pulls in transitively at
+# install time via Depends:.
+#
+# Why a build workflow rather than a hand-checked-in deb: keeping it
+# consistent with cape-yara-forge / cape-host-config so apt-publish's
+# workflow_run fan-in picks up the same artifact-name shape and version
+# semantics for every threat-content / host-config / mongo-tuning deb.
+#
+# Triggers:
+#   - workflow_dispatch (ad-hoc rebuilds — e.g. unit-file change)
+#   - push to aws-nested-virt/mongodb-build/ or this workflow file
+#
+# Artifact: cape-mongodb-debs-<version>  (consumed by apt-publish.yml fan-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override package version (default: YYYYMMDD)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/mongodb-build/**'
+      - '.github/workflows/mongodb-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mongodb-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev ca-certificates
+
+      - name: Resolve package version
+        id: ver
+        run: |
+          set -euo pipefail
+          # Default to YYYYMMDD so the version is monotonic and
+          # human-readable.  Operators can override via dispatch input.
+          ver="${{ inputs.version }}"
+          if [ -z "$ver" ]; then
+              ver="$(date -u +%Y%m%d)"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved package_version=$ver"
+
+      - name: Package cape-mongodb.deb
+        env:
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash mongodb-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-mongodb_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "===file list==="
+          dpkg-deb -c "$deb"
+          # The systemd unit must be present.
+          dpkg-deb -c "$deb" | grep -q '/lib/systemd/system/cape-mongodb.service$' \
+            || { echo "::error::cape-mongodb.service missing from deb"; exit 1; }
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-mongodb-debs-${{ steps.ver.outputs.version }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

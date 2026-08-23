@@ -1,0 +1,116 @@
+name: clamav-mirror-build
+
+# Mirrors 3rd-party / non-mainline ClamAV signature feeds (SaneSecurity,
+# URLhaus, twinclams, wmetcalf clam-punch, etc.) through the local mirror
+# CDN so analysis hosts don't reach github.com / abuse.ch / Swinburne
+# from the analysis path.
+#
+# Cisco-Talos's standard CVDs (main.cvd, daily.cvd, bytecode.cvd) are
+# NOT mirrored — those stay on database.clamav.net (Cisco's own
+# mirror network). The host's freshclam.conf keeps DatabaseMirror
+# pointed at Cisco; only the DatabaseCustomURL entries (3rd-party)
+# move to point at our /clamav-extra/ CDN path.
+#
+# Source list: aws-nested-virt/clamav-mirror-build/sources.txt
+#
+# Triggers:
+#   - cron every 4h (3rd-party feeds update on varied cadences;
+#     4h gets us close to fresh without spamming GHA)
+#   - workflow_dispatch (manual rebuild)
+#   - push to aws-nested-virt/clamav-mirror-build/** (source list edits)
+#
+# Change-gate: check job HEADs each upstream URL and composites
+# (Last-Modified + Content-Length + ETag) into a fingerprint. The
+# build job runs only when the fingerprint differs from the marker
+# we stamped on the CDN last publish.
+#
+# Artifact: cape-clamav-feeds-cdn-<fingerprint-short>
+#   consumed by apt-publish.yml CDN-mirror step.
+
+on:
+  schedule:
+    - cron: '23 */4 * * *'    # every 4 hours, minute :23
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/clamav-mirror-build/**'
+      - '.github/workflows/clamav-mirror-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clamav-mirror-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed:               ${{ steps.check.outputs.changed }}
+      upstream_fingerprint:  ${{ steps.check.outputs.upstream_fingerprint }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare upstream fingerprint vs. last-published marker
+        id: check
+        env:
+          # Schedule honors change gate; manual / push always force.
+          FORCE_REBUILD: ${{ github.event_name != 'schedule' }}
+          # check-changed.sh reads the upstream-fingerprint.txt marker as a
+          # bare asset on the single rolling threat-content release.
+          THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash clamav-mirror-build/check-changed.sh | tee /tmp/check.out
+          grep -E '^(changed|upstream_fingerprint)=' /tmp/check.out >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + upload artifact
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              ca-certificates curl
+
+      - name: Mirror 3rd-party ClamAV feeds
+        env:
+          WORK_DIR: ${{ github.workspace }}/aws-nested-virt/.work
+          UPSTREAM_FINGERPRINT: ${{ needs.check.outputs.upstream_fingerprint }}
+        run: cd aws-nested-virt && bash clamav-mirror-build/mirror.sh
+
+      - name: Sanity check the mirror tree
+        run: |
+          set -euo pipefail
+          ls -la aws-nested-virt/.work/cdn/clamav-extra/
+          # At least one file from each major source family should
+          # have landed. Each ClamAV sig DB is at least ~100 bytes;
+          # if we're seeing zero-byte files something failed mid-fetch.
+          for must in junk.ndb urlhaus.ndb twinclams.ldb miscreantpunch099.ldb; do
+              [ -s "aws-nested-virt/.work/cdn/clamav-extra/$must" ] \
+                  || { echo "::error::missing or empty $must"; exit 1; }
+              sz=$(stat -c %s "aws-nested-virt/.work/cdn/clamav-extra/$must")
+              echo "  $must: $sz bytes ✓"
+          done
+          # The fingerprint marker must match what the check job decided.
+          recorded=$(cat aws-nested-virt/.work/cdn/clamav-extra/upstream-fingerprint.txt)
+          expected="${{ needs.check.outputs.upstream_fingerprint }}"
+          [ "$recorded" = "$expected" ] || { echo "::error::fingerprint marker mismatch ($recorded vs $expected)"; exit 1; }
+
+      - name: Upload CDN artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-clamav-feeds-cdn-${{ needs.check.outputs.upstream_fingerprint }}
+          path: aws-nested-virt/.work/cdn/**
+          if-no-files-found: error
+          retention-days: 30

@@ -7,8 +7,9 @@ and push the analysis artifact tree to S3 at <prefix>/<job_id>/<rel>. Runs at
 order 9998 — BEFORE the native mongodb reporting module (order 9999) — so the
 report doc that mongodb.py writes to the central DocumentDB already carries
 info.job_id. The DocumentDB write itself is the NATIVE mongodb.py path pointed at
-DocumentDB via [mongodb] (tls=yes, retrywrites=no) — validated against live DocumentDB
-(loop_saver/$set, calls chunking, files $addToSet, tenant_scope_idx). This module only adds the FS->S3 half
+DocumentDB via [mongodb] (tls=yes, retrywrites=no); compat/docdb_compat.py already
+validated that write path (loop_saver/$set, calls chunking, files $addToSet,
+tenant_scope_idx) against live DocumentDB. This module only adds the FS->S3 half
 plus the job_id keying the read seam (artifact_storage.artifact_response) resolves.
 """
 import logging
@@ -16,18 +17,25 @@ import os
 import re
 
 from lib.cuckoo.common.abstracts import Report
-from lib.cuckoo.common.central_mode import central_bridge_required, central_mode_config, upload_target_realpath
+from lib.cuckoo.common.central_mode import central_mode_config, upload_target_realpath
 from lib.cuckoo.common.exceptions import CuckooReportError
 from lib.cuckoo.common.storage_backend import get_artifact_store
 
 log = logging.getLogger(__name__)
 
-# job_id becomes an S3 key / local-mount container segment, so it must be path-safe (no separators, no '..').
-# The safety guard is defined ONCE in lib.cuckoo.common.artifact_storage and shared by the read seam
-# (job_id_from_custom) and this write seam so they can never drift -- the last line of defence against a
-# tenant-supplied `custom` poisoning another job's prefix (audit CRITICAL-1). local-<int> fallback satisfies
-# it. (The read seam now rejects a path-unsafe custom at the parser, so this is belt-and-suspenders.)
-from lib.cuckoo.common.artifact_storage import _SAFE_JOB_ID_RE, _is_safe_job_id
+# job_id becomes an S3 key segment, so it must not contain path separators or
+# traversal. The broker should stamp an authenticated job_id; this is the last
+# line of defence against a tenant-supplied `custom` poisoning another job's
+# prefix (audit CRITICAL-1). local-<int> fallback satisfies the allowlist.
+# Must start with an alnum (no leading '.'/'-'/'_') AND contain no '..' run, so a
+# value like '.', '..', '.foo' or 'a..b' can never collapse 'results/<job_id>/' to a
+# parent ref ('results/../') in an S3 key or the local staging path. _is_safe_job_id
+# applies both rules (the regex alone permitted '.'/'..').
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _is_safe_job_id(job_id):
+    return bool(job_id) and _JOB_ID_RE.match(job_id) is not None and ".." not in job_id
 
 # Upload the whole analysis tree to S3 (the "heavy detail" tier): shots, dropped
 # files, pcap, procdump, AND reports/ (report.json/html/pdf are downloadable
@@ -38,37 +46,22 @@ _EXCLUDE_DIRS = set()
 
 
 def resolve_job_id(custom, analysis_id):
-    """The broker passes the global job_id through the task `custom` field, carried all the way to
-    reporting. This is the CONSUMER that turns `custom` into the job_id that keys info.job_id, the
-    info.id rewrite below, the S3 container prefix, and the pre-insert scoped delete -- i.e. the site
-    (with the container build in run() and the pre-insert delete in mongodb.py) that actually TRUSTS
-    `custom`. So it must NOT honour a submitter-influenceable value that could steer another task's id.
-
-    Accept 'job_id=<v>' ONLY in the FIRST comma-position -- exactly what the broker dispatcher sends
-    (custom = f"job_id={job_id}") and what the central submit-bridge's enqueue filter
-    (`custom NOT LIKE 'job_id=%'`, prefix-anchored) is written against. Accepting it at ANY position, or
-    accepting a bare 'ui-<N>' token, would let a client `custom` that EVADES that prefix filter
-    ("foo=bar,job_id=ui-<victim>" or a bare "ui-<victim>") still resolve to a foreign id. Keeping the
-    consumer's parse anchored the same way the filter is makes the in-tree code enforce the containment
-    rather than leaning on the (out-of-tree) bridge alone.
-
-    A bare token with no '=' and no ',' is the direct-submission fallback (central mode also works when an
-    analysis was submitted without the broker), but a bare 'ui-<N>' is NEVER honoured -- that is the
-    bridge's reserved central-id form, which no direct submitter produces. Fall back to 'local-<id>' when
-    nothing usable is present.
-
-    Shares ONE parser with the read/delete consumers -- job_id_from_custom (lib.cuckoo.common.artifact_storage)
-    -- so the write and read keys can't drift; this just adds the write-side 'local-<analysis_id>' fallback.
-
-    On the broker path the bridge OVERWRITES custom with its own 'job_id=ui-<own_tid>' (SQL UPDATE) and the
-    dispatcher builds custom from the SQS message's job_id (not the RDS custom field), so a forged custom does
-    not reach here at all. The anchoring above closes the two filter-EVASION forms (non-first-position
-    'job_id=' and a bare 'ui-<N>') on any path; a FIRST-position 'custom=job_id=ui-<victim>' is still honoured
-    verbatim and, in a bridge-less / direct deployment, remains contained only by topology -- NOT closed here.
-    DURABLE FIX (upstream): a signed / out-of-band job_id authenticated against the delivering broker."""
-    from lib.cuckoo.common.artifact_storage import job_id_from_custom
-
-    return job_id_from_custom(custom) or f"local-{analysis_id}"
+    """The broker passes the global job_id through the task `custom` field, carried
+    all the way to reporting. Accept 'job_id=<v>' (optionally among other
+    comma-separated k=v pairs) or a bare token. Fall back to 'local-<id>' so central
+    mode also works when an analysis was submitted directly (no broker)."""
+    if custom:
+        text = str(custom)
+        for part in text.split(","):
+            part = part.strip()
+            if part.startswith("job_id="):
+                v = part.split("=", 1)[1].strip()
+                if v:
+                    return v
+        token = text.strip()
+        if token and "=" not in token and "," not in token:
+            return token
+    return f"local-{analysis_id}"
 
 
 class CentralStore(Report):
@@ -103,7 +96,7 @@ class CentralStore(Report):
             # Refuse a job_id that could escape/poison another job's S3 prefix.
             raise CuckooReportError(
                 "centralstore: refusing unsafe job_id %r (must match %s and contain no '..')"
-                % (job_id, _SAFE_JOB_ID_RE.pattern))
+                % (job_id, _JOB_ID_RE.pattern))
         info["job_id"] = job_id  # carried into the DocumentDB doc; read seam keys S3 by it
 
         # Align info.id to the CENTRAL task id when the broker assigned a
@@ -115,17 +108,6 @@ class CentralStore(Report):
         # so the report view, all report-tab lookups, and the artifact seam work without
         # touching ~25 info.id call sites in the upstream-synced views.py.
         _m = re.match(r"^ui-(\d+)$", job_id)
-        # BRIDGE-REQUIRED (central + MT): only a bridged 'ui-<central_id>' doc has a tenant-resolvable identity.
-        # A non-bridged doc ('local-<id>' / bare-token custom) has NO tenancy by construction, so persisting it
-        # to the shared DocumentDB would create a single-tenant doc the tenant-scoped own-doc filters
-        # deliberately can't address (an unreachable-on-delete orphan, or a restrictive toggle that never
-        # reaches it). Refuse it HERE -- the single choke point where the central analysis doc is written -- so
-        # a non-bridged submission can never produce a doc in an MT deployment (direct worker submission is
-        # single-tenant only; see lib.cuckoo.common.central_mode.central_bridge_required).
-        if not _m and central_bridge_required():
-            raise CuckooReportError(
-                "centralstore: refusing non-bridged analysis (job_id=%r) under multitenancy -- tenant-isolated "
-                "central submission requires the submit-bridge (ui-<central_id>)" % job_id)
         if _m:
             info["id"] = int(_m.group(1))
 
@@ -151,7 +133,7 @@ class CentralStore(Report):
         # upload failure we leave no marker, so the analysis is retained until it is
         # re-confirmed or the worker recycles (24h) — never purged unconfirmed.
         if failed == 0:
-            _emit_done_marker(store, container, self.analysis_path, cfg, job_id, uploaded)
+            self._write_done_marker(cfg, job_id, uploaded)
         else:
             log.warning("centralstore: %d upload(s) failed for job_id=%s; NOT marking done "
                         "(local copy retained for cleanup safety)", failed, job_id)
@@ -232,59 +214,29 @@ class CentralStore(Report):
                 log.warning("centralstore: failed to upload recording %s -> %s/%s: %s", fn, container, rel, e)
         return count, failed
 
-
-def _emit_done_marker(store, container, analysis_path, cfg, job_id, uploaded):
-    """Emit the analysis completion marker, in TWO places, once the whole tree is confirmed:
-
-    1. LOCAL — storage/analyses/<id>/.centralstore.done. The worker's cape-nvme-cleanup purges
-       only analyses carrying this file, so it can never delete a job that didn't reach the
-       central store.
-    2. CENTRAL STORE — uploaded as the FINAL object at <container>/.centralstore.done. The READ
-       seam (artifact_storage._stage_tree) treats this key as the completion signal and only then
-       caches .central_staged; WITHOUT the store copy `complete` is never True, so every central
-       report view re-stages the entire tree from the store on every request. Uploaded last (and
-       only when failed==0 upstream) so a listing taken mid-upload never shows the marker before
-       the tree is complete.
-
-    Best-effort: a marker failure never breaks reporting — the artifacts are already durable. If
-    the local write fails there's nothing to upload; if the store upload fails the local gate
-    still stands (cleanup stays safe) and the read side falls back to the per-file download seam."""
-    import json
-    import time
-
-    if not analysis_path or not os.path.isdir(analysis_path):
-        return
-    marker = os.path.join(analysis_path, ".centralstore.done")
-    # Backend-aware location string: s3://bucket/... for the S3 path, or the shared
-    # mount's <root>/<prefix>/<job_id>/ for the local path. Informational only.
-    if cfg.storage_backend == "local" and cfg.central_local_root:
-        location = os.path.join(cfg.central_local_root, cfg.s3_prefix, job_id) + os.sep
-    else:
-        location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
-    try:
-        with open(marker, "w") as f:
-            json.dump({
-                "job_id": job_id,
-                "location": location,
-                "artifacts": uploaded,
-                "ts": time.time(),
-            }, f)
-    except Exception as e:
-        log.warning("centralstore: could not write local done marker %s: %s", marker, e)
-        return  # nothing to upload if the local marker couldn't even be written
-    # This is the SINGLE object that gates the read-side staging cache (artifact_storage.
-    # _stage_tree). Reporting runs once and won't re-emit it, and the worker's cleanup gate (the
-    # local marker) will let the ephemeral NVMe copy be purged — so a transient store hiccup here
-    # would permanently disable that job's read cache with no self-heal. Retry a few times before
-    # giving up; the tree itself is already durable, so this stays best-effort even on total failure.
-    for attempt in range(3):
-        try:
-            store.put_file(marker, container, ".centralstore.done")
+    def _write_done_marker(self, cfg, job_id, uploaded):
+        """Write storage/analyses/<id>/.centralstore.done once the artifact tree is
+        fully in S3. cape-nvme-cleanup purges only analyses carrying this marker, so
+        it can never delete something that didn't reach the central stores."""
+        base = self.analysis_path
+        if not base or not os.path.isdir(base):
             return
+        marker = os.path.join(base, ".centralstore.done")
+        # Backend-aware location string: s3://bucket/... for the S3 path, or the shared
+        # mount's <root>/<prefix>/<job_id>/ for the local path. Informational only.
+        if cfg.storage_backend == "local" and cfg.central_local_root:
+            location = os.path.join(cfg.central_local_root, cfg.s3_prefix, job_id) + os.sep
+        else:
+            location = "s3://%s/%s/%s/" % (cfg.s3_bucket, cfg.s3_prefix, job_id)
+        try:
+            import json
+            import time
+            with open(marker, "w") as f:
+                json.dump({
+                    "job_id": job_id,
+                    "location": location,
+                    "artifacts": uploaded,
+                    "ts": time.time(),
+                }, f)
         except Exception as e:
-            log.warning("centralstore: marker upload attempt %d/3 to %s/.centralstore.done failed: %s",
-                        attempt + 1, container, e)
-            if attempt < 2:
-                time.sleep(0.25 * (attempt + 1))
-    log.warning("centralstore: gave up uploading %s/.centralstore.done after 3 attempts "
-                "(read-side staging cache disabled for this job; artifacts still served per-file)", container)
+            log.warning("centralstore: could not write done marker %s: %s", marker, e)

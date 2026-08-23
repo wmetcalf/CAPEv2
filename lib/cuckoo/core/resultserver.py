@@ -695,19 +695,7 @@ class SingleVMResultServerWorker(GeventResultServerWorker):
             task_log_stop_force(task_id)
 
 
-# Use a SPAWN context (not the default fork) for the per-VM ResultServer worker
-# processes. cape monkey-patches threading with gevent, and gevent's Thread lacks
-# CPython's _reset_internal_locks; forking a running gevent-patched process makes
-# threading._after_fork raise AttributeError on every live aux Thread (Mitmdump,
-# QEMUScreenshots, ...) in the child, leaving locks unreset -> intermittent
-# deadlocks (e.g. a later sniffer subprocess fork wedging an analysis). spawn
-# starts a fresh interpreter with NO inherited threads, so _after_fork never runs
-# on them. (2026-07-02: a 12-job multiworker load test wedged a task and logged
-# _after_fork AttributeErrors for Mitmdump + QEMUScreenshots.)
-_rs_spawn_ctx = multiprocessing.get_context("spawn")
-
-
-class ResultServerWorkerProcess(_rs_spawn_ctx.Process):
+class ResultServerWorkerProcess(multiprocessing.Process):
     """Dedicated ResultServer process for a single VM.
 
     Each worker runs its own gevent event loop and StreamServer,
@@ -721,10 +709,8 @@ class ResultServerWorkerProcess(_rs_spawn_ctx.Process):
         self.ip = ip
         self.port = port
         self.listen_ip = listen_ip
-        # Value/Event must come from the same spawn context as the Process so they
-        # are shared correctly across the spawn boundary (pickled into the child).
-        self._task_id = _rs_spawn_ctx.Value("i", 0)
-        self._ready = _rs_spawn_ctx.Event()
+        self._task_id = multiprocessing.Value("i", 0)
+        self._ready = multiprocessing.Event()
 
     def run(self):
         """Entry point for the worker process. Sets up a standalone

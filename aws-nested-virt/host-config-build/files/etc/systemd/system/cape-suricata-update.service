@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Suricata rules from the ruleset CDN via suricata-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Run as root because suricata-update writes to /etc/suricata/rules/
+# and reloads suricata.service (the reload-command in update.yaml).
+User=root
+Group=root
+ExecStart=/usr/bin/suricata-update --config /etc/suricata/update.yaml
+TimeoutStartSec=300

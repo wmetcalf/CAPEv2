@@ -1,0 +1,64 @@
+# Bridge between the FHS-friendly /etc/cape/*.conf operator-edit
+# location (where cape-core.conffiles tells dpkg to track changes)
+# and CAPE's hardcoded /opt/CAPEv2/conf/ search path inside
+# lib/cuckoo/common/config.py::Config.
+#
+# Without these symlinks the Config class falls back to the
+# `.conf.default` schema only, leaving every CAPE-side attribute
+# load (e.g. web_cfg.zipped_download in cape/web/web/settings.py:81)
+# AttributeError'ing on package configure.  A cape-deb-e2e run
+# hit exactly that.
+#
+# Symptom of a partial list (the original bug): routing.conf,
+# vpn.conf, api.conf, logging.conf, sslproxy.conf, etc. were all
+# missing from this file, so /opt/CAPEv2/conf/routing.conf was a
+# dangling reference and Config(routing) silently fell back to
+# routing.conf.default's enable_pcap=no.  Sniffer aux module
+# early-exited every task, no dump.pcap, no suricata signatures
+# in any analysis. Caught on a validation deploy 2026-05-19 after burning
+# half a day chasing why routing.conf edits in userdata had no
+# effect.
+#
+# Keep this file in sync with the cape/conf/default/*.conf.default
+# set that debian/rules's override_dh_install copies into /etc/cape/.
+#
+# Format: <target> <symlink_path>.  dh_link prepends a leading slash
+# to both, so the entries below read "make /opt/CAPEv2/conf/X a
+# symlink to /etc/cape/X".
+etc/cape/api.conf              opt/CAPEv2/conf/api.conf
+etc/cape/auxiliary.conf        opt/CAPEv2/conf/auxiliary.conf
+etc/cape/aws.conf              opt/CAPEv2/conf/aws.conf
+etc/cape/az.conf               opt/CAPEv2/conf/az.conf
+etc/cape/cuckoo.conf           opt/CAPEv2/conf/cuckoo.conf
+etc/cape/cuckoomx.conf         opt/CAPEv2/conf/cuckoomx.conf
+etc/cape/distributed.conf      opt/CAPEv2/conf/distributed.conf
+etc/cape/esx.conf              opt/CAPEv2/conf/esx.conf
+etc/cape/externalservices.conf opt/CAPEv2/conf/externalservices.conf
+etc/cape/gcp.conf              opt/CAPEv2/conf/gcp.conf
+etc/cape/hosts.conf            opt/CAPEv2/conf/hosts.conf
+etc/cape/hyperv.conf           opt/CAPEv2/conf/hyperv.conf
+etc/cape/integrations.conf     opt/CAPEv2/conf/integrations.conf
+etc/cape/kvm.conf              opt/CAPEv2/conf/kvm.conf
+etc/cape/kvmremote.conf        opt/CAPEv2/conf/kvmremote.conf
+etc/cape/logging.conf          opt/CAPEv2/conf/logging.conf
+etc/cape/malheur.conf          opt/CAPEv2/conf/malheur.conf
+etc/cape/memory.conf           opt/CAPEv2/conf/memory.conf
+etc/cape/mitmdump.conf         opt/CAPEv2/conf/mitmdump.conf
+etc/cape/multi.conf            opt/CAPEv2/conf/multi.conf
+etc/cape/physical.conf         opt/CAPEv2/conf/physical.conf
+etc/cape/polarproxy.conf       opt/CAPEv2/conf/polarproxy.conf
+etc/cape/processing.conf       opt/CAPEv2/conf/processing.conf
+etc/cape/proxmox.conf          opt/CAPEv2/conf/proxmox.conf
+etc/cape/qemu.conf             opt/CAPEv2/conf/qemu.conf
+etc/cape/reporting.conf        opt/CAPEv2/conf/reporting.conf
+etc/cape/routing.conf          opt/CAPEv2/conf/routing.conf
+etc/cape/smtp_sinkhole.conf    opt/CAPEv2/conf/smtp_sinkhole.conf
+etc/cape/sslproxy.conf         opt/CAPEv2/conf/sslproxy.conf
+etc/cape/virtualbox.conf       opt/CAPEv2/conf/virtualbox.conf
+etc/cape/vmware.conf           opt/CAPEv2/conf/vmware.conf
+etc/cape/vmwarerest.conf       opt/CAPEv2/conf/vmwarerest.conf
+etc/cape/vmwareserver.conf     opt/CAPEv2/conf/vmwareserver.conf
+etc/cape/vpn.conf              opt/CAPEv2/conf/vpn.conf
+etc/cape/vsphere.conf          opt/CAPEv2/conf/vsphere.conf
+etc/cape/web.conf              opt/CAPEv2/conf/web.conf
+etc/cape/xenserver.conf        opt/CAPEv2/conf/xenserver.conf

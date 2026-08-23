@@ -1,0 +1,74 @@
+# cape-libvirt: libvirt built from source staged under
+# $DESTDIR by libvirt-build/build.sh (ninja install --destdir).
+# Path layout matches `meson setup --prefix=/usr --sysconfdir=/etc
+# --localstatedir=/var --libdir=/usr/lib/x86_64-linux-gnu`.
+#
+# Hand-curated. Each glob below was checked against `find $DESTDIR
+# -type f` after a clean 11.1.0 build on ubuntu:24.04. Add files
+# here if upstream introduces new binaries we care about; remove
+# globs that no longer match.
+
+# Daemons + helpers (sbin)
+usr/sbin/libvirtd
+usr/sbin/virtlogd
+usr/sbin/virtlockd
+
+# Client tooling
+usr/bin/virsh
+usr/bin/virt-admin
+usr/bin/virt-host-validate
+usr/bin/virt-pki-validate
+usr/bin/virt-xml-validate
+usr/bin/virt-ssh-helper
+
+# Shared libraries (libvirt.so.0, libvirt-qemu.so.0, libvirt-lxc.so.0,
+# admin, libvirt-glib-1.0 if linked).  Glob catches both the SONAME
+# symlinks and the .so.X.Y.Z real files.
+usr/lib/x86_64-linux-gnu/libvirt*.so*
+
+# pkg-config files so anything else linking libvirt can find it
+usr/lib/x86_64-linux-gnu/pkgconfig/libvirt*.pc
+
+# Per-driver hook script directories + storage backend helpers
+usr/lib/libvirt
+usr/libexec/libvirt*
+
+# Headers — not strictly needed at runtime but harmless and keeps the
+# deb usable for in-place rebuilds against this libvirt without
+# pulling libvirt-dev.
+usr/include/libvirt
+
+# Default config + state schema
+etc/libvirt
+
+# Apparmor abstractions and per-domain templates that libvirt-qemu
+# expects to chain into (libvirt loads these via abstractions/libvirt-qemu
+# in /etc/apparmor.d/usr.sbin.libvirtd).
+etc/apparmor.d/abstractions/libvirt-qemu
+etc/apparmor.d/libvirt
+etc/apparmor.d/usr.lib.libvirt.virt-aa-helper
+etc/apparmor.d/usr.sbin.libvirtd
+
+# systemd unit + socket + tmpfiles + sysctl drop-in
+lib/systemd/system/libvirt*.service
+lib/systemd/system/libvirt*.socket
+lib/systemd/system/virtlockd*.service
+lib/systemd/system/virtlockd*.socket
+lib/systemd/system/virtlogd*.service
+lib/systemd/system/virtlogd*.socket
+usr/lib/sysctl.d/60-libvirtd.conf
+usr/lib/tmpfiles.d/libvirt.conf
+
+# Misc data — locale, manpages, augeas lens, schemas, polkit policies
+usr/share/libvirt
+usr/share/locale/*/LC_MESSAGES/libvirt.mo
+usr/share/man/man1/virsh.1
+usr/share/man/man1/virt-*.1
+usr/share/man/man7/virkey*.7
+usr/share/man/man8/libvirt*.8
+usr/share/man/man8/virt*.8
+usr/share/polkit-1/actions/org.libvirt*.policy
+usr/share/polkit-1/rules.d/50-libvirt.rules
+usr/share/augeas/lenses/libvirt*.aug
+usr/share/bash-completion/completions/virsh
+usr/share/bash-completion/completions/virt-admin

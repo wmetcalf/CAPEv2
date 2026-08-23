@@ -1,0 +1,86 @@
+Source: sandbox-cape
+Section: misc
+Priority: optional
+Maintainer: CAPEv2 AWS Nested-Virt <noreply@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-virtualenv (>= 1.2),
+ python3-virtualenv,
+ python3.12,
+ python3.12-venv,
+ python3.12-dev,
+ build-essential,
+ libyara-dev,
+ libmagic-dev,
+ libpq-dev,
+ libssl-dev,
+ libffi-dev,
+ libvirt-dev,
+ libxml2-dev,
+ pkg-config,
+ git,
+ rsync
+Standards-Version: 4.6.2
+Homepage: https://github.com/kevoreilly/CAPEv2
+Vcs-Git: https://github.com/kevoreilly/CAPEv2.git
+Vcs-Browser: https://github.com/kevoreilly/CAPEv2
+
+Package: cape-core
+Architecture: amd64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ python3.12,
+ python3-poetry,
+ postgresql,
+ postgresql-client,
+ clamav,
+ clamav-daemon,
+ clamav-freshclam,
+ suricata | cape-suricata,
+ yara,
+ qemu-kvm | cape-qemu,
+ qemu-utils | cape-qemu,
+ ovmf,
+ libvirt-clients,
+ libvirt-daemon-system,
+ virtinst,
+ bridge-utils,
+ unzip,
+ jq,
+ curl,
+ git,
+ cron,
+ numactl
+Description: CAPEv2 sandbox application core
+ The Python application code for the CAPEv2 fork plus our patches as commits.
+ Bundled venv via dh-virtualenv at /opt/CAPEv2/.venv/, configs under
+ /etc/cape/ via dpkg conffile mechanism, systemd units in
+ /lib/systemd/system/. Replaces the legacy git-clone + pip-install +
+ patch-apply bootstrap path.
+
+Package: cape-signatures
+Architecture: all
+Depends:
+ ${misc:Depends},
+ cape-core (>= ${binary:Version})
+Description: CAPEv2 community signatures and parsers
+ Python content from the kevoreilly/community repo: behavioral signatures
+ (modules/signatures/) and malware-family config parsers (modules/parsers/).
+ Version-pinned to cape-core via apt Depends so signature/core ABI mismatch
+ is caught at install time rather than at runtime via ImportError.
+
+# cape-qemu and cape-suricata are NOT built from this source package any
+# more. They're produced by dedicated workflows (qemu-build.yml and
+# suricata-build.yml) so cape-core and cape-signatures rebuild fast on
+# every push instead of paying the 25-min QEMU compile each time. The
+# .deb files apt-publish ships still satisfy cape-core's `... |
+# cape-{qemu,suricata}` alternation in the Depends: above.
+#
+# Build inputs that live in this repo and feed into those workflows:
+#   suricata-build/build.sh + package.sh       → cape-suricata.deb
+#   qemu-build/<tbd>                           → cape-qemu.deb
+#   debian/cape-suricata.{install,postinst}    → file-list manifest +
+#   debian/cape-qemu.{install,postinst}          deb postinst respectively;
+#                                                consumed by package.sh
+#                                                in each *-build/ dir.

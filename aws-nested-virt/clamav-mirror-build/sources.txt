@@ -1,0 +1,46 @@
+# clamav-mirror-build sources — 3rd-party / non-mainline ClamAV feeds
+# we mirror through the the ruleset CDN.
+#
+# Standard Cisco-Talos CVDs (main.cvd, daily.cvd, bytecode.cvd) are
+# NOT mirrored here — Cisco's own DatabaseMirror network is the right
+# distribution path for those.  This file lists the feeds the existing
+# CAPE host's /etc/clamav/freshclam.conf reaches via DatabaseCustomURL
+# entries, which we move behind our CDN.
+#
+# Format: one URL per line.  Comments + blanks allowed.  The URL
+# basename becomes the on-CDN filename
+# (e.g., http://.../sanesecurity/junk.ndb → /clamav-extra/junk.ndb).
+#
+# Add new feeds by appending a line + committing to main; the workflow's
+# push trigger rebuilds.
+
+# SaneSecurity (GPL signatures from Sanesecurity.org, mirrored by Swinburne)
+http://ftp.swin.edu.au/sanesecurity/junk.ndb
+http://ftp.swin.edu.au/sanesecurity/jurlbl.ndb
+http://ftp.swin.edu.au/sanesecurity/phish.ndb
+http://ftp.swin.edu.au/sanesecurity/rogue.hdb
+http://ftp.swin.edu.au/sanesecurity/sanesecurity.ftm
+http://ftp.swin.edu.au/sanesecurity/scam.ndb
+http://ftp.swin.edu.au/sanesecurity/sigwhitelist.ign2
+http://ftp.swin.edu.au/sanesecurity/spamattach.hdb
+http://ftp.swin.edu.au/sanesecurity/spamimg.hdb
+http://ftp.swin.edu.au/sanesecurity/winnow.attachments.hdb
+http://ftp.swin.edu.au/sanesecurity/winnow_bad_cw.hdb
+http://ftp.swin.edu.au/sanesecurity/winnow_extended_malware.hdb
+http://ftp.swin.edu.au/sanesecurity/winnow_malware.hdb
+http://ftp.swin.edu.au/sanesecurity/winnow_malware_links.ndb
+
+# URLhaus (abuse.ch malware URL list)
+https://urlhaus.abuse.ch/downloads/urlhaus.ndb
+
+# Splunk twinclams / twinwave
+https://raw.githubusercontent.com/splunk/twinclams/master/twinclams.ldb
+https://raw.githubusercontent.com/splunk/twinclams/master/twinwave.ign2
+
+# wmetcalf clam-punch (curated false-positive suppressions + extras)
+https://raw.githubusercontent.com/wmetcalf/clam-punch/master/miscreantpunch099.ldb
+
+# NOTE: SecuriteInfo feeds (token-gated paid subscription) deliberately
+# excluded — re-distributing token-gated content has license
+# implications; tenants that need SecuriteInfo keep the direct
+# DatabaseCustomURL entries with their own tokens.

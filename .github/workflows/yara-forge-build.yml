@@ -1,0 +1,152 @@
+name: yara-forge-build
+
+# Builds `cape-yara-forge.deb` by mirroring the latest YARA Forge release
+# (github.com/YARAHQ/yara-forge) and repackaging the chosen flavor (default
+# "extended") for delivery via the apt repo.
+#
+# Why mirror through our apt repo rather than fetching upstream at deploy
+# time: enterprise tenants shouldn't reach out to GitHub directly, and we
+# need deterministic versioning + reproducible deploys. The .deb shipped
+# here carries the upstream YARA Forge release tag as its Version, so
+# downstream consumers can pin/audit.
+#
+# Triggers:
+#   - weekly cron (YARA Forge cuts releases on a roughly-weekly cadence)
+#   - workflow_dispatch for ad-hoc rebuilds or pinned-tag rebuilds
+#   - push to aws-nested-virt/yara-forge-build/ or this workflow file
+#
+# Artifact: cape-yara-forge-debs-<tag>  (consumed by apt-publish.yml fan-in)
+
+on:
+  schedule:
+    # Tuesday 06:17 UTC — yara-forge typically releases over the weekend,
+    # so a Tuesday pull picks up Sunday/Monday cuts.
+    - cron: '17 6 * * 2'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'YARA Forge flavor to ship: core | extended | full'
+        type: choice
+        options: [core, extended, full]
+        default: extended
+      pinned_tag:
+        description: 'Pin to a specific YARA Forge release tag (blank = latest)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/yara-forge-build/**'
+      - '.github/workflows/yara-forge-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yara-forge-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed:      ${{ steps.check.outputs.changed }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare upstream YARA Forge tag vs. apt repo version
+        id: check
+        env:
+          # Probe the DEV deb release's flat Packages.gz (its own release
+          # tag, addressed as a full base — no channel sub-path). Dev
+          # publishes first; prod follows via cape-deb-e2e promote, so the
+          # check stays aligned with the latest version the pipeline shipped.
+          APT_REPO_URL:  ${{ vars.APT_DEV_REPO_URL }}
+          FORCE_REBUILD: ${{ github.event_name != 'schedule' }}
+          YARA_FORGE_TAG: ${{ inputs.pinned_tag }}
+          GH_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash yara-forge-build/check-changed.sh | tee /tmp/check.out
+          grep -E '^(changed|upstream_tag)=' /tmp/check.out >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + upload artifact
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev unzip ca-certificates curl python3 jq
+
+      - name: Fetch latest YARA Forge release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          YARA_FORGE_FLAVOR: ${{ inputs.flavor || 'extended' }}
+          # Reuse the EXACT tag the check job resolved rather than letting
+          # fetch.sh re-query releases/latest independently — otherwise the
+          # two jobs make separate, non-atomic calls to a moving target and
+          # detect/package can diverge. A manual pinned_tag still wins.
+          YARA_FORGE_TAG:    ${{ inputs.pinned_tag || needs.check.outputs.upstream_tag }}
+          WORK_DIR: ${{ github.workspace }}/.work
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash yara-forge-build/fetch.sh
+
+      - name: Capture release tag for package version + artifact name
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="$(cat .work/release-tag)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Deb Version field: strip leading 'v' if present, replace any
+          # disallowed chars. YARA Forge tags are usually plain dates
+          # (e.g. 20260507) or semver-ish.  printf -- not echo -- to
+          # avoid a trailing newline that tr would translate to '-' and
+          # produce an invalid "20260510-" Version (no revision number).
+          ver="${tag#v}"
+          ver="$(printf '%s' "$ver" | tr -c 'A-Za-z0-9.+~:-' '-')"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: tag=$tag  package_version=$ver"
+
+      - name: Package cape-yara-forge.deb
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+          PACKAGE_VERSION: ${{ steps.tag.outputs.version }}
+          YARA_FORGE_FLAVOR: ${{ inputs.flavor || 'extended' }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash yara-forge-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-yara-forge_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "===file list==="
+          dpkg-deb -c "$deb"
+          # The shipped .yar must be present + non-trivial.
+          size=$(dpkg-deb -c "$deb" | awk '/\.yar$/ {print $3; exit}')
+          echo "rule-file-size=$size"
+          [ "${size:-0}" -gt 100000 ] || { echo "::error::shipped .yar is implausibly small ($size bytes)"; exit 1; }
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-yara-forge-debs-${{ steps.tag.outputs.tag }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

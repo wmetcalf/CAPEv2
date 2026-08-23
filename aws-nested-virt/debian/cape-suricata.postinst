@@ -1,0 +1,24 @@
+#!/bin/sh
+# cape-suricata postinst: CAPE invokes suricata in unix-socket mode per
+# analysis task; restart cape-processor so it picks up the new binary
+# on next task spawn.
+
+set -e
+
+case "$1" in
+    configure)
+        systemctl try-restart cape-processor.service || true
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "cape-suricata postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,37 @@
+[Unit]
+# CAPE-tuned mongod unit. Mirrors the legacy install-nestedvirt.sh
+# `install_mongodb` function which hand-rolled this file at first boot:
+#
+#   - NUMA interleave so mongod allocates evenly across both sockets on
+#     the m8i.8xlarge bake target; without this, mongod pins to a single
+#     NUMA node and the other node's memory bandwidth is unused.
+#   - tcmallocReleaseRate=5.0: mongod's default tcmalloc release rate
+#     (1.0) holds onto freed memory longer than CAPE's churn pattern
+#     wants; 5.0 returns pages to the kernel quickly so the host has
+#     headroom for the 24 windows VM clones.
+#   - GLIBC_TUNABLES=glibc.pthread.rseq=0: works around a kernel/glibc
+#     interaction that surfaces on Ubuntu 24.04 hosts running mongod
+#     8.0 — without this, mongod segfaults on heavy concurrent inserts.
+#     See https://jira.mongodb.org/browse/SERVER-89077.
+#
+# Replaces /lib/systemd/system/mongod.service from the mongodb-org-server
+# package; the cape-mongodb.postinst masks the upstream unit so the two
+# don't race for port 27017.
+Description=CAPE-tuned MongoDB document database
+Documentation=https://docs.mongodb.com
+Wants=network.target
+After=network.target
+
+[Service]
+PermissionsStartOnly=true
+Environment="GLIBC_TUNABLES=glibc.pthread.rseq=0"
+ExecStart=/usr/bin/numactl --interleave=all /usr/bin/mongod --setParameter "tcmallocReleaseRate=5.0"
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+User=mongodb
+Group=mongodb
+SyslogIdentifier=cape-mongodb
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

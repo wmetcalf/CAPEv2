@@ -1,0 +1,13 @@
+[Unit]
+Description=CAPE Sandbox Network Isolation Firewall Rules
+After=network.target libvirtd.service docker.service
+Wants=docker.service
+Before=cape.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /etc/cape/firewall/load-rules.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

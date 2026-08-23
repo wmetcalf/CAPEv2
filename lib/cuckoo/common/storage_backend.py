@@ -112,24 +112,9 @@ class LocalFSStore(ArtifactStore):
 
     def put_file(self, local_path, container, relpath):
         dest = self._path(container, relpath)
-        dest_dir = os.path.dirname(dest)
-        os.makedirs(dest_dir, exist_ok=True)
-        if os.path.realpath(local_path) == os.path.realpath(dest):
-            return
-        # Write to a temp file in the SAME dir (same filesystem) then atomically rename, so a
-        # concurrent reader (the central read seam staging from a shared/NFS mount) never observes
-        # a half-written object at the final key. A direct copyfile would expose partial content.
-        fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=".part-")
-        os.close(fd)
-        try:
-            shutil.copyfile(local_path, tmp)
-            os.replace(tmp, dest)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.realpath(local_path) != os.path.realpath(dest):
+            shutil.copyfile(local_path, dest)
 
 
 class S3Store(ArtifactStore):
@@ -185,23 +170,22 @@ class S3Store(ArtifactStore):
             return ""
 
     def materialize(self, container, relpath):
-        # Whole body in one try so a mkstemp OSError (disk full / bad TEMP perms) can't escape and
-        # break the (None, False) contract the caller relies on.
-        tmp = None
         try:
             obj = self._client().get_object(Bucket=self.bucket, Key=self._key(container, relpath))
-            fd, tmp = tempfile.mkstemp(prefix="cape_central_")
+        except Exception:
+            return (None, False)
+        fd, tmp = tempfile.mkstemp(prefix="cape_central_")
+        try:
             with os.fdopen(fd, "wb") as f:
                 for c in obj["Body"].iter_chunks(65536):
                     f.write(c)
-            return (tmp, True)
         except Exception:
-            if tmp is not None:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             return (None, False)
+        return (tmp, True)
 
     def iter_relpaths(self, container):
         prefix = f"{container}/"

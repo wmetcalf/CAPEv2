@@ -1,0 +1,153 @@
+name: sigma-rules-build
+
+# Builds `cape-sigma-rules.deb` by mirroring Zircolite rule packs
+# (github.com/wagga40/Zircolite) and shipping them to
+# /opt/CAPEv2/data/sigma/ via apt.
+#
+# CAPE consumes sigma via Zircolite's pre-converted JSON pack format
+# (one large file per OS/severity slice, not raw SigmaHQ YAML).
+# Historically the host ran cape-sigma-update.timer which invoked
+# `zircolite.py --update-rules` at runtime — that reaches GitHub from
+# the analysis host which is undesirable in enterprise deployments.
+# Build-time fetch + apt-managed delivery moves that fetch into the
+# pipeline.
+#
+# Triggers:
+#   - weekly cron (Zircolite cuts releases roughly weekly)
+#   - workflow_dispatch (manual rebuild + optional tag pin)
+#   - push to aws-nested-virt/sigma-rules-build/** or this workflow
+#
+# Artifact: cape-sigma-rules-debs-<tag>  (consumed by apt-publish fan-in)
+
+on:
+  schedule:
+    # Daily 06:57 UTC. Zircolite cuts rule-pack updates on a roughly
+    # daily cadence; a weekly cron lags upstream by 6 days in the worst
+    # case. Re-running daily against an unchanged upstream is
+    # idempotent: the deb Version (Zircolite tag) doesn't change so
+    # aptly's same-version-skip prevents needless republishes.
+    - cron: '57 6 * * *'
+  workflow_dispatch:
+    inputs:
+      pinned_tag:
+        description: 'Pin to a specific Zircolite release tag (blank = latest)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/sigma-rules-build/**'
+      - '.github/workflows/sigma-rules-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sigma-rules-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed:      ${{ steps.check.outputs.changed }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare upstream Zircolite tag vs. apt repo version
+        id: check
+        env:
+          # Probe the DEV deb release's flat Packages.gz (its own release
+          # tag, addressed as a full base — no channel sub-path). Dev
+          # publishes first in the chain; prod follows via promote, so
+          # reading dev compares against the latest version shipped.
+          APT_REPO_URL:  ${{ vars.APT_DEV_REPO_URL }}
+          # Schedule-triggered runs respect the change gate. Manual
+          # dispatches and pushes to source-tree paths force a rebuild
+          # (operator intent — we always honor it).
+          FORCE_REBUILD: ${{ github.event_name != 'schedule' }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash sigma-rules-build/check-changed.sh | tee /tmp/check.out
+          grep -E '^(changed|upstream_tag)=' /tmp/check.out >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + upload artifact
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev git ca-certificates curl python3 jq
+
+      - name: Fetch Zircolite rule packs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIRCOLITE_TAG: ${{ inputs.pinned_tag || '' }}
+          WORK_DIR: ${{ github.workspace }}/.work
+        run: cd aws-nested-virt && bash sigma-rules-build/fetch.sh
+
+      - name: Determine PACKAGE_VERSION
+        id: ver
+        run: |
+          set -euo pipefail
+          tag=$(cat .work/release-tag)
+          # Strip leading 'v' for Debian Version cleanliness.
+          ver="${tag#v}"
+          ver="$(printf '%s' "$ver" | tr -c 'A-Za-z0-9.+~:-' '-')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$tag package_version=$ver"
+
+      - name: Package cape-sigma-rules.deb
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: cd aws-nested-virt && bash sigma-rules-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-sigma-rules_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          echo "=== deb metadata ==="
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "=== first 20 entries ==="
+          # Use awk rather than `head -20` so we consume the full
+          # dpkg-deb tar stream — head exits after 20 lines and
+          # SIGPIPEs the upstream dpkg-deb process, which under
+          # `set -o pipefail` fails the step.  cape-sigma-rules has
+          # ~17 large .json packs so dpkg-deb's tar stream is still
+          # mid-write when head would close.  awk consumes the rest
+          # silently before exiting clean.
+          # Capture full output once; subsequent inspections use the
+          # buffered listing.  Avoids SIGPIPE'ing dpkg-deb when an
+          # awk/head/etc consumer exits early.
+          listing=$(dpkg-deb -c "$deb")
+          printf '%s\n' "$listing" | awk 'NR<=20'
+          # rules_windows_merged.json is the biggest pack — sanity-check
+          # it lands and is non-trivial in size (>1MB ZSL "no rules" guard).
+          merged_size=$(printf '%s\n' "$listing" | awk '/rules_windows_merged\.json$/ {print $3; exit}')
+          echo "rules_windows_merged.json size=$merged_size"
+          [ "${merged_size:-0}" -gt 1000000 ] || { echo "::error::rules_windows_merged.json implausibly small"; exit 1; }
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-sigma-rules-debs-${{ steps.ver.outputs.tag }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90

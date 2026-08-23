@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic Suricata rule refresh (every 6h)
+
+[Timer]
+# Fire 10 min after boot for an initial refresh, then every 6 hours.
+# Tracks cape-rules-build's cron cadence (every 6h).
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

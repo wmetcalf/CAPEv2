@@ -206,6 +206,9 @@ def _claims(extra: dict) -> dict:
     top level) so the function is idempotent: calling it on already-flattened
     claims — or on a flat provider's data — returns them unchanged even if they
     happen to carry their own ``userinfo`` key.
+
+    (Replaces our fork's ``_claims``: the MT branch added the same OIDC-claims
+    flattening independently; we adopt upstream's helper to keep zero fork delta.)
     """
     if isinstance(extra, dict) and "id_token" in extra:
         ui = extra.get("userinfo")
@@ -219,7 +222,7 @@ def _extract_groups(extra: dict) -> set:
     extra = _claims(extra)
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
-    raw = extra.get(claim) or []
+    raw = _claims(extra).get(claim) or []
     if isinstance(raw, str):
         raw = [raw]
     elif not isinstance(raw, (list, tuple, set)):
@@ -257,7 +260,8 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     changed = False
     extra = _claims(extra)
 
-    email = extra.get("email") or ""
+    claims = _claims(extra)
+    email = claims.get("email") or ""
     if email and user.email != email:
         user.email = email
         changed = True
@@ -267,7 +271,7 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     if admin_groups or super_groups:
         oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
         claim = oidc_cfg.get("groups_claim") or "groups"
-        if claim not in extra:
+        if claim not in claims:
             log.warning(
                 "OIDC groups claim %r absent from token for %s; skipping role reconciliation",
                 claim, user.username,
@@ -294,43 +298,32 @@ def reconcile_tenant(user, user_groups: set) -> None:
     The caller skips this entirely when the groups claim is ABSENT (misconfig
     guard), mirroring role reconciliation; a present-but-empty claim is honoured.
     """
-    from users.models import Tenant, UserProfile
+    try:
+        from users.models import Tenant, UserProfile
+    except ImportError:
+        # MT `users` app not deployed -> nothing to reconcile (single-tenant deployment).
+        # Catch ImportError ONLY: a runtime error importing a DEPLOYED users app (e.g.
+        # AppRegistryNotReady, a real bug in the module) must propagate, not be swallowed
+        # into a silent skip that leaves tenant membership stale (fail-closed).
+        return
 
-    def _g(vals):
-        # A tenant's idp_groups/admin_idp_groups come from a JSONField. Normalize
-        # defensively so a MALFORMED config can't mis-match a tenant: a bare string is
-        # ONE group (NOT an iterable of characters — else a member of group "a"/"c"/…
-        # would spuriously match), a list/tuple/set is filtered to hashable strings (so
-        # a nested dict can't TypeError the set intersection and 500 the login), and any
-        # other type fails closed to the empty set.
-        if isinstance(vals, str):
-            return {vals}
-        if isinstance(vals, (list, tuple, set)):
-            return {g for g in vals if isinstance(g, str)}
-        return set()
-
-    # Filter in Python rather than an idp_groups__contains query: the Django auth
-    # DB is sqlite, where JSONField contains/contained_by lookups are unsupported
-    # (supports_json_field_contains=False -> NotSupportedError). Tenant counts are
-    # small per deployment, so this O(n) scan is negligible.
-    matches = [t for t in Tenant.objects.filter(active=True) if user_groups & _g(t.idp_groups)]
+    matches = [t for t in Tenant.objects.filter(active=True) if user_groups & set(t.idp_groups or [])]
     prof, _ = UserProfile.objects.get_or_create(user=user)
-    if len(matches) == 1:
+    if len(matches) > 1:
+        log.warning(
+            "user %s matches multiple tenants %s; leaving tenant unset",
+            user.username, [t.slug for t in matches],
+        )
+        prof.tenant = None
+        prof.is_tenant_admin = False
+    elif len(matches) == 1:
         t = matches[0]
-        new_tenant, new_admin = t, bool(user_groups & _g(t.admin_idp_groups))
+        prof.tenant = t
+        prof.is_tenant_admin = bool(user_groups & set(t.admin_idp_groups or []))
     else:
-        if len(matches) > 1:
-            log.warning(
-                "user %s matches multiple tenants %s; leaving tenant unset",
-                user.username, [t.slug for t in matches],
-            )
-        new_tenant, new_admin = None, False
-    # Only write when something actually changed — avoid a needless UPDATE on
-    # every SSO login.
-    if prof.tenant_id != getattr(new_tenant, "id", None) or bool(prof.is_tenant_admin) != new_admin:
-        prof.tenant = new_tenant
-        prof.is_tenant_admin = new_admin
-        prof.save(update_fields=["tenant", "is_tenant_admin"])
+        prof.tenant = None
+        prof.is_tenant_admin = False
+    prof.save(update_fields=["tenant", "is_tenant_admin"])
 
 
 # ── Account adapters ──────────────────────────────────────────────────────────
@@ -479,9 +472,5 @@ def _reconcile_sso_user_on_login(sender, request, user, **kwargs):
     # only touch tenant membership when the groups claim is actually present.
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
-    # Normalize first: the openid_connect provider nests claims under
-    # extra["userinfo"], so checking the raw wrapper would treat the groups claim
-    # as absent and skip tenant reconciliation entirely — SSO users would log in
-    # with no tenant/tenant-admin membership. _extract_groups already normalizes.
     if claim in _claims(extra):
         reconcile_tenant(user, _extract_groups(extra))

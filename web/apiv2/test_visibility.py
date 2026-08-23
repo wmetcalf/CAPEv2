@@ -4,41 +4,22 @@ import re
 import pytest
 from django.contrib.auth.models import User
 
-pytest_plugins = ("mt_test_fixtures",)  # fixtures live in web/mt_test_fixtures.py (not a conftest,
-# which would shadow tests/conftest.py under pythonpath=web + --import-mode=append)
-
-
 # A view "enforces visibility" if its source references any of these — a read
 # guard, the artifact preamble, the list filter, the web decorator, or a
 # management guard (for mutation endpoints).
 GUARD_MARKERS = (
     "_deny_if_hidden", "_deny_task", "_deny_manage", "_resolve_task_id", "visible_to",
-    "require_task_visibility", "require_task_manage", "require_task_delete", "can_view_task",
-    "can_manage_task", "can_delete_task", "can_toggle_task",
+    "require_task_visibility", "require_task_manage", "can_view_task", "can_manage_task",
+    "can_toggle_task",
     # scope-filtering primitives for aggregate / mongo surfaces (dashboard,
     # statistics, hunt, compare): restrict an aggregation to the viewer's
-    # entitled scopes instead of gating a single task_id. viewer_scope is the
-    # central-mode facade over entitled_scope_filter (hunt() uses it post-#3105).
-    "scope_match", "entitled_scope_filter", "viewer_scope",
+    # entitled scopes instead of gating a single task_id.
+    "scope_match", "entitled_scope_filter",
 )
 
 # Routed task_id views that legitimately need NO per-task visibility guard.
 # SECURITY ALLOWLIST — keep tiny; every entry needs a real justification.
-ALLOWLIST = {
-    # tasks_machine: central-mode control-plane INFRA read. It is NOT tenant-scoped
-    # on purpose, but the exemption is bounded (pinned by the test_tasks_machine_*
-    # tests below): (1) it returns ONLY the pool VM label (e.g. "win11_seabios_107"),
-    # never analysis content / target / tenant metadata; (2) it authorizes ONLY via EITHER
-    # the configured [api] control_plane_token shared secret (constant-time m2m match) OR the
-    # model's own cross-tenant authority viewer_for().is_local_admin — NOT is_staff, NOT
-    # conditional on token_auth. Any other caller (incl. anonymous under MT) gets the same
-    # generic 404 as a missing task and can't read a cross-tenant VM label or enumerate ids.
-    # An empty control_plane_token disables the shared-secret path (fail-closed). With MT off,
-    # viewer_for marks every principal is_local_admin (legacy see-all), so single-tenant
-    # installs are unaffected. The end user was already authorized via can_manage_task at the
-    # UI's remote_session view before this machine-to-machine call.
-    "tasks_machine",
-}
+ALLOWLIST = set()
 
 
 # URL capture-group names that identify a single task/analysis — any of these in
@@ -84,24 +65,23 @@ def _func_source(views_module, name):
 
 
 def _all_task_views():
-    import apiv2.views
-    import apiv2.urls
-    import analysis.views
-    import analysis.urls
-    import compare.views
-    import compare.urls
-    import guac.views
-    import guac.urls
+    import apiv2.views, apiv2.urls, analysis.views, analysis.urls
+    import compare.views, compare.urls
+    import guac.views, guac.urls
+    import submission.views, submission.urls
     from web import urls as web_urls
 
     # (urls module, views module the matched names resolve to, alias used there).
     # The root urlconf (web.urls) routes file/filereport/vtupload/full_memory*
     # into analysis.views under the `analysis_views` alias — historically unscanned.
+    # submission.urls routes task_id views too (resubmit index, status,
+    # remote_session) — also historically unscanned by this gate.
     specs = (
         (apiv2.urls, apiv2.views, "views"),
         (analysis.urls, analysis.views, "views"),
         (compare.urls, compare.views, "views"),
         (guac.urls, guac.views, "views"),
+        (submission.urls, submission.views, "views"),
         (web_urls, analysis.views, "analysis_views"),
     )
     cases = []
@@ -133,7 +113,7 @@ def test_routed_task_view_enforces_visibility(modname, views_mod, name):
 # route, so the routed-task_id gate above can't see them. Each must still filter
 # its output by the caller's visibility. Add any new cross-task feed here — they
 # may live in EITHER apiv2.views or analysis.views (e.g. `pending`).
-AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri", "pending", "hunt", "search")
+AGGREGATE_TASK_FEEDS = ("tasks_rollingsuri", "pending", "hunt", "search", "cuckoo_status", "task_x_hours")
 
 
 @pytest.mark.parametrize("name", AGGREGATE_TASK_FEEDS)
@@ -142,8 +122,7 @@ def test_aggregate_feed_filters_by_viewer(name):
     must reference a visibility guard, or it leaks cross-tenant task data/ids
     (the routed-task_id gate cannot catch these — no task_id in the route).
     Scans BOTH apiv2.views and analysis.views since feeds live in either."""
-    import apiv2.views
-    import analysis.views
+    import apiv2.views, analysis.views
 
     src = _func_source(apiv2.views, name) or _func_source(analysis.views, name)
     assert src is not None, f"{name} not found in apiv2.views or analysis.views"
@@ -201,14 +180,13 @@ def test_guac_session_view_enforces_visibility(modname, name):
 
 def test_guac_websocket_consumer_rechecks_visibility():
     """SECURITY GATE (websocket): the guac tunnel consumer is not URL-routed, so
-    the routed gates can't see it. Opening the tunnel is live-VM control (a task
-    ACTION), so it must re-check MANAGE rights (defense in depth behind the
-    manage-gated mint), not mere read visibility."""
+    the routed gates can't see it. It must re-check task visibility (defense in
+    depth behind the mint-time gate)."""
     import guac.consumers
 
     src = open(guac.consumers.__file__).read()
-    assert "can_manage_task" in src, \
-        "guac websocket consumer must re-check manage rights (can_manage_task) — defense-in-depth for the live-VM tunnel"
+    assert "can_view_task" in src, \
+        "guac websocket consumer must re-check task visibility (can_view_task) — defense-in-depth for the live-VM tunnel"
 
 
 class FakeTask:
@@ -237,58 +215,11 @@ def test_deny_if_hidden_blocks_cross_tenant_private(mt_enabled):
     assert resp.status_code == 404
 
 
-def _force_mt_off(monkeypatch):
-    """Deterministically disable MT for the apiv2 deny helpers (the facade
-    delegates to users.tenancy.multitenancy_config at call time)."""
-    import users.tenancy as ut
-    from lib.cuckoo.common.tenancy import MTConfig
-    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
-
-
 @pytest.mark.django_db
-def test_deny_if_hidden_missing_task_mt_on(mt_enabled):
-    """Under MT a MISSING task returns the SAME generic 404 as a hidden task, so
-    another tenant's task ids can't be enumerated by status code."""
+def test_deny_if_hidden_missing_task():
     import apiv2.views as views
     other = User.objects.create_user("b", "b@x.com", "x")
-    resp = views._deny_if_hidden(FakeReq(other), None)
-    assert resp is not None and resp.status_code == 404
-
-
-@pytest.mark.django_db
-def test_deny_if_hidden_missing_task_mt_off_defers(monkeypatch):
-    """With MT DISABLED there is no isolation to enforce, so the gate must NOT turn
-    a missing task into a 404 — it defers (None) to the caller's own missing-task
-    handling. This preserves upstream's default-install contract (e.g. reprocess of
-    a nonexistent task returns 200 with an error body — the CI regression this
-    fixes: tests/web/test_apiv2.py::ReprocessTask.test_task_does_not_exist)."""
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    other = User.objects.create_user("b", "b@x.com", "x")
-    assert views._deny_if_hidden(FakeReq(other), None) is None
-
-
-@pytest.mark.django_db
-def test_deny_manage_missing_task_mt_on(cape_db, mt_enabled, monkeypatch):
-    """_deny_manage mirrors _deny_if_hidden for a missing task: generic 404 under MT.
-    (cape_db initializes the CAPE db singleton that views.db.view_task binds to —
-    same fixture the other views.db-patching tests in this file use.)"""
-    import apiv2.views as views
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    other = User.objects.create_user("b", "b@x.com", "x")
-    resp = views._deny_manage(FakeReq(other), 1)
-    assert resp is not None and resp.status_code == 404
-
-
-@pytest.mark.django_db
-def test_deny_manage_missing_task_mt_off_defers(cape_db, monkeypatch):
-    """_deny_manage defers (None) on a missing task when MT is off — same
-    default-install back-compat as _deny_if_hidden."""
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    other = User.objects.create_user("b", "b@x.com", "x")
-    assert views._deny_manage(FakeReq(other), 1) is None
+    assert views._deny_if_hidden(FakeReq(other), None) is not None  # not found
 
 
 @pytest.mark.django_db
@@ -340,7 +271,7 @@ def test_toggle_visibility_authz_and_indistinguishability(cape_db, mt_enabled, m
 
     monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
     monkeypatch.setattr(views.db, "set_task_visibility",
-                        lambda tid, vis, expected_prior=None: state.__setitem__("vis", vis), raising=False)
+                        lambda tid, vis: state.__setitem__("vis", vis), raising=False)
 
     c = APIClient()
 
@@ -403,8 +334,7 @@ def _hash_routed_views(urls_module):
 
 
 def _all_hash_views():
-    import apiv2.urls
-    import apiv2.views
+    import apiv2.urls, apiv2.views
     discovered = _hash_routed_views(apiv2.urls)
     # Explicitly pin tasks_search (it filters via visible_to= in list_tasks,
     # which is in GUARD_MARKERS) so it remains covered even if its URL pattern
@@ -447,7 +377,7 @@ def test_hash_routed_discovery_catches_unguarded(tmp_path, monkeypatch):
         '    ),\n'
         ']\n'
     )
-    import importlib.util
+    import types, importlib.util
     spec = importlib.util.spec_from_file_location("fake_urls", fake_urls)
     fake_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fake_mod)
@@ -461,12 +391,10 @@ def test_hash_routed_discovery_catches_unguarded(tmp_path, monkeypatch):
 def test_tasks_delete_many_skips_unmanageable_cross_tenant(cape_db, mt_enabled, monkeypatch):
     """A tenant-less user POSTing another tenant's private task id to the bulk-
     delete endpoint must NOT delete it (the worst confirmed critical)."""
-    import types
     from rest_framework.test import APIRequestFactory, force_authenticate
     import apiv2.views as views
 
     deleted = []
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": True}))  # bypass freeze
     monkeypatch.setattr(views.db, "view_task",
                         lambda tid: FakeTask(user_id=999, tenant_id=10, visibility="private"))
     monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
@@ -481,581 +409,251 @@ def test_tasks_delete_many_skips_unmanageable_cross_tenant(cape_db, mt_enabled, 
     assert resp.data.get(1) == "not exists"    # indistinguishable from missing
 
 
-def _dm_stub(monkeypatch, deleted):
-    """Common stubs for the bulk-delete happy path: a manageable, non-running task whose SQL delete
-    succeeds. view_task returns a REAL task so `deleted` is mutation-detecting (not vacuous)."""
-    import types
+@pytest.mark.django_db
+def test_pcap_create_stamps_submission_scope(cape_db, mt_enabled, monkeypatch):
+    """REGRESSION (T5): the apiv2 file-create PCAP branch must stamp the caller's
+    submission scope onto the task — tenant_id / visibility / user_id — exactly
+    like the adjacent add_static branch. Before the fix it called db.add_pcap(
+    file_path=...) with NO scope kwargs, so API-submitted PCAP tasks landed
+    unscoped (tenant_id None, user_id 0) instead of the submitter's tenant: a
+    cross-tenant visibility defect on the API PCAP path (the web form already
+    stamped correctly). Captures the add_pcap kwargs — the scope keys are absent
+    entirely before the fix and present after."""
+    from rest_framework.test import APIRequestFactory, force_authenticate
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from users.models import Tenant, UserProfile
     import apiv2.views as views
-    _t = FakeTask(user_id=1, tenant_id=None, visibility="public")
-    _t.status = "reported"  # not TASK_RUNNING
-    # happy path: [taskdelete] enabled so the authed-non-staff freeze gate doesn't short-circuit
-    # (freeze has its own dedicated tests). Callers that test the freeze override apiconf after this.
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": True}))
-    monkeypatch.setattr(views, "can_manage_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views, "can_delete_task", lambda u, t: True, raising=False)  # delete paths gate on this
-    monkeypatch.setattr(views.db, "view_task", lambda tid: _t)
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    monkeypatch.setattr(views.db, "session",
-                        types.SimpleNamespace(commit=lambda: None, rollback=lambda: None), raising=False)
-    monkeypatch.setattr(views, "delete_folder", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(views, "central_delete_analysis", lambda *a, **k: None, raising=False)
+
+    ten = Tenant.objects.create(slug="acme", name="Acme")
+    u = User.objects.create_user("pcapal", "pcapal@x.com", "x")
+    prof = UserProfile.objects.get(user=u)
+    prof.tenant = ten
+    prof.save()
+    u = User.objects.get(pk=u.pk)  # refresh so request.user.userprofile is current
+
+    captured = {}
+    monkeypatch.setattr(views.db, "list_machines", lambda *a, **k: [])
+    monkeypatch.setattr(views.db, "add_pcap", lambda **kw: captured.update(kw) or 7, raising=False)
+    # Skip real demux/copy: hand the view one ready pcap entry (content, tmp_path, _).
+    monkeypatch.setattr(
+        views, "process_new_task_files",
+        lambda request, files, details, opt_filename, unique: ([(b"data", b"/tmp/x.pcap", None)], details),
+    )
+
+    req = APIRequestFactory().post(
+        "/apiv2/tasks/create/file/",
+        {"pcap": "1", "file": SimpleUploadedFile("x.pcap", b"\xd4\xc3\xb2\xa1pcapdata")},
+        format="multipart",
+    )
+    force_authenticate(req, user=u)
+    resp = views.tasks_create_file(req)
+
+    assert resp.status_code == 200, getattr(resp, "data", resp)
+    # The scope kwargs must reach add_pcap (absent entirely before the fix).
+    assert captured.get("tenant_id") == ten.id, f"PCAP task not tenant-scoped: {captured}"
+    assert captured.get("user_id") == u.id, f"PCAP task owner not stamped: {captured}"
+    assert "visibility" in captured, f"PCAP task visibility not stamped: {captured}"
+
+
+def _build_recovery_chain(views):
+    """A foreign (tenant-20 private) analysis N plus a PUBLIC recovery wrapper R
+    whose custom='Recovery_<N>'. validate_task() transparently resolves R -> N.
+    Returns (recovery_id, foreign_id)."""
+    from lib.cuckoo.core.data.task import Task, TASK_REPORTED, TASK_RECOVERED
+
+    foreign = Task(target="secret.exe")
+    foreign.category = "file"
+    foreign.user_id, foreign.tenant_id, foreign.visibility = 999, 20, "private"
+    foreign.status = TASK_REPORTED
+    views.db.session.add(foreign)
+    views.db.session.commit()
+    nid = foreign.id
+
+    rec = Task(target="wrapper.exe")
+    rec.category = "file"
+    rec.user_id, rec.tenant_id, rec.visibility = 0, None, "public"   # viewer B can see the wrapper
+    rec.status = TASK_RECOVERED
+    rec.custom = f"Recovery_{nid}"
+    views.db.session.add(rec)
+    views.db.session.commit()
+    return rec.id, nid
 
 
 @pytest.mark.django_db
-def test_tasks_delete_many_reports_malformed_id_without_dropping_batch(cape_db, monkeypatch):
-    """A malformed id is reported per-id (200 + error) and does NOT reject the batch or 500 mid-way --
-    the valid ids are still reclaimed. Guards against the all-or-nothing whole-batch leak (neither dist.py
-    nor go-fetcher inspects a 4xx). view_task returns a real task so `deleted` is RED against the old
-    all-or-nothing 400 (which reclaimed nothing)."""
+def test_reauthorize_rtid_denies_cross_tenant_recovery(mt_enabled, monkeypatch):
+    """UNIT (T12): _reauthorize_rtid re-checks the RESOLVED task. A recovery chain
+    resolving to a task the viewer can't read -> denial; to one they can -> switch
+    to rtid; no rtid -> passthrough."""
+    import apiv2.views as views
+
+    other = User.objects.create_user("rtu", "rtu@x.com", "x")  # tenant-less
+    monkeypatch.setattr(views.db, "view_task",
+                        lambda *a, **k: FakeTask(user_id=999, tenant_id=20, visibility="private"))
+    tid, denied = views._reauthorize_rtid(FakeReq(other), 1, {"rtid": 2})
+    assert denied is not None and denied.status_code == 404 and tid == 1  # foreign -> denied
+
+    monkeypatch.setattr(views.db, "view_task",
+                        lambda *a, **k: FakeTask(user_id=999, tenant_id=20, visibility="public"))
+    tid, denied = views._reauthorize_rtid(FakeReq(other), 1, {"rtid": 2})
+    assert denied is None and tid == 2  # visible resolved task -> switch to rtid
+
+    tid, denied = views._reauthorize_rtid(FakeReq(other), 5, {})
+    assert denied is None and tid == 5  # no rtid -> passthrough
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("name,call", [
+    ("tasks_view", lambda views, req, rid: views.tasks_view(req, rid)),
+    ("tasks_iocs", lambda views, req, rid: views.tasks_iocs(req, rid)),
+    ("tasks_pcap_variant", lambda views, req, rid: views.tasks_pcap_variant(req, rid, "decrypted")),
+])
+def test_recovery_chain_reauthorizes_resolved_task(cape_db, mt_enabled, monkeypatch, name, call):
+    """REGRESSION (T12): a TASK_RECOVERED task (custom='Recovery_<N>') makes
+    validate_task resolve to the underlying task N. The viewer was authorized
+    against the PUBLIC recovery wrapper, not N — so serving N without re-checking
+    lets a recovery chain read another tenant's analysis. Every artifact endpoint
+    must re-authorize the resolved task. Covers all three code paths: the separate
+    tasks_view recovery branch, the inline rtid switch, and the shared
+    _resolve_task_id preamble. Without the fix the resolved foreign task leaks
+    back (non-404); with it the resolved task is denied (indistinguishable 404)."""
     from rest_framework.test import APIRequestFactory, force_authenticate
     import apiv2.views as views
 
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("mid", "mid@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "10,oops,11"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
+    rid, nid = _build_recovery_chain(views)
+    other = User.objects.create_user("recov", "recov@x.com", "x")  # tenant-less, can't see N
+    req = APIRequestFactory().get("/x/")
+    force_authenticate(req, user=other)
 
-    assert resp.status_code == 200                   # no all-or-nothing 4xx
-    assert sorted(deleted) == [10, 11]               # valid ids STILL reclaimed
-    assert "oops" in resp.data.get("invalid_ids", [])  # reported in a LIST, not a top-level key
-    assert resp.data.get("status") == "partial_error"  # covers the _invalid status contract
-    assert resp.data.get("error") is True            # surfaced, not a silent OK
+    resp = call(views, req, rid)
+    assert resp.status_code == 404, (
+        f"{name}: recovery chain to foreign task {nid} was NOT re-authorized "
+        f"(status={resp.status_code}, body={getattr(resp, 'data', '')!r})"
+    )
+
+
+# --- T2: apiv2 file() by-hash sample download full-stack cross-tenant denial ---
+
+class _Sample:
+    id = 7
 
 
 @pytest.mark.django_db
-def test_tasks_delete_many_out_of_range_id_is_invalid_not_500(cape_db, monkeypatch):
-    """A digit-only but out-of-range id (> 2**31-1, beyond Task.id's 32-bit range) is reported as invalid,
-    not passed to view_task where the driver would raise a bodiless 500 mid-batch after earlier deletes
-    already committed. Keeps the validate-before-delete invariant."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
+def test_file_by_hash_denies_cross_tenant(cape_db, mt_enabled, monkeypatch):
+    """apiv2 file() streams a sample by hash. The by-hash gate (_deny_by_hash ->
+    can_view_sample) must withhold a sample with NO viewer-visible task: an
+    indistinguishable 404, no sample bytes, no Content-Disposition. The predicate
+    is unit-tested, but no test drove file() end-to-end through routing+DRF auth."""
+    from rest_framework.test import APIClient
     import apiv2.views as views
+    import lib.cuckoo.core.database as dbmod
 
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("oor", "oor@x.com", "x")
-    _huge = "9" * 4301  # > CPython's 4300-digit int(str) cap -> int() would itself raise ValueError -> 500
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "10,2147483648,%s,11" % _huge})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
+    served = {"path": False}
+    monkeypatch.setattr(views.apiconf, "sampledl", {"enabled": True}, raising=False)
+    monkeypatch.setattr(dbmod._DATABASE, "find_sample", lambda **k: _Sample(), raising=False)
+    monkeypatch.setattr(dbmod._DATABASE, "list_tasks", lambda **k: [], raising=False)  # none visible to B
+    monkeypatch.setattr(views.db, "sample_path_by_hash",
+                        lambda *a, **k: served.update(path=True) or ["/x"], raising=False)
 
-    assert resp.status_code == 200                            # not a 500 (neither out-of-range nor >4300 digits)
-    assert sorted(deleted) == [10, 11]                        # in-range ids reclaimed
-    _inv = resp.data.get("invalid_ids", [])
-    assert "2147483648" in _inv and _huge in _inv            # both reported, never hit view_task or int()-raise
+    c = APIClient()
+    c.force_authenticate(user=User.objects.create_user("fb", "fb@x.com", "x"))  # tenant-less
+    r = c.get("/apiv2/files/get/sha256/" + "a" * 64 + "/")
+    assert r.status_code == 404, r.content
+    assert served["path"] is False           # gate fired before any path resolution -> no bytes
+    assert "Content-Disposition" not in r
 
 
 @pytest.mark.django_db
-def test_tasks_delete_many_zero_padded_id_accepted(cape_db, monkeypatch):
-    """A left-zero-padded id (e.g. %011d) is a valid in-range id, not rejected: strip leading zeros
-    before the length/magnitude gate."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
+def test_file_by_hash_allows_when_visible(cape_db, mt_enabled, monkeypatch):
+    """Positive control: when the viewer HAS a visible task referencing the sample,
+    file() passes the by-hash gate and proceeds to resolve a path — proving denial
+    is conditional on entitlement, not blanket."""
+    from rest_framework.test import APIClient
     import apiv2.views as views
+    import lib.cuckoo.core.database as dbmod
 
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("zp", "zp@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "00000000001,000010"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
+    served = {"path": False}
+    monkeypatch.setattr(views.apiconf, "sampledl", {"enabled": True}, raising=False)
+    monkeypatch.setattr(dbmod._DATABASE, "find_sample", lambda **k: _Sample(), raising=False)
+    monkeypatch.setattr(dbmod._DATABASE, "list_tasks", lambda **k: [object()], raising=False)  # one visible
+    monkeypatch.setattr(views.db, "sample_path_by_hash",
+                        lambda *a, **k: served.update(path=True) or [], raising=False)
 
-    assert resp.status_code == 200
-    assert sorted(deleted) == [1, 10]                        # padded ids resolved, not reported invalid
-    assert resp.data.get("invalid_ids") is None
-    assert resp.data.get("status") == "OK"
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_repeated_form_keys(cape_db, monkeypatch):
-    """Repeated form ids= keys (ids=10&ids=11&ids=12) are all honored via getlist, not truncated to
-    the last value."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("rk", "rk@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": ["10", "11", "12"]})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert sorted(deleted) == [10, 11, 12]                   # all three, not just the last
+    c = APIClient()
+    c.force_authenticate(user=User.objects.create_user("fv", "fv@x.com", "x"))
+    r = c.get("/apiv2/files/get/sha256/" + "a" * 64 + "/")
+    assert served["path"] is True            # passed the gate -> attempted to resolve a path
 
 
-@pytest.mark.django_db
-def test_tasks_delete_many_gates_on_can_delete_not_can_manage(cape_db, monkeypatch):
-    """The delete path authorizes via can_delete_task (stricter for public jobs), NOT can_manage_task:
-    a caller who may manage a public task but not delete it is refused."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
+# Task-CREATING db calls in the submission views must stamp the caller's
+# submission scope (tenant_id= + visibility=); otherwise the created task lands
+# unscoped (tenant_id None) and becomes cross-tenant visible — the T5 PCAP
+# regression. AST-checked (not substring) so multi-line call sites and any NEW
+# add_* call can't ship without scope.
+SCOPE_STAMPING_METHODS = {"add_pcap", "add_static", "add_url", "add_path"}
 
-    deleted = []
-    _t = FakeTask(user_id=1, tenant_id=10, visibility="public")
-    _t.status = "reported"
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda tid: _t)
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    monkeypatch.setattr(views, "can_manage_task", lambda u, t: True, raising=False)   # manage WOULD allow
-    monkeypatch.setattr(views, "can_delete_task", lambda u, t: False, raising=False)  # delete denies
 
-    u = User.objects.create_user("cd", "cd@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "5"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
+def test_submission_add_calls_stamp_scope():
+    """SECURITY GATE (scope stamping): every db.add_{pcap,static,url,path}() call
+    in the submission views must pass tenant_id= and visibility=, or the created
+    task is unscoped and leaks across tenants. Locks the T5 fix structurally."""
+    import ast
+    import importlib
 
-    assert deleted == []                                     # gated by can_delete_task (deny), not can_manage
-    assert resp.data.get(5) == "not exists"
+    offenders = []
+    for modname in ("apiv2.views", "submission.views"):
+        mod = importlib.import_module(modname)
+        tree = ast.parse(open(mod.__file__).read())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in SCOPE_STAMPING_METHODS):
+                kws = {kw.arg for kw in node.keywords}
+                missing = {"tenant_id", "visibility"} - kws
+                if missing:
+                    offenders.append(f"{modname}:{node.lineno} {node.func.attr} missing {sorted(missing)}")
+    assert not offenders, (
+        f"Submission task-creating call(s) without scope stamping: {offenders}. "
+        f"Pass tenant_id= and visibility= (from submission_scope) so the task is "
+        f"not created cross-tenant visible."
+    )
 
+
+# --- T9: tasks_search by-hash existence-oracle indistinguishability ---
 
 @pytest.mark.django_db
-def test_tasks_delete_gates_on_can_delete_not_can_manage(cape_db, monkeypatch):
-    """tasks_delete (single) authorizes each task via can_delete_task, NOT can_manage_task: a caller who
-    may manage a public task but not delete it is refused (task lands in `failed`, nothing deleted). A
-    behavioral pin so a revert of tasks_delete to can_manage_task fails CI (the GUARD_MARKERS substring
-    check alone would still pass)."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _t = FakeTask(user_id=1, tenant_id=10, visibility="public")
-    _t.status = "reported"
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": True}))
-    monkeypatch.setattr(views, "validate_task", lambda *a, **k: {"error": False}, raising=False)
-    monkeypatch.setattr(views.db, "view_task", lambda tid: _t)
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    monkeypatch.setattr(views, "can_manage_task", lambda u, t: True, raising=False)   # manage WOULD allow
-    monkeypatch.setattr(views, "can_delete_task", lambda u, t: False, raising=False)  # delete denies
-
-    u = User.objects.create_user("td_cd", "td_cd@x.com", "x")
-    req = APIRequestFactory().get("/apiv2/tasks/delete/5/")   # tasks_delete is @api_view(["GET"])
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete(req, "5")
-
-    assert deleted == []                              # gated by can_delete_task (deny), not can_manage
-    assert "5" in resp.data.get("failed", "")         # reported failed, not deleted
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_gates_on_can_set_visibility_not_can_toggle(cape_db, mt_enabled, monkeypatch):
-    """The visibility WRITE authorizes via can_set_visibility_task (transition-aware), NOT can_toggle_task
-    -- this is what stops a tenant-admin downgrading a non-owned PUBLIC job into can_delete's tenant
-    branch. RED against a revert to can_toggle_task (which has no direction guard)."""
+def test_tasks_search_hash_is_indistinguishable_oracle(cape_db, mt_enabled, monkeypatch):
+    """tasks_search by hash must return a response BYTE-IDENTICAL for a foreign-
+    but-existing sample (a Sample row exists, but no viewer-visible task) and a
+    never-seen hash ({data:[],error:False}) — else the data/error shape becomes a
+    cross-tenant existence oracle. Drives the real view as a tenant-less viewer."""
     from rest_framework.test import APIClient
     import apiv2.views as views
 
-    wrote = []
+    class _S:
+        id = 7
 
-    class T:
-        id = 1
+        def to_dict(self):
+            return {"id": 7}
 
-        def __init__(self):
-            self.user_id, self.tenant_id, self.visibility = 999, 10, "public"
+    FOREIGN = "a" * 64
+    NEVER = "b" * 64
 
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-    monkeypatch.setattr(views.db, "set_task_visibility",
-                        lambda tid, vis: wrote.append((tid, vis)) or T(), raising=False)
-    monkeypatch.setattr(views, "can_view_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views, "can_toggle_task", lambda u, t: True, raising=False)             # toggle WOULD allow
-    monkeypatch.setattr(views, "can_set_visibility_task", lambda u, t, v: False, raising=False)  # transition denies
+    def _find(**k):
+        if k.get("sha256") == FOREIGN:
+            return _S()              # sample exists
+        if "parent" in k:
+            return []                # no child samples
+        return None                  # never-seen hash
 
-    u = User.objects.create_user("tsv_cd", "tsv_cd@x.com", "x")
+    monkeypatch.setattr(views.db, "find_sample", _find, raising=False)
+    monkeypatch.setattr(views.db, "list_tasks", lambda **k: [], raising=False)  # no visible task for B
+
     c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "tenant"}, format="json")
-
-    assert r.status_code == 403                       # gated by can_set_visibility_task (deny), not can_toggle
-    assert wrote == []                                # the downgrade write never happened
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_reads_json_body(cape_db, monkeypatch):
-    """ids sourced from request.data so a JSON-bodied caller isn't a silent no-op (request.POST is
-    empty for application/json -> would answer 200 having deleted nothing)."""
-    import json as _json
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("js", "js@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/",
-                                   data=_json.dumps({"ids": "101,102"}), content_type="application/json")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert sorted(deleted) == [101, 102]             # JSON body honored, not a silent no-op
-    assert resp.data.get("status") == "OK"           # clean-batch status contract covered
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_json_delete_mongo_opt_out_honored(cape_db, monkeypatch):
-    """A JSON caller's delete_mongo=false RETAIN opt-out must be honored: delete_mongo is read from the
-    SAME body as ids (request.data), not request.POST (empty for application/json -> would default True
-    and irreversibly erase the report the caller asked to keep)."""
-    import json as _json
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted, wiped = [], []
-    _dm_stub(monkeypatch, deleted)
-    monkeypatch.setattr(views, "central_delete_analysis",
-                        lambda req, tid, **k: wiped.append(tid) or None, raising=False)
-    u = User.objects.create_user("jmo", "jmo@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/",
-                                   data=_json.dumps({"ids": "101,102", "delete_mongo": False}),
-                                   content_type="application/json")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert sorted(deleted) == [101, 102]             # SQL rows deleted
-    assert wiped == []                               # reports RETAINED (opt-out honored, not erased)
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_json_array_body_is_ids_not_500(cape_db, monkeypatch):
-    """A top-level JSON array body ([10,11]) is treated as the ids list, not an AttributeError 500 on
-    request.data.get (request.data is a list, which has no .get)."""
-    import json as _json
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("jarr", "jarr@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/",
-                                   data=_json.dumps([10, 11]), content_type="application/json")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200                   # not a 500
-    assert sorted(deleted) == [10, 11]
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_invalid_token_does_not_clobber_envelope(cape_db, monkeypatch):
-    """Tokens spelled like reserved envelope keys ('status'/'error') are reported in the invalid_ids LIST
-    and must NOT overwrite the summary keys."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("clob", "clob@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "10,status,error,11"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert sorted(deleted) == [10, 11]                       # valid ids still reclaimed
-    assert set(resp.data.get("invalid_ids", [])) == {"status", "error"}  # both reported, not swallowed
-    assert resp.data.get("status") == "partial_error"        # envelope intact (not clobbered by a token)
-    assert resp.data.get("error") is True
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_missing_ids_is_noop(cape_db, monkeypatch):
-    """Absent/empty ids -> clean no-op: NOTHING deleted (capture proves it), not the old int('') 500."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)  # view_task returns a deletable task, so an empty-ids delete would be caught
-    u = User.objects.create_user("noid", "noid@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert deleted == []                             # nothing deleted on empty ids
-    assert resp.data.get("status") == "OK"           # clean-batch status contract covered
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_never_frozen_machine_cleanup_path(cape_db, monkeypatch):
-    """tasks_delete_many is the MACHINE worker-cleanup path (utils/dist.py + go-fetcher) -> it carries NO
-    [taskdelete] freeze: an authenticated non-staff caller (a dist node's Token principal) AND the anonymous
-    stock path both proceed even with [taskdelete] disabled. RED against re-introducing the freeze, which
-    403'd the token-auth workers (silent disk-reclamation break) and never fired under token_auth=no. The
-    legal-hold freeze lives on the HUMAN endpoint tasks_delete."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": False}))  # frozen config
-
-    # authenticated non-staff (the token-auth dist worker principal) -> NOT frozen
-    u = User.objects.create_user("fz", "fz@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "10"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-    assert resp.status_code == 200
-    assert deleted == [10]
-
-    # anonymous (stock token_auth_enabled=no path) -> also proceeds
-    deleted.clear()
-    req_anon = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "11"})
-    resp_anon = views.tasks_delete_many(req_anon)
-    assert resp_anon.status_code == 200
-    assert deleted == [11]
-
-
-@pytest.mark.django_db
-def test_tasks_delete_rejects_negative_range_no_mass_delete(cape_db, monkeypatch):
-    """/tasks/delete/-5/ must 400, NOT expand to range(0,6) and mass-delete tasks 1-5
-    (the force_int('')==0 footgun)."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    u = User.objects.create_user("td1", "td1@x.com", "x")  # staff bypasses the gate
-    u.is_staff = True
-    u.save()
-    req = APIRequestFactory().get("/apiv2/tasks/delete/-5/")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete(req, "-5")
-    assert resp.status_code == 400
-    assert deleted == []                             # no mass delete
-
-
-@pytest.mark.django_db
-def test_tasks_delete_rejects_multi_hyphen_no_500(cape_db, monkeypatch):
-    """/tasks/delete/1-2-3/ must 400, not 500 (ValueError: too many values to unpack)."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    u = User.objects.create_user("td2", "td2@x.com", "x")
-    u.is_staff = True
-    u.save()
-    req = APIRequestFactory().get("/apiv2/tasks/delete/1-2-3/")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete(req, "1-2-3")
-    assert resp.status_code == 400
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_empty_delete_mongo_retains(cape_db, monkeypatch):
-    """A present-but-EMPTY delete_mongo RETAINS the Mongo report (upstream bool("")=False
-    back-compat) -- NOT a 400 and NOT a delete. The explicit-string parse still fixes the
-    original bug where a real "False" was coerced truthy and wrongly deleted."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    _t = FakeTask(user_id=1, tenant_id=None, visibility="public")
-    _t.status = "reported"                     # not TASK_RUNNING
-    called = []
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskdelete={"enabled": True}))  # bypass freeze
-    monkeypatch.setattr(views, "can_manage_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views.db, "view_task", lambda tid: _t)
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: True)
-    monkeypatch.setattr(views.db, "session",
-                        types.SimpleNamespace(commit=lambda: None, rollback=lambda: None), raising=False)
-    monkeypatch.setattr(views, "delete_folder", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(views, "central_delete_analysis",
-                        lambda *a, **k: called.append(a) or None, raising=False)
-
-    u = User.objects.create_user("emr", "emr@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "1", "delete_mongo": ""})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code != 400             # empty no longer rejected (back-compat)
-    assert resp.data.get(1) == "deleted"       # task deleted
-    assert called == []                        # report RETAINED: central_delete_analysis NOT called
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_nested_ids_rejected_not_partial(cape_db, monkeypatch):
-    """A nested/structured ids entry ({"ids": [[10,11,12]]}) must be rejected WHOLE, never str()+split.
-    str([10,11,12]) -> "[10, 11, 12]" whose middle token " 11" strips to a digit -> the old flatten would
-    silently DELETE task 11 from a payload that names no scalar id. Reject the list entry as invalid."""
-    import json as _json
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("nest", "nest@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/",
-                                   data=_json.dumps({"ids": [[10, 11, 12]]}), content_type="application/json")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert deleted == []                                     # NOTHING deleted -- no partial-delete of task 11
-    assert "[10, 11, 12]" in resp.data.get("invalid_ids", [])  # the list entry reported whole, never split
-    assert resp.data.get("error") is True
-
-
-@pytest.mark.django_db
-def test_tasks_delete_many_zero_token_rejected(cape_db, monkeypatch):
-    """A zero-valued token ("0" / "00") is out of range (Task.id starts at 1) -> reported invalid, never
-    passed through as id 0 (which view_task can't resolve). Locks the lower bound, matching _coerce_task_id."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _dm_stub(monkeypatch, deleted)
-    u = User.objects.create_user("zt", "zt@x.com", "x")
-    req = APIRequestFactory().post("/apiv2/tasks/delete_many/", {"ids": "0,00,11"})
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete_many(req)
-
-    assert resp.status_code == 200
-    assert deleted == [11]                                   # only the real id; 0/00 rejected
-    _inv = resp.data.get("invalid_ids", [])
-    assert "0" in _inv and "00" in _inv                      # both zero tokens reported, not resolved to id 0
-
-
-@pytest.mark.django_db
-def test_ext_tasks_search_ids_bounded_not_500(cape_db, monkeypatch):
-    """The extendedsearch `ids` option must bound each token like the delete paths: an out-of-range or
-    >4300-digit argument returns a clean error, NOT a bodiless 500 (int() ValueError / PG 22003 in
-    list_tasks). The guard fires before any db call, so no perform_search/list_tasks mock is needed."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(extendedtasksearch={"enabled": True}))
-    u = User.objects.create_user("eids", "eids@x.com", "x")
-    _huge = "9" * 4301  # beyond CPython's int(str) 4300-digit cap -> unbounded int() would itself raise
-    for bad in ("2147483648", _huge, "0"):  # out-of-range, huge-digit, zero (lower bound)
-        req = APIRequestFactory().post("/apiv2/tasks/extendedsearch/", {"option": "ids", "argument": bad})
-        force_authenticate(req, user=u)
-        req.user = u
-        resp = views.ext_tasks_search(req)
-        assert resp.data.get("error") is True                        # clean error envelope, never a 500
-        assert resp.data.get("error_value") == "Not all values are valid task ids"
-
-
-@pytest.mark.django_db
-def test_ext_tasks_search_drops_cross_tenant_rows(cape_db, mt_enabled, monkeypatch):
-    """ext_tasks_search batch-filters perform_search rows through
-    list_tasks(visible_to=viewer) in ONE query: a report row for a task the caller
-    can't see (foreign/private) must be dropped from the response. Locks the N+1 ->
-    batch rewrite so it can't regress into a cross-tenant leak."""
-    import types
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    class _T:
-        def __init__(self, i):
-            self.id = i
-
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(extendedtasksearch={"enabled": True}))
-    monkeypatch.setattr(views, "repconf", types.SimpleNamespace(mongodb=types.SimpleNamespace(enabled=True)), raising=False)
-    monkeypatch.setattr(views, "es_as_db", False, raising=False)
-    monkeypatch.setattr(views, "perform_search", lambda *a, **k: [{"info": {"id": 2}}, {"info": {"id": 3}}])
-    # only task 2 is visible to this viewer; task 3 (foreign/private) is not
-    monkeypatch.setattr(views.db, "list_tasks", lambda *a, **k: [_T(2)])
-
-    req = APIRequestFactory().post("/apiv2/tasks/extendedsearch/", {"option": "malscore", "argument": "5"})
-    u = User.objects.create_user("ext", "ext@x.com", "x")  # tenant-less, non-admin
-    force_authenticate(req, user=u)
-    req.user = u
-    resp = views.ext_tasks_search(req)
-    ids = [r["info"]["id"] for r in resp.data.get("data", [])]
-    assert ids == [2]  # foreign task 3 dropped by the batch visibility filter
-
-
-# --- missing-task regression: the MT gate deleted upstream's `if not task:` guard
-# in these 3 endpoints; with MT off _deny_* defers on a missing task, so without
-# the restored guard they fall through to task.to_dict()/task.guest -> HTTP 500.
-# MT off MUST reproduce upstream's 200 error body; MT on stays the generic 404.
-def _apiget(views, u, path):
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    req = APIRequestFactory().get(path)
-    force_authenticate(req, user=u)
-    req.user = u
-    return req
-
-
-@pytest.mark.django_db
-def test_tasks_view_missing_mt_off_restores_upstream(cape_db, monkeypatch):
-    import types
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskview={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("tv_off", "tv_off@x.com", "x")
-    resp = views.tasks_view(_apiget(views, u, "/apiv2/tasks/view/999/"), 999)
-    assert resp.status_code == 200
-    assert resp.data == {"error": True, "error_value": "Task not found in database"}
-
-
-@pytest.mark.django_db
-def test_tasks_view_missing_mt_on_generic_404(cape_db, mt_enabled, monkeypatch):
-    import types
-    import apiv2.views as views
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskview={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("tv_on", "tv_on@x.com", "x")
-    resp = views.tasks_view(_apiget(views, u, "/apiv2/tasks/view/999/"), 999)
-    assert resp.status_code == 404
-
-
-@pytest.mark.django_db
-def test_tasks_status_missing_mt_off_restores_upstream(cape_db, monkeypatch):
-    import types
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskstatus={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("ts_off", "ts_off@x.com", "x")
-    resp = views.tasks_status(_apiget(views, u, "/apiv2/tasks/status/999/"), 999)
-    assert resp.status_code == 200
-    assert resp.data == {"error": True, "error_value": "Task does not exist"}
-
-
-@pytest.mark.django_db
-def test_tasks_status_missing_mt_on_generic_404(cape_db, mt_enabled, monkeypatch):
-    import types
-    import apiv2.views as views
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskstatus={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("ts_on", "ts_on@x.com", "x")
-    resp = views.tasks_status(_apiget(views, u, "/apiv2/tasks/status/999/"), 999)
-    assert resp.status_code == 404
-
-
-def _apipost(views, u, path):
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    req = APIRequestFactory().post(path)  # tasks_file_stream is @api_view(["POST"])
-    force_authenticate(req, user=u)
-    req.user = u
-    return req
-
-
-@pytest.mark.django_db
-def test_tasks_file_stream_missing_mt_off_restores_upstream(cape_db, monkeypatch):
-    import types
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskstatus={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("fs_off", "fs_off@x.com", "x")
-    resp = views.tasks_file_stream(_apipost(views, u, "/apiv2/tasks/get/stream/999/"), 999)
-    assert resp.status_code == 200
-    assert resp.data == {"error": True, "error_value": "Task does not exist"}
-
-
-@pytest.mark.django_db
-def test_tasks_file_stream_missing_mt_on_generic_404(cape_db, mt_enabled, monkeypatch):
-    import types
-    import apiv2.views as views
-    monkeypatch.setattr(views, "apiconf", types.SimpleNamespace(taskstatus={"enabled": True}))
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: None)
-    u = User.objects.create_user("fs_on", "fs_on@x.com", "x")
-    resp = views.tasks_file_stream(_apipost(views, u, "/apiv2/tasks/get/stream/999/"), 999)
-    assert resp.status_code == 404
+    c.force_authenticate(user=User.objects.create_user("ts", "ts@x.com", "x"))  # tenant-less
+    r_foreign = c.get(f"/apiv2/tasks/search/sha256/{FOREIGN}/")
+    r_never = c.get(f"/apiv2/tasks/search/sha256/{NEVER}/")
+    assert r_foreign.status_code == r_never.status_code == 200
+    # foreign-existing and never-seen must be byte-identical (no existence oracle)
+    assert r_foreign.json() == r_never.json() == {"data": [], "error": False}
 
 
 def test_every_perform_search_caller_passes_viewer():
@@ -1146,7 +744,7 @@ REVIEWED_MONGO_PIVOTS = {
     "analysis.views:search_behavior": "mongo_find('calls', _id $in) — ObjectIds from the gated task's own behavior doc",
     "analysis.views:report": "mongo_aggregate $match info.id == the can_view_task-gated task_id",
     "analysis.views:hunt": "mongo_aggregate $facet pinned by entitled_scope_filter()",
-    "apiv2.views:tasks_rollingsuri": "mongo_find then batch list_tasks(visible_to=) membership (+ is_local_admin fast-path)",
+    "apiv2.views:tasks_rollingsuri": "mongo_find then per-row can_view_task (+ is_local_admin fast-path)",
     "compare.views:left": "mongo_find md5-pivot AND-ed with entitled_scope_filter()",
     "compare.views:hash": "mongo_find md5-pivot AND-ed with entitled_scope_filter()",
 }
@@ -1238,902 +836,138 @@ def test_byhash_sample_resolution_is_gated():
     )
 
 
-@pytest.mark.django_db
-def test_resolve_task_id_regates_recovery_rtid_pivot(cape_db, mt_enabled, monkeypatch):
-    """rtid wrong-object regression: after a Recovery_<N> pivot to a DIFFERENT task,
-    _resolve_task_id must re-gate visibility on the RESOLVED id — the initial
-    _deny_if_hidden only authorized the original task, so serving the resolved
-    task's artifacts without a re-check leaks another tenant's bytes."""
-    import types
-    import apiv2.views as av
-    from django.contrib.auth.models import User
-    from django.test import RequestFactory
-
-    class OwnTask:      # original id 5 — public, readable by anyone
-        id = 5
-        user_id = 0
-        tenant_id = 10
-        visibility = "public"
-
-    class ForeignTask:  # rtid 6 — another tenant's private analysis
-        id = 6
-        user_id = 999
-        tenant_id = 20
-        visibility = "private"
-
-    monkeypatch.setattr(av, "apiconf", types.SimpleNamespace())  # enabled_key -> None -> skip gate
-    monkeypatch.setattr(av.db, "view_task", lambda tid, *a, **k: OwnTask() if int(tid) == 5 else ForeignTask())
-    monkeypatch.setattr(av, "validate_task", lambda tid, *a, **k: {"error": False, "rtid": 6, "tlp": ""})
-
-    req = RequestFactory().get("/x")
-    req.user = User.objects.create_user("rtid_neg", "rtid_neg@x.com", "x")  # tenant-less, non-admin
-    resolved, err = av._resolve_task_id(req, 5, "taskpcap")
-    assert resolved is None and err is not None  # denied on the resolved foreign id
-
+# --- T10: download_from_3rdparty local-cache reuse is scoped by viewer ---
 
 @pytest.mark.django_db
-def test_resolve_task_id_allows_readable_rtid_pivot(cape_db, mt_enabled, monkeypatch):
-    """Positive control: a Recovery pivot to a task the requester CAN read resolves
-    normally (the re-gate must not block legitimate recovery)."""
-    import types
-    import apiv2.views as av
-    from django.contrib.auth.models import User
-    from django.test import RequestFactory
-
-    class OwnTask:
-        id = 5
-        user_id = 0
-        tenant_id = 10
-        visibility = "public"
-
-    class OwnTask2:
-        id = 6
-        user_id = 0
-        tenant_id = 10
-        visibility = "public"
-
-    monkeypatch.setattr(av, "apiconf", types.SimpleNamespace())
-    monkeypatch.setattr(av.db, "view_task", lambda tid, *a, **k: OwnTask() if int(tid) == 5 else OwnTask2())
-    monkeypatch.setattr(av, "validate_task", lambda tid, *a, **k: {"error": False, "rtid": 6, "tlp": ""})
-
-    req = RequestFactory().get("/x")
-    req.user = User.objects.create_user("rtid_pos", "rtid_pos@x.com", "x")
-    resolved, err = av._resolve_task_id(req, 5, "taskpcap")
-    assert resolved == 6 and err is None
-
-
-@pytest.mark.django_db
-def test_tasks_view_regates_recovery_pivot(cape_db, mt_enabled, monkeypatch):
-    """rtid wrong-object (tasks_view INLINE pivot, separate from _resolve_task_id):
-    a TASK_RECOVERED task whose `custom` points Recovery_<N> at another tenant's
-    task must NOT serve that task's data — re-gate on the resolved id."""
-    import types
-    import apiv2.views as av
-    from django.contrib.auth.models import User
-    from rest_framework.test import APIRequestFactory, force_authenticate
-
-    class OwnRecovered:      # id 5 — public + readable; recovers to id 6
-        id = 5
-        user_id = 0
-        tenant_id = 10
-        visibility = "public"
-        status = av.TASK_RECOVERED
-        custom = "Recovery_6"
-        guest = None
-        errors = []
-        sample_id = None
-
-        def to_dict(self):
-            return {"category": "file", "target": "/tmp/own"}
-
-    class ForeignTask:      # id 6 — another tenant's private analysis
-        id = 6
-        user_id = 999
-        tenant_id = 20
-        visibility = "private"
-        status = av.TASK_RECOVERED
-        custom = None
-        guest = None
-        errors = []
-        sample_id = None
-
-        def to_dict(self):
-            return {"category": "file", "target": "/tmp/secret"}
-
-    monkeypatch.setattr(av, "apiconf", types.SimpleNamespace(taskview={"enabled": True}))
-    monkeypatch.setattr(av.db, "view_task", lambda tid, **k: OwnRecovered() if int(tid) == 5 else ForeignTask())
-
-    req = APIRequestFactory().get("/apiv2/tasks/view/5/")
-    u = User.objects.create_user("tv_neg", "tv_neg@x.com", "x")  # tenant-less, non-admin
-    force_authenticate(req, user=u)
-    req.user = u
-    resp = av.tasks_view(req, 5)
-    assert resp.status_code == 404  # denied on the resolved foreign task, not served
-
-
-def test_visibility_endpoint_opts_into_session_auth():
-    """Codex: the report-page visibility toggle authenticates with a browser
-    session; SessionAuthentication is dropped from the DRF default in SSO mode, so
-    the endpoint must opt back into it (while keeping API-token auth)."""
-    import apiv2.views as av
-    from rest_framework.authentication import SessionAuthentication
-
-    cls = getattr(av.tasks_set_visibility, "cls", None)
-    assert cls is not None, "tasks_set_visibility should be a DRF @api_view"
-    assert SessionAuthentication in cls.authentication_classes, \
-        "visibility toggle must accept browser session auth (SSO drops it from the default)"
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_rejects_tenant_for_tenantless_task(cape_db, mt_enabled, monkeypatch):
-    """A task with tenant_id=None cannot be 'tenant'-visible (can_read's tenant branch
-    needs a non-null job tenant) — the toggle API must reject that transition with a
-    400 rather than persist an owner/break-glass-only invisible state."""
-    from rest_framework.test import APIClient
-    import apiv2.views as views
-
-    owner = User.objects.create_user("ownt", "ownt@x.com", "x")  # tenant-less owner
-    state = {"vis": "private"}
-
-    class T:
-        id = 1
-
-        def __init__(self):
-            self.user_id = owner.id
-            self.tenant_id = None
-
-        @property
-        def visibility(self):
-            return state["vis"]
-
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-    monkeypatch.setattr(views.db, "set_task_visibility",
-                        lambda tid, vis, expected_prior=None: state.__setitem__("vis", vis), raising=False)
-
-    c = APIClient()
-    c.force_authenticate(user=owner)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "tenant"}, format="json")
-    assert r.status_code == 400 and r.json().get("error") is True
-    assert state["vis"] == "private"  # unchanged — set_task_visibility never invoked with tenant
-
-    # sanity: the owner can still set public/private on their tenantless task
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "public"}, format="json")
-    assert r.status_code == 200, r.content
-    assert state["vis"] == "public"
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_rejected_when_mt_disabled(cape_db, monkeypatch):
-    """Visibility is an MT feature: with MT disabled the toggle endpoint must reject
-    (400) and never write — with MT off every principal is is_local_admin, so
-    can_toggle would otherwise authorize a write whose value could become a backfill
-    landmine (hide/expose legacy analyses) if MT is later enabled."""
-    from rest_framework.test import APIClient
-    import apiv2.views as views
-    import users.tenancy as ut
-    from lib.cuckoo.common.tenancy import MTConfig
-
-    # force MT OFF deterministically (the facade delegates to users.tenancy)
-    monkeypatch.setattr(ut, "multitenancy_config", lambda: MTConfig(False, "shared", "", True))
-
-    wrote = {"set": False}
-    monkeypatch.setattr(views.db, "set_task_visibility",
-                        lambda *a, **k: wrote.__setitem__("set", True), raising=False)
-
-    class T:
-        id = 1
-        user_id = 1
-        tenant_id = None
-        visibility = "public"
-
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-
-    u = User.objects.create_user("mtoff", "mtoff@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "private"}, format="json")
-    assert r.status_code == 400 and r.json().get("error") is True
-    assert wrote["set"] is False  # never wrote SQL/mongo while MT off
-
-
-# ---------------------------------------------------------------------------
-# Finding (1): ext_tasks_search — the batch record filter must NOT drop records
-# whose info.id has no live SQL Task row when MT is off / break-glass. A
-# non-admin (MT on) still drops rows outside the visible set.
-# ---------------------------------------------------------------------------
-
-
-class _Viewer:
-    def __init__(self, is_local_admin):
-        self.is_local_admin = is_local_admin
-
-
-class _RowTask:
-    def __init__(self, tid):
-        self.id = tid
-
-
-def _run_ext_search_filter(monkeypatch, viewer, mongo_records, visible_ids):
-    """Drive ext_tasks_search's post-perform_search record loop in isolation:
-    stub apiconf (enabled), perform_search (returns mongo_records), viewer_for,
-    the SQL visibility query (list_tasks -> rows with visible_ids), and force the
-    mongo (not ES) branch. Returns the resp['data'] list the view would emit."""
-    import apiv2.views as views
-    from rest_framework.test import APIClient
-
-    # enabled endpoint + valid term/value so we reach the records branch
-    monkeypatch.setattr(views.apiconf, "extendedtasksearch",
-                        {"enabled": True}, raising=False)
-    monkeypatch.setattr(views, "es_as_db", False, raising=False)
-
-    class _Mongo:
-        enabled = True
-
-    class _RepConf:
-        mongodb = _Mongo()
-
-    monkeypatch.setattr(views, "repconf", _RepConf(), raising=False)
-    monkeypatch.setattr(views, "viewer_for", lambda user: viewer, raising=False)
-    monkeypatch.setattr(views, "perform_search",
-                        lambda *a, **k: mongo_records, raising=False)
-    # SQL visibility resolution — only the "visible" ids come back as rows
-    monkeypatch.setattr(
-        views.db, "list_tasks",
-        lambda *a, **k: [_RowTask(t) for t in visible_ids], raising=False,
-    )
-    # "malscore" is a valid term that skips the tags/options/ids preamble
-    c = APIClient()
-    u = User.objects.create_user("extsearch", "extsearch@x.com", "x")
-    c.force_authenticate(user=u)
-    r = c.post("/apiv2/tasks/extendedsearch/",
-               {"option": "malscore", "argument": "5"}, format="json")
-    assert r.status_code == 200, r.content
-    return r.json()
-
-
-@pytest.mark.django_db
-def test_ext_search_mt_off_keeps_records_without_sql_row(cape_db, monkeypatch):
-    """MT off / break-glass (is_local_admin): every record is returned even when
-    NO record's info.id maps to a live SQL Task row (list_tasks -> []). This is
-    the upstream default-install behavior; the new MT drop must be a no-op."""
-    records = [{"info": {"id": 111}}, {"info": {"id": 222}}]
-    out = _run_ext_search_filter(monkeypatch, _Viewer(True), records, visible_ids=[])
-    assert out.get("error") is False
-    assert out["data"] == records  # nothing dropped despite empty SQL visible set
-
-
-@pytest.mark.django_db
-def test_ext_search_mt_on_drops_invisible_records(cape_db, monkeypatch):
-    """MT on, non-admin viewer: records whose info.id is not in the caller's
-    visible set are dropped; visible ones are kept."""
-    records = [{"info": {"id": 111}}, {"info": {"id": 222}}]
-    out = _run_ext_search_filter(monkeypatch, _Viewer(False), records, visible_ids=[111])
-    assert out.get("error") is False
-    assert out["data"] == [{"info": {"id": 111}}]  # 222 not visible -> dropped
-
-
-# ---------------------------------------------------------------------------
-# Finding (2): task_x_hours — MT off must reproduce upstream's reversed-bounds
-# (always-empty) query verbatim; only MT on uses the corrected 24h window.
-# ---------------------------------------------------------------------------
-
-
-# NOTE on task_x_hours + `datetime`: the view uses `datetime.datetime.now()`,
-# but apiv2/views.py imports only `from datetime import datetime` (a pre-existing
-# quirk carried verbatim from upstream base into BOTH the MT-off and MT-on
-# branches). To exercise the BEHAVIORAL difference between the two branches
-# (reversed-bounds + (date, samples) tuple-unpack for MT-off vs corrected-bounds
-# + per-Task can_view count for MT-on) without tripping that name resolution, the
-# tests inject a shim exposing `.datetime`/`.timedelta` and capture the between()
-# bounds so we can assert which query the branch built.
-
-
-class _FakeQuery:
-    def __init__(self, recorder, rows):
-        self._recorder = recorder
-        self._rows = rows
-
-    def filter(self, criterion):
-        return self
-
-    def all(self):
-        return self._rows
-
-
-class _FakeSession:
-    def __init__(self, recorder, rows):
-        self._recorder = recorder
-        self._rows = rows
-
-    def query(self, *a, **k):
-        return _FakeQuery(self._recorder, self._rows)
-
-    def close(self):
-        self._recorder["closed"] = True
-
-
-def _install_datetime_shim(monkeypatch, views, recorder):
-    """Capture the Task.added_on.between() bounds order so tests can prove reversed
-    (MT-off/upstream) vs corrected (MT-on). Uses the REAL datetime (NO shim): the
-    view must call the imported names datetime.now()/timedelta() directly — a
-    regression to the datetime.datetime.now() typo would raise here (module imports
-    `from datetime import datetime`), instead of being masked by a fake module."""
-    class _Col:
-        def between(self, lo, hi):
-            recorder["bounds"] = (lo, hi)
-            return object()  # opaque criterion
-
-    monkeypatch.setattr(views.Task, "added_on", _Col(), raising=False)
-
-
-@pytest.mark.django_db
-def test_task_x_hours_mt_off_uses_reversed_bounds_and_tuple_unpack(cape_db, monkeypatch, mt_disabled):
-    """MT disabled => upstream verbatim: reversed between(now, now-1day) bounds
-    AND `for date, samples in res` tuple-unpack. Feed (date, count) 2-tuples so
-    the upstream unpack succeeds and the result matches upstream's shape; assert
-    the bounds are REVERSED (lo > hi) — i.e. NOT the corrected MT-on window."""
-    import datetime as _dt
-    import apiv2.views as views
-    from rest_framework.test import APIClient
-
-    rec = {}
-    _install_datetime_shim(monkeypatch, views, rec)
-    d1 = _dt.datetime(2026, 1, 1, 12, 0, 0)
-    # upstream shape: rows are (date, samples) tuples
-    monkeypatch.setattr(views.db, "Session",
-                        lambda *a, **k: _FakeSession(rec, [(d1, 3)]), raising=False)
-
-    u = User.objects.create_user("txh_off", "txh_off@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.get("/apiv2/tasks/stats/")
-    assert r.status_code == 200, r.content
-    body = r.json()
-    assert body["error"] is False
-    # upstream setdefault(date, samples) -> the raw `samples` value, NOT a count
-    assert list(body["stats"].values()) == [3]
-    # reversed bounds (upstream bug preserved): lo (now) > hi (now - 1 day)
-    lo, hi = rec["bounds"]
-    assert lo > hi
-    assert rec.get("closed") is True
-
-
-@pytest.mark.django_db
-def test_task_x_hours_mt_off_tuple_unpack_rejects_plain_task(cape_db, monkeypatch, mt_disabled):
-    """Extra proof the MT-off branch is upstream verbatim: it unpacks each row as
-    `for date, samples in res`. A single Task object (the MT-on row shape) is not
-    a 2-tuple, so the upstream unpack raises -> 500. This distinguishes the branch
-    from the new per-Task count loop."""
-    import apiv2.views as views
-    from rest_framework.test import APIClient
-
-    rec = {}
-    _install_datetime_shim(monkeypatch, views, rec)
-
-    class _NotATuple:
-        added_on = None  # single object, NOT iterable into (date, samples)
-
-    monkeypatch.setattr(views.db, "Session",
-                        lambda *a, **k: _FakeSession(rec, [_NotATuple()]), raising=False)
-
-    u = User.objects.create_user("txh_off2", "txh_off2@x.com", "x")
-    # raise_request_exception=False so the unhandled unpack TypeError surfaces as a
-    # 500 response instead of the test client re-raising it.
-    c = APIClient(raise_request_exception=False)
-    c.force_authenticate(user=u)
-    r = c.get("/apiv2/tasks/stats/")
-    assert r.status_code == 500
-
-
-@pytest.mark.django_db
-def test_task_x_hours_mt_on_corrected_bounds_and_visibility_count(cape_db, monkeypatch, mt_enabled):
-    """MT enabled => corrected 24h window (lo < hi) AND the new Python path that
-    iterates single Task objects, counting one per bucket, filtered by
-    can_view_task. Invisible tasks are skipped."""
-    import datetime as _dt
-    import apiv2.views as views
-    from rest_framework.test import APIClient
-
-    rec = {}
-    _install_datetime_shim(monkeypatch, views, rec)
-
-    class _T:
-        def __init__(self, tid, view):
-            self.id = tid
-            self._view = view
-            self.added_on = _dt.datetime(2026, 1, 1, 12, 0, 0)
-
-    rows = [_T(1, True), _T(2, False), _T(3, True)]
-    monkeypatch.setattr(views.db, "Session",
-                        lambda *a, **k: _FakeSession(rec, rows), raising=False)
-    monkeypatch.setattr(views, "can_view_task",
-                        lambda user, t: t._view, raising=False)
-
-    u = User.objects.create_user("txh_on", "txh_on@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.get("/apiv2/tasks/stats/")
-    assert r.status_code == 200, r.content
-    body = r.json()
-    assert body["error"] is False
-    # 2 visible tasks in the same minute bucket -> count 2 (invisible skipped).
-    assert sum(body["stats"].values()) == 2
-    # corrected bounds (MT-on): lo (now - 1 day) < hi (now)
-    lo, hi = rec["bounds"]
-    assert lo < hi
-
-
-# ---------------------------------------------------------------------------
-# Finding (3): _strip_mt_task_fields — Task.to_dict() now carries tenant_id +
-# visibility. MT off => strip (upstream-identical output). MT on => preserved.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.django_db
-def test_strip_mt_task_fields_mt_off_removes_keys(monkeypatch, mt_disabled):
-    import apiv2.views as views
-    d = {"id": 1, "target": "x", "tenant_id": 7, "visibility": "private"}
-    out = views._strip_mt_task_fields(d)
-    assert "tenant_id" not in out
-    assert "visibility" not in out
-    assert out["id"] == 1 and out["target"] == "x"
-
-
-@pytest.mark.django_db
-def test_strip_mt_task_fields_mt_on_preserves_keys(monkeypatch, mt_enabled):
-    import apiv2.views as views
-    d = {"id": 1, "target": "x", "tenant_id": 7, "visibility": "private"}
-    out = views._strip_mt_task_fields(d)
-    assert out["tenant_id"] == 7
-    assert out["visibility"] == "private"
-
-
-@pytest.mark.django_db
-def test_strip_mt_sample_fields_drops_source_url_when_mt_on(mt_enabled):
-    """The global (hash-deduped, ownerless) samples row's source_url is the FIRST
-    registrant's provenance -> strip it from hash-addressed / embedded sample responses
-    under MT so it can't leak to a tenant that later submits the same file."""
-    import apiv2.views as views
-    d = {"id": 1, "sha256": "a" * 64, "source_url": "https://intranet.bcorp/loader.bin"}
-    out = views._strip_mt_sample_fields(dict(d))
-    assert "source_url" not in out           # cross-tenant provenance stripped
-    assert out["sha256"] == "a" * 64          # intrinsic file fields kept
-
-
-def test_strip_mt_sample_fields_keeps_source_url_when_mt_off(monkeypatch):
-    """MT off (single-tenant): no cross-tenant concern -> upstream output verbatim."""
-    import apiv2.views as views
-    _force_mt_off(monkeypatch)
-    d = {"id": 1, "source_url": "https://x"}
-    assert views._strip_mt_sample_fields(dict(d))["source_url"] == "https://x"
-
-
-@pytest.mark.django_db
-def test_tasks_view_response_strips_mt_keys_when_off(cape_db, monkeypatch, mt_disabled):
-    """End-to-end: tasks_view must not leak tenant_id/visibility on a default
-    (MT-off) install; with MT on it does."""
-    from rest_framework.test import APIClient
-    import apiv2.views as views
-
-    class _Task:
-        def __init__(self):
-            self.id = 1
-            self.category = "file"
-            self.guest = None
-            self.sample_id = None
-            self.errors = []
-            self.status = "reported"
-            self.custom = None
-
-        def to_dict(self):
-            return {
-                "id": 1,
-                "category": "file",
-                "target": "/tmp/a.bin",
-                "status": "reported",
-                "tenant_id": 5,
-                "visibility": "private",
-            }
-
-    monkeypatch.setattr(views.apiconf, "taskview", {"enabled": True}, raising=False)
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: _Task(), raising=False)
-
-    class _Mongo:
-        enabled = False
-
-    class _RepConf:
-        mongodb = _Mongo()
-
-    monkeypatch.setattr(views, "repconf", _RepConf(), raising=False)
-    monkeypatch.setattr(views, "es_as_db", False, raising=False)
-
-    u = User.objects.create_user("tv_off", "tv_off@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.get("/apiv2/tasks/view/1/")
-    assert r.status_code == 200, r.content
-    data = r.json()["data"]
-    assert "tenant_id" not in data
-    assert "visibility" not in data
-
-
-def _td_stub(monkeypatch, deleted):
-    """Happy-path stubs for tasks_delete (single GET path): a deletable task whose SQL delete succeeds.
-    web_reporting defaults enabled -> central_delete_analysis is called; stub it out."""
-    import types
-    import apiv2.views as views
-    _t = FakeTask(user_id=1, tenant_id=None, visibility="public")
-    _t.status = "reported"
-    monkeypatch.setattr(views, "validate_task", lambda *a, **k: {"error": False}, raising=False)
-    monkeypatch.setattr(views, "can_delete_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views.db, "view_task", lambda tid: _t)
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    monkeypatch.setattr(views.db, "session",
-                        types.SimpleNamespace(commit=lambda: None, rollback=lambda: None), raising=False)
-    monkeypatch.setattr(views, "delete_folder", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(views, "central_delete_analysis", lambda *a, **k: None, raising=False)
-
-
-@pytest.mark.django_db
-def test_tasks_delete_rejects_out_of_range_and_huge_tokens(cape_db, monkeypatch):
-    """tasks_delete (single GET path) rejects a digit-only-but-out-of-range (>2**31-1), a >4300-digit
-    (int()-would-raise), and a zero token with 400 -- before view_task / int()-raise (a bodiless 500).
-    Parity with the delete_many bounds, previously untested on the single path."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    u = User.objects.create_user("td_oor", "td_oor@x.com", "x")
-    u.is_staff = True
-    u.save()
-    for tid in ("2147483648", "9" * 4301, "0", "10,2147483648"):
-        req = APIRequestFactory().get("/apiv2/tasks/delete/%s/" % tid)
-        force_authenticate(req, user=u)
-        resp = views.tasks_delete(req, tid)
-        assert resp.status_code == 400, tid
-    assert deleted == []                               # nothing deleted on any malformed/out-of-range id
-
-
-@pytest.mark.django_db
-def test_tasks_delete_zero_padded_id_accepted(cape_db, monkeypatch):
-    """A left-zero-padded but in-range id ('007', '00000000010') is ACCEPTED + normalized (7, 10), parity
-    with delete_many (comment claims parity; only delete_many had a proof before)."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    deleted = []
-    _td_stub(monkeypatch, deleted)
-    u = User.objects.create_user("td_zp", "td_zp@x.com", "x")
-    u.is_staff = True
-    u.save()
-    req = APIRequestFactory().get("/apiv2/tasks/delete/007,00000000010/")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete(req, "007,00000000010")
-    assert resp.status_code == 200
-    assert sorted(deleted) == [7, 10]                  # padded ids normalized + deleted
-
-
-@pytest.mark.django_db
-def test_tasks_delete_range_reversed_rejected_and_valid_range_deletes_each(cape_db, monkeypatch):
-    """The START-END range arm: a reversed range ('9-3') is 400 with nothing deleted; a valid range ('3-5')
-    deletes each id in [start,end]. Both range branches were untested (only the comma-list arm had pins)."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    # reversed -> 400, no delete
-    deleted = []
-    monkeypatch.setattr(views.db, "delete_task", lambda tid: deleted.append(tid) or True)
-    u = User.objects.create_user("td_rng", "td_rng@x.com", "x")
-    u.is_staff = True
-    u.save()
-    req = APIRequestFactory().get("/apiv2/tasks/delete/9-3/")
-    force_authenticate(req, user=u)
-    resp = views.tasks_delete(req, "9-3")
-    assert resp.status_code == 400 and deleted == []
-
-    # valid range -> each id deleted
-    deleted2 = []
-    _td_stub(monkeypatch, deleted2)
-    req2 = APIRequestFactory().get("/apiv2/tasks/delete/3-5/")
-    force_authenticate(req2, user=u)
-    resp2 = views.tasks_delete(req2, "3-5")
-    assert resp2.status_code == 200
-    assert sorted(deleted2) == [3, 4, 5]
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_report_store_unreachable_returns_503(cape_db, mt_enabled, monkeypatch):
-    """When db.set_task_visibility raises CuckooOperationalError (report store unreachable) the SQL change is
-    rolled back and the endpoint returns 503 (retry) -- NOT a silent 200 with the two stores diverged."""
-    from rest_framework.test import APIClient
-    from lib.cuckoo.common.exceptions import CuckooOperationalError
-    import apiv2.views as views
-
-    class T:
-        id = 1
-
-        def __init__(self):
-            self.user_id, self.tenant_id, self.visibility = 1, 10, "tenant"
-
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-    monkeypatch.setattr(views, "can_view_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views, "can_set_visibility_task", lambda u, t, v: True, raising=False)
-
-    def _raise(tid, vis, expected_prior=None):
-        raise CuckooOperationalError("report store unreachable")
-    monkeypatch.setattr(views.db, "set_task_visibility", _raise, raising=False)
-
-    u = User.objects.create_user("v503", "v503@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "public"}, format="json")
-    assert r.status_code == 503
-    assert r.json().get("error") is True
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_concurrent_change_returns_409(cape_db, mt_enabled, monkeypatch):
-    """If set_task_visibility raises CuckooVisibilityConflict (a concurrent toggle changed the row after the
-    pre-lock authorization), the endpoint returns 409 (re-read + retry) -- not a 503 and not a silent write."""
-    from rest_framework.test import APIClient
-    from lib.cuckoo.common.exceptions import CuckooVisibilityConflict
-    import apiv2.views as views
-
-    class T:
-        id = 1
-
-        def __init__(self):
-            self.user_id, self.tenant_id, self.visibility = 1, 10, "tenant"
-
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-    monkeypatch.setattr(views, "can_view_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views, "can_set_visibility_task", lambda u, t, v: True, raising=False)
-
-    def _raise(tid, vis, expected_prior=None):
-        raise CuckooVisibilityConflict("changed concurrently")
-    monkeypatch.setattr(views.db, "set_task_visibility", _raise, raising=False)
-
-    u = User.objects.create_user("v409", "v409@x.com", "x")
-    c = APIClient()
-    c.force_authenticate(user=u)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "public"}, format="json")
-    assert r.status_code == 409 and r.json().get("error") is True
-
-
-@pytest.mark.django_db
-def test_toggle_visibility_passes_expected_prior_for_cas(cape_db, mt_enabled, monkeypatch):
-    """The endpoint passes the snapshot visibility it authorized against as expected_prior, so the setter can
-    CAS-abort on a concurrent change. RED if the endpoint dropped the arg (the setter could then commit a
-    stale-authorized write)."""
-    from rest_framework.test import APIClient
-    import apiv2.views as views
-
+def test_download_from_3rdparty_scopes_cache_reuse(cape_db, mt_enabled, monkeypatch):
+    """download_from_3rdparty reuses a locally-cached sample only when the
+    requester is entitled (db.sample_path_by_hash(h, visible_to=viewer)). A
+    non-entitled tenant must NOT receive another tenant's cached bytes: the call
+    must pass the viewer and, when not entitled, fall through to the external
+    downloader as if uncached. This boundary lives in web_utils (outside the
+    by-hash VIEW gate's scan), so it had no automated test."""
+    from lib.cuckoo.common import web_utils
+    from lib.cuckoo.common.tenancy import Viewer
+
+    H = "a" * 64
     seen = {}
+    monkeypatch.setattr(web_utils.db, "sample_path_by_hash",
+                        lambda h, visible_to=None: seen.update(h=h, visible_to=visible_to) or [],
+                        raising=False)
 
-    class T:
-        id = 1
+    class _DL:   # external downloader returns a sentinel distinct from any local copy
+        def download(self, h, apikey=None):
+            return (b"EXTERNAL", "VirusTotal")
 
-        def __init__(self):
-            self.user_id, self.tenant_id, self.visibility = 1, 10, "tenant"
+    monkeypatch.setattr(web_utils, "downloader_services", _DL(), raising=False)
+    monkeypatch.setattr(web_utils, "download_file", lambda **d: ("ok", {"task_ids": [1]}), raising=False)
 
-    monkeypatch.setattr(views.db, "view_task", lambda *a, **k: T())
-    monkeypatch.setattr(views, "can_view_task", lambda u, t: True, raising=False)
-    monkeypatch.setattr(views, "can_set_visibility_task", lambda u, t, v: True, raising=False)
+    viewer = Viewer(user_id=5, tenant_id=99)
+    details = {"errors": [], "viewer": viewer, "apikey": None}
+    web_utils.download_from_3rdparty(H, "", details)
 
-    def _cap(tid, vis, expected_prior=None):
-        seen["expected_prior"] = expected_prior
-        return T()
-    monkeypatch.setattr(views.db, "set_task_visibility", _cap, raising=False)
+    assert seen.get("visible_to") is viewer            # entitlement consulted with the requester's viewer
+    assert details.get("content") == b"EXTERNAL"       # not entitled -> NOT reused local; fetched external
+    assert details.get("service") == "VirusTotal"
 
-    u = User.objects.create_user("vcas", "vcas@x.com", "x")
+
+@pytest.mark.django_db
+def test_download_from_3rdparty_reuses_when_entitled(cape_db, mt_enabled, monkeypatch):
+    """Positive control: when the viewer IS entitled (sample_path_by_hash returns
+    a path), the local cache is reused and the external downloader is NOT hit —
+    proving the gate is conditional, not blanket-blocking."""
+    from lib.cuckoo.common import web_utils
+    from lib.cuckoo.common.tenancy import Viewer
+
+    dl = {"n": 0}
+    monkeypatch.setattr(web_utils.db, "sample_path_by_hash",
+                        lambda h, visible_to=None: ["/x/sample"], raising=False)
+    monkeypatch.setattr(web_utils, "get_file_content", lambda paths: b"LOCALBYTES", raising=False)
+
+    class _DL:
+        def download(self, h, apikey=None):
+            dl["n"] += 1
+            return (b"EXTERNAL", "VirusTotal")
+
+    monkeypatch.setattr(web_utils, "downloader_services", _DL(), raising=False)
+    monkeypatch.setattr(web_utils, "download_file", lambda **d: ("ok", {"task_ids": [1]}), raising=False)
+
+    details = {"errors": [], "viewer": Viewer(user_id=5, tenant_id=99), "apikey": None}
+    web_utils.download_from_3rdparty("a" * 64, "", details)
+
+    assert details.get("service") == "Local" and details.get("content") == b"LOCALBYTES"
+    assert dl["n"] == 0     # entitled -> reused local cache, never fetched external
+
+
+# --- T11: aggregate-count endpoints reflect only the viewer's entitled scope ---
+
+def _seed_one_public_two_foreign(views):
+    """1 public task (visible to everyone) + 2 tenant-20 private tasks (foreign)."""
+    from lib.cuckoo.core.data.task import Task
+    for vis, ten, uid in [("public", None, 0), ("private", 20, 999), ("private", 20, 999)]:
+        t = Task(target="x.exe")
+        t.category = "file"
+        t.user_id, t.tenant_id, t.visibility = uid, ten, vis
+        views.db.session.add(t)
+    views.db.session.commit()
+
+
+@pytest.mark.django_db
+def test_cuckoo_status_task_counts_are_scoped(cape_db, mt_enabled, monkeypatch):
+    """cuckoo_status totals come from db.get_tasks_status_count(visible_to=viewer).
+    A tenant-less viewer must see only the public task (total 1), not all 3."""
+    from rest_framework.test import APIClient
+    import apiv2.views as views
+
+    monkeypatch.setattr(views.apiconf, "cuckoostatus", {"enabled": True}, raising=False)
+    _seed_one_public_two_foreign(views)
+
+    c = APIClient()
+    c.force_authenticate(user=User.objects.create_user("cs", "cs@x.com", "x"))  # tenant-less
+    r = c.get("/apiv2/cuckoo/status/")
+    assert r.status_code == 200, r.content
+    assert r.json()["data"]["tasks"]["total"] == 1   # only the public task is visible
+
+
+@pytest.mark.django_db
+def test_task_x_hours_counts_are_scoped(cape_db, mt_enabled, monkeypatch):
+    """task_x_hours buckets the last-24h tasks, filtering each through can_view_task.
+    A tenant-less viewer's buckets must sum to only the visible (public) task."""
+    from rest_framework.test import APIClient
+    import apiv2.views as views
+
+    _seed_one_public_two_foreign(views)
+    c = APIClient()
+    c.force_authenticate(user=User.objects.create_user("tx", "tx@x.com", "x"))  # tenant-less
+    r = c.get("/apiv2/tasks/stats/")
+    assert r.status_code == 200, r.content
+    assert sum(r.json().get("stats", {}).values()) == 1   # foreign-tenant tasks excluded
+
+
+@pytest.mark.django_db
+def test_statistics_data_passes_viewer_per_scope(cape_db, mt_enabled, monkeypatch):
+    """statistics_data: a locked-mode tenant viewer gets PER-SCOPE stats, each
+    scoped to the viewer (not the flat global call). Asserts statistics() is
+    invoked for the viewer's entitled scopes with viewer= set."""
+    from rest_framework.test import APIClient
+    from users.models import Tenant, UserProfile
+    import apiv2.views as views
+
+    calls = []
+    monkeypatch.setattr(views, "statistics",
+                        lambda days, scope=None, viewer=None: calls.append((scope, viewer)) or {},
+                        raising=False)
+    ten = Tenant.objects.create(slug="acme", name="Acme")
+    u = User.objects.create_user("sd", "sd@x.com", "x")
+    p = UserProfile.objects.get(user=u)
+    p.tenant = ten
+    p.save()
+    u = User.objects.get(pk=u.pk)
+
     c = APIClient()
     c.force_authenticate(user=u)
-    r = c.patch("/apiv2/tasks/visibility/1/", {"visibility": "public"}, format="json")
-    assert r.status_code == 200
-    assert seen.get("expected_prior") == "tenant"   # the snapshot value the authorization was computed against
-
-
-# ---------------------------------------------------------------------------
-# tasks_machine: central-mode control-plane infra read (label-only). It is NOT tenant-
-# scoped (allowlisted in the coverage gate), so its exemption is bounded by these tests:
-# it returns ONLY the pool VM label, and it is gated UNCONDITIONALLY on the model's own
-# cross-tenant authority viewer_for().is_local_admin — NOT is_staff, NOT is_superuser, and
-# NOT conditional on token_auth_enabled (token_auth off removes authentication, not
-# authorization; anonymous under MT is is_local_admin=False and must be denied here exactly
-# as every sibling per-task read denies it). Tests use the REAL viewer_for (via mt_enabled,
-# which sets local_admins_manage_all_tenants=True) so a superuser resolves is_local_admin
-# and a weakening of the gate goes RED.
-# ---------------------------------------------------------------------------
-@pytest.mark.django_db
-def test_tasks_machine_local_admin_reads_label_cross_tenant(cape_db, mt_enabled, monkeypatch):
-    """A caller with the model's cross-tenant authority (viewer_for().is_local_admin — the
-    central service identity) reads a task's analysis-VM label EVEN for another tenant's
-    private task; the single cross-tenant read tasks_machine allows. Bounded to the label."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    svc = User.objects.create_user("svc_admin", "svc@x.com", "x")
-    svc.is_superuser = True  # + mt_enabled's local_admins_manage_all_tenants => is_local_admin
-    svc.save()
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/")
-    force_authenticate(req, user=svc)
-    resp = views.tasks_machine(req, "1")
-    assert resp.data.get("error") is False
-    assert resp.data.get("machine") == "win11_seabios_107"
-
-
-@pytest.mark.django_db
-def test_tasks_machine_is_staff_alone_gets_generic_404(cape_db, mt_enabled, monkeypatch):
-    """is_staff is NOT the model's cross-tenant authority. A real is_staff (non-superuser)
-    principal resolves to is_local_admin=False, so it gets the SAME generic 404 as a missing
-    task: no cross-tenant VM label, no existence oracle. Real viewer_for => a regression to
-    an is_staff gate goes RED."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    u = User.objects.create_user("svc_staff_only", "p@x.com", "x")
-    u.is_staff = True  # staff but NOT superuser => is_local_admin False
-    u.save()
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/")
-    force_authenticate(req, user=u)
-    resp = views.tasks_machine(req, "1")
-    assert resp.status_code == 404
-    assert "machine" not in resp.data
-
-
-@pytest.mark.django_db
-def test_tasks_machine_anonymous_denied_under_mt(cape_db, mt_enabled, monkeypatch):
-    """SECURITY PIN (the [HIGH]): the in-function authorization gate denies an UNAUTHENTICATED
-    caller under MT — the least-privileged principal (no shared secret presented, is_local_admin
-    =False) — with the SAME generic 404 as a missing task, EVEN for an existing private task, so
-    there is no cross-tenant label leak and no existence oracle. This calls the view function
-    directly, exercising that gate in isolation: the result does NOT depend on token_auth_enabled,
-    because the gate never keys off it. A regression to a token_auth_enabled-conditional gate (the
-    original [HIGH]) would return the label here under token_auth_enabled=no and go RED. (At the
-    DRF dispatch layer a token_auth_enabled=yes install additionally 403s anonymous before reaching
-    here — an earlier denial, not a weaker one.)"""
-    from rest_framework.test import APIRequestFactory
-    import apiv2.views as views
-
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/")  # no auth -> AnonymousUser
-    resp = views.tasks_machine(req, "1")
-    assert resp.status_code == 404
-    assert "machine" not in resp.data
-
-
-@pytest.mark.django_db
-def test_tasks_machine_denied_and_missing_are_indistinguishable(cape_db, mt_enabled, monkeypatch):
-    """The ALLOWLIST justification rests on 'a non-authorized caller gets the SAME generic
-    404 as a missing task, so it can't enumerate ids'. Pin it: the DENIED response (anon,
-    task exists) is byte-identical to the MISSING response (local-admin, view_task -> None),
-    both 404. Also covers the missing-task branch, which otherwise had zero coverage."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    # denied: anonymous, task EXISTS
-    monkeypatch.setattr(views.db, "view_task", lambda tid: FakeTask(user_id=9, tenant_id=1, visibility="private"))
-    denied = views.tasks_machine(APIRequestFactory().get("/apiv2/tasks/machine/1/"), "1")
-    # missing: local-admin caller, task DOES NOT EXIST
-    monkeypatch.setattr(views.db, "view_task", lambda tid: None)
-    admin = User.objects.create_user("svc_adm2", "a2@x.com", "x")
-    admin.is_superuser = True
-    admin.save()
-    mreq = APIRequestFactory().get("/apiv2/tasks/machine/2/")
-    force_authenticate(mreq, user=admin)
-    missing = views.tasks_machine(mreq, "2")
-    assert denied.status_code == 404 and missing.status_code == 404
-    assert denied.data == missing.data  # indistinguishable -> no existence oracle
-
-
-@pytest.mark.django_db
-def test_tasks_machine_returns_only_label(cape_db, mt_enabled, monkeypatch):
-    """The response surface MUST stay minimal ({error, machine, vnc_port}) — the coverage-gate
-    exemption is only safe because the payload is just the pool VM label + its VNC port (both
-    infra facts about a pool VM, never analysis content / target / tenant metadata). vnc_port is
-    resolved LOCALLY on the worker so the central node needn't open the worker's libvirt over SSH;
-    here libvirt is absent so it is None."""
-    from rest_framework.test import APIRequestFactory, force_authenticate
-    import apiv2.views as views
-
-    t = FakeTask(user_id=1, tenant_id=10, visibility="public")
-    t.machine = "win11_seabios_101"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    svc = User.objects.create_user("svc_only", "o@x.com", "x")
-    svc.is_superuser = True
-    svc.save()
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/")
-    force_authenticate(req, user=svc)
-    resp = views.tasks_machine(req, "1")
-    assert set(resp.data.keys()) == {"error", "machine", "vnc_port"}
-    assert resp.data["machine"] == "win11_seabios_101"
-
-
-@pytest.mark.django_db
-def test_tasks_machine_mt_off_allows_single_tenant(cape_db, mt_disabled, monkeypatch):
-    """Back-compat: with MT OFF, viewer_for marks every principal is_local_admin (legacy
-    single-tenant / AllowAny see-all), so the label read works for any caller — the gate is
-    a no-op exactly like every other tenancy check on a non-MT install."""
-    from rest_framework.test import APIRequestFactory
-    import apiv2.views as views
-
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/")  # even anonymous: MT-off => see-all
-    resp = views.tasks_machine(req, "1")
-    assert resp.data.get("error") is False
-    assert resp.data.get("machine") == "win11_seabios_107"
-
-
-def _tm_set_cp(monkeypatch, views, secret):
-    """Configure [api] control_plane_token for tasks_machine (it reads apiconf.api.get)."""
-    import types
-    monkeypatch.setattr(
-        views.apiconf, "api",
-        types.SimpleNamespace(get=lambda k, d=None: secret if k == "control_plane_token" else d),
-        raising=False,
-    )
-
-
-@pytest.mark.django_db
-def test_tasks_machine_control_plane_secret_authorizes(cape_db, mt_enabled, monkeypatch):
-    """The control plane presenting the configured [api] control_plane_token shared secret
-    reads the label EVEN when anonymous under token_auth_enabled=no (the poc2 posture) — the
-    m2m auth path for interactive attach. Still label-only."""
-    from rest_framework.test import APIRequestFactory
-    import apiv2.views as views
-
-    _tm_set_cp(monkeypatch, views, "s3cr3t-cp-token")
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/", HTTP_AUTHORIZATION="Token s3cr3t-cp-token")  # anonymous
-    resp = views.tasks_machine(req, "1")
-    assert resp.data.get("error") is False
-    assert resp.data.get("machine") == "win11_seabios_107"
-    assert set(resp.data.keys()) == {"error", "machine", "vnc_port"}
-
-
-@pytest.mark.django_db
-def test_tasks_machine_wrong_control_plane_secret_denied(cape_db, mt_enabled, monkeypatch):
-    """A WRONG bearer with a configured secret gets the generic 404 — no guess/bypass, no
-    fallback to == or is_staff. (Anonymous, so the is_local_admin fallback also denies.)"""
-    from rest_framework.test import APIRequestFactory
-    import apiv2.views as views
-
-    _tm_set_cp(monkeypatch, views, "s3cr3t-cp-token")
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/", HTTP_AUTHORIZATION="Token WRONG")  # anonymous
-    resp = views.tasks_machine(req, "1")
-    assert resp.status_code == 404
-    assert "machine" not in resp.data
-
-
-@pytest.mark.django_db
-def test_tasks_machine_empty_secret_disables_shared_path(cape_db, mt_enabled, monkeypatch):
-    """FAIL-CLOSED: an EMPTY configured secret disables the shared-secret path entirely (no
-    '' == '' match), so an anonymous caller — even presenting an empty bearer — falls through
-    to the is_local_admin gate and is denied."""
-    from rest_framework.test import APIRequestFactory
-    import apiv2.views as views
-
-    _tm_set_cp(monkeypatch, views, "")  # secret unset
-    t = FakeTask(user_id=999, tenant_id=10, visibility="private")
-    t.machine = "win11_seabios_107"
-    monkeypatch.setattr(views.db, "view_task", lambda tid: t)
-    req = APIRequestFactory().get("/apiv2/tasks/machine/1/", HTTP_AUTHORIZATION="Token ")  # empty bearer, anonymous
-    resp = views.tasks_machine(req, "1")
-    assert resp.status_code == 404
-    assert "machine" not in resp.data
+    r = c.get("/apiv2/tasks/statistics/7/")
+    assert r.status_code == 200, r.content
+    assert calls, "statistics() was not called"
+    assert all(scope in ("public", "tenant", "mine") for scope, _ in calls)  # per-scope, not flat global
+    assert all(viewer is not None for _, viewer in calls)                    # every call scoped to the viewer

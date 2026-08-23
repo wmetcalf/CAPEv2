@@ -1,0 +1,38 @@
+#!/bin/sh
+# cape-core postrm: stop services on remove/purge.
+
+set -e
+
+case "$1" in
+    remove|purge)
+        for svc in cape.service cape-web.service cape-rooter.service \
+                   cape-processor.service guac-web.service; do
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+        done
+        systemctl daemon-reload || true
+
+        # Clean up the poetry wrapper postinst installed at
+        # /etc/poetry/bin/poetry.  Leave /etc/poetry/config.toml alone
+        # on `remove` (operator may have customized it); purge clears it.
+        rm -f /etc/poetry/bin/poetry
+        rmdir /etc/poetry/bin 2>/dev/null || true
+        if [ "$1" = "purge" ]; then
+            rm -f /etc/poetry/config.toml
+            rmdir /etc/poetry 2>/dev/null || true
+        fi
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        # No action.
+        ;;
+
+    *)
+        echo "cape-core postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

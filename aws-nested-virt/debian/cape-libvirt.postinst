@@ -1,0 +1,63 @@
+#!/bin/sh
+# cape-libvirt postinst: refresh the dynamic loader cache, kick the
+# libvirt sockets, reload apparmor for the new per-domain templates.
+#
+# We DON'T restart libvirtd on configure: doing so kills any qemu
+# domain currently running on the host (CAPE-managed analysis VMs).
+# systemd socket activation re-spawns libvirtd cleanly on next API
+# call so existing connections that drop reconnect naturally; new
+# clients pick up the new binary.
+
+set -e
+
+case "$1" in
+    configure)
+        # ldconfig: libvirt.so.0 is a new shared library file from
+        # this deb; without re-running ldconfig, /etc/ld.so.cache
+        # still points at the apt libvirt.so.0 (when we replaced it
+        # in-place via Replaces:) which would be the Ubuntu 10.x
+        # binary if dpkg's purge timing put us in a window.
+        ldconfig
+
+        # Stop+disable the apt-shipped libvirtd if it's still hanging
+        # around (Conflicts: only triggers removal during install if
+        # apt was used; manual dpkg -i won't purge it).
+        for unit in libvirt-bin libvirtd libvirtd-tls libvirtd-tcp; do
+            if systemctl is-enabled "$unit.service" >/dev/null 2>&1; then
+                systemctl disable "$unit.service" 2>/dev/null || true
+            fi
+        done
+
+        systemctl daemon-reload || true
+
+        # Reload our apparmor profile + abstractions so the new
+        # libvirt's per-domain confinement uses our shipped templates.
+        if [ -f /etc/apparmor.d/usr.sbin.libvirtd ] \
+            && command -v apparmor_parser >/dev/null 2>&1; then
+            apparmor_parser -r /etc/apparmor.d/usr.sbin.libvirtd 2>/dev/null || \
+                echo "cape-libvirt: apparmor_parser -r libvirtd failed; profile not active" >&2
+        fi
+
+        # Socket-activated: enable libvirtd.socket so any first virsh/
+        # libvirt-glib call wakes libvirtd. Don't `start` it here —
+        # operator/cape-core triggers it.
+        if [ -f /lib/systemd/system/libvirtd.socket ]; then
+            systemctl enable libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket 2>/dev/null || true
+        fi
+        if [ -f /lib/systemd/system/virtlogd.socket ]; then
+            systemctl enable virtlogd.socket 2>/dev/null || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "cape-libvirt postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

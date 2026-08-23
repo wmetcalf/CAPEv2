@@ -84,22 +84,25 @@ class ElasticSearchDB(Report):
         report["info"]["ended"] = (
             datetime.strptime(info["ended"], "%Y-%m-%d %H:%M:%S") if isinstance(info["ended"], str) else info["ended"]
         )
-        # machine peut être absent (analyse statique) ou None
-        if isinstance(info.get("machine"), dict):
-            for k in ("started_on", "shutdown_on"):
-                if isinstance(info["machine"].get(k), str):
-                    report["info"]["machine"][k] = datetime.strptime(info["machine"][k], "%Y-%m-%d %H:%M:%S")
+        report["info"]["machine"]["started_on"] = (
+            datetime.strptime(info["machine"]["started_on"], "%Y-%m-%d %H:%M:%S")
+            if isinstance(info["machine"]["started_on"], str)
+            else info["machine"]["started_on"]
+        )
+        report["info"]["machine"]["shutdown_on"] = (
+            datetime.strptime(info["machine"]["shutdown_on"], "%Y-%m-%d %H:%M:%S")
+            if isinstance(info["machine"]["shutdown_on"], str)
+            else info["machine"]["shutdown_on"]
+        )
 
-        for dropped in report.get("dropped") or []:
-            if isinstance(dropped, dict) and isinstance(dropped.get("pe"), dict):
-                pe = dropped["pe"]
-                if isinstance(pe.get("timestamp"), str):
-                    pe["timestamp"] = datetime.strptime(pe["timestamp"], "%Y-%m-%d %H:%M:%S")
+        for dropped in report["dropped"]:
+            if "pe" in dropped:
+                dropped["pe"]["timestamp"] = datetime.strptime(dropped["pe"]["timestamp"], "%Y-%m-%d %H:%M:%S")
 
     # Fix signatures from string to list in order to have a common mapping
     def fix_signature_results(self, report):
-        for s in report.get("signatures") or []:
-            for f in s.get("data") or []:
+        for s in report["signatures"]:
+            for f in s["data"]:
                 for k, val in f.items():
                     if isinstance(val, (str, bool)):
                         f[k] = {"name": str(val)}
@@ -108,17 +111,15 @@ class ElasticSearchDB(Report):
                             val[index] = {"name": file}
 
     def fix_suricata_http_status(self, report):
-        suricata = report.get("suricata")
-        if isinstance(suricata, dict):
-            for http in suricata.get("http") or []:
-                if isinstance(http, dict) and http.get("status") == "None":
+        if "http" in report["suricata"]:
+            for http in report["suricata"]["http"]:
+                if http["status"] == "None":
                     http["status"] = None
 
     def fix_cape_payloads(self, report):
-        cape = report.get("CAPE")
-        if isinstance(cape, dict):
-            for p in cape.get("payloads") or []:
-                if isinstance(p, dict) and p.get("tlsh") is False:
+        if "CAPE" in report:
+            for p in report["CAPE"]["payloads"]:
+                if p["tlsh"] is False:
                     p["tlsh"] = None
 
     def convert_procdump_strings_to_str(self, report):
@@ -166,7 +167,7 @@ class ElasticSearchDB(Report):
         new_processes = insert_calls(report, elastic_db=elastic_handler)
 
         # Store the results in the report.
-        report["behavior"] = dict(report.get("behavior") or {})
+        report["behavior"] = dict(report["behavior"])
         report["behavior"]["processes"] = new_processes
 
         delete_analysis_and_related_calls(report["info"]["id"])

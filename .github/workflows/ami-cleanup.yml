@@ -1,0 +1,249 @@
+name: ami-cleanup
+
+# Daily cron-driven sweep of cape-host-base AMIs.  Keeps:
+#   1. Original baseline   (oldest cape-host-base with Retention=keep)
+#   2. Last 2 most recent  (by CreationDate)
+#   3. Currently deployed  (whatever's in terraform/nestedvirt-ami/
+#                           terraform.tfvars source_ami_id — resolved
+#                           from the IaC repo at runtime; falls back
+#                           to "skip this protection" on lookup error,
+#                           so the AMI is then subject to recency
+#                           rules only)
+#
+# Deregisters everything else AND deletes the backing EBS snapshots
+# (deregister alone leaves the snapshot at ~$50/mo per snapshot —
+# entire reason we hit $5,780/mo before the 2026-05-22 manual cleanup).
+#
+# Fail-safe: any AWS describe error in the keep-list computation
+# exits without deleting anything.  Over-retain by a day > destroy a
+# rollback target on transient API hiccup.
+#
+# Cron: 17 7 * * * (daily 07:17 UTC) — after the daily threat-content
+# cron rebuild storm has settled (clamav-mirror q4h + suricata-rules
+# q6h fire on the :13/:23 marks).  Sweep at :17 means it sees the
+# post-build state, not a mid-flight AMI mid-tagging.
+#
+# Triggers:
+#   - schedule (daily)
+#   - workflow_dispatch with dry_run input (operator inspection)
+#   - push to this file (test new logic before going live)
+#
+# Required secrets:
+#   AMI_CLEANUP_ROLE_ARN  OIDC role: ec2:DescribeImages, DescribeTags,
+#                         DeregisterImage, DescribeSnapshots,
+#                         DeleteSnapshot.  Same trust policy as
+#                         AMI_BAKE_ROLE_ARN but scoped to read+delete
+#                         (no run-instances).
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print the delete plan without executing'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ami-cleanup.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ami-cleanup
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AMI_CLEANUP_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve currently-deployed AMI from live instance
+        # Look up the AMI ID of the currently-running nestedvirt-ami
+        # host directly from EC2.  This is the source of truth for
+        # what's deployed — more reliable than parsing tfvars (which
+        # isn't checked into git anyway).  Falls through to empty on
+        # lookup error, in which case the keep-list step falls back
+        # to recency-only protection.
+        id: deployed
+        run: |
+          set -uo pipefail
+          deployed_ami=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=capev2-dev-nestedvirt-ami-host" \
+                        "Name=instance-state-name,Values=running,pending" \
+              --query 'Reservations[*].Instances[*]|[][] | sort_by(@, &LaunchTime) | [-1].ImageId' \
+              --output text 2>/dev/null || echo "")
+          # describe-instances returns "None" when no instance matches;
+          # treat that the same as empty.
+          [ "$deployed_ami" = "None" ] && deployed_ami=""
+          echo "deployed_ami=$deployed_ami" >> "$GITHUB_OUTPUT"
+          if [ -n "$deployed_ami" ]; then
+              echo "::notice::deployed AMI (per live instance): $deployed_ami"
+          else
+              echo "::warning::no running nestedvirt-ami-host found — falling back to recency-only protection"
+          fi
+
+      - name: Compute keep + delete lists
+        id: plan
+        # Default GHA shell is `bash -eo pipefail {0}`.  Switch to
+        # `bash {0}` for THIS step only — the script does its own
+        # error-handling via `|| true` on the expected-non-zero
+        # branches (grep -v with all-match, [-n ""] guards, etc.)
+        # and `set -eo pipefail` would abort on those even when
+        # they're semantically fine.
+        shell: bash {0}
+        env:
+          DEPLOYED_AMI: ${{ steps.deployed.outputs.deployed_ami }}
+        run: |
+          set -uo pipefail
+
+          # Pull every cape-host-base AMI sorted oldest-first.  jq's
+          # sort_by is stable so ties (same-second creation) preserve
+          # describe-images natural order.
+          aws ec2 describe-images --owners self \
+              --filters "Name=tag:Purpose,Values=cape-host-base" \
+                        "Name=state,Values=available" \
+              --query 'Images[*].{id:ImageId,date:CreationDate,retention:Tags[?Key==`Retention`]|[0].Value}' \
+              --output json > /tmp/all-amis.json
+
+          total=$(jq 'length' /tmp/all-amis.json)
+          echo "::notice::found $total cape-host-base AMIs"
+
+          if [ "$total" -lt 1 ]; then
+              echo "::warning::no AMIs to inspect — nothing to do"
+              echo "keep=[]"   >> "$GITHUB_OUTPUT"
+              echo "delete=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          # Original baseline = oldest cape-host-base with
+          # Retention=keep tag.  Falls back to oldest overall if no AMI
+          # carries the tag (legacy bakes pre-2026-05).
+          original=$(jq -r \
+              '[.[] | select(.retention=="keep")] | sort_by(.date) | .[0].id // (sort_by(.date) | .[0].id)' \
+              /tmp/all-amis.json)
+
+          # Last 2 newest by CreationDate
+          last2=$(jq -r 'sort_by(.date) | reverse | .[0:2] | .[].id' /tmp/all-amis.json)
+
+          # Build keep-set: original + last 2 + deployed.  Use an if
+          # block (not `[ -n ] && echo`) so an empty DEPLOYED_AMI
+          # doesn't propagate exit-1 through the subshell — caught in
+          # earlier testing where tfvars wasn't readable
+          # via GitHub API (file is operator-managed, not in git),
+          # DEPLOYED_AMI came back empty, the `&&` branch returned
+          # 1, and `set -e` (then default) aborted the step.
+          keep_set=$(
+              {
+                  echo "$original"
+                  echo "$last2"
+                  if [ -n "$DEPLOYED_AMI" ]; then echo "$DEPLOYED_AMI"; fi
+              } | sort -u | grep -v '^$'
+          )
+
+          # Delete = every AMI not in keep_set.  grep -v with no
+          # matches exits 1 — handled by `|| true`.  Also handle the
+          # case where keep_set is empty (shouldn't happen, but
+          # defensive: an empty -f pattern file matches everything,
+          # making the inversion delete nothing).
+          if [ -z "$keep_set" ]; then
+              echo "::error::keep_set computed empty — refusing to delete anything"
+              exit 1
+          fi
+          delete=$(jq -r '.[].id' /tmp/all-amis.json \
+              | grep -vxF -f <(echo "$keep_set") \
+              || true)
+
+          echo ""
+          echo "=== KEEP ==="
+          echo "$keep_set" | while read ami; do
+              date=$(jq -r --arg a "$ami" '.[] | select(.id==$a) | .date' /tmp/all-amis.json)
+              reason=""
+              [ "$ami" = "$original"     ] && reason="${reason}original "
+              [ "$ami" = "$DEPLOYED_AMI" ] && reason="${reason}deployed "
+              echo "$last2" | grep -qxF "$ami" && reason="${reason}recent "
+              printf '  %s  %s  [%s]\n' "$date" "$ami" "${reason%% }"
+          done
+
+          echo ""
+          echo "=== DELETE ==="
+          if [ -z "$delete" ]; then
+              echo "  (none)"
+          else
+              echo "$delete" | while read ami; do
+                  date=$(jq -r --arg a "$ami" '.[] | select(.id==$a) | .date' /tmp/all-amis.json)
+                  snap=$(aws ec2 describe-images --image-ids "$ami" \
+                      --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' \
+                      --output text 2>/dev/null || echo "")
+                  printf '  %s  %s  snap=%s\n' "$date" "$ami" "$snap"
+              done
+          fi
+
+          # Emit the delete list as a newline-separated env var the
+          # next step can iterate without parsing JSON again.
+          {
+              echo "delete_amis<<DELETE_EOF"
+              echo "$delete"
+              echo "DELETE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Execute deletions
+        # Skip when triggered from workflow_dispatch with dry_run=true,
+        # OR when there's nothing to delete.  Cron + push paths always
+        # execute.
+        if: ${{ steps.plan.outputs.delete_amis != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          set -uo pipefail
+          dereg=0
+          dereg_fail=0
+          snap_del=0
+          snap_fail=0
+          while IFS= read -r ami; do
+              [ -z "$ami" ] && continue
+              snap=$(aws ec2 describe-images --image-ids "$ami" \
+                  --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' \
+                  --output text 2>/dev/null || echo "")
+              if aws ec2 deregister-image --image-id "$ami" 2>>/tmp/cleanup.err; then
+                  echo "  deregistered $ami"
+                  dereg=$((dereg+1))
+              else
+                  echo "  FAILED deregister $ami"
+                  dereg_fail=$((dereg_fail+1))
+                  continue
+              fi
+              if [ -n "$snap" ] && [ "$snap" != "None" ]; then
+                  if aws ec2 delete-snapshot --snapshot-id "$snap" 2>>/tmp/cleanup.err; then
+                      echo "    deleted $snap"
+                      snap_del=$((snap_del+1))
+                  else
+                      echo "    FAILED delete $snap"
+                      snap_fail=$((snap_fail+1))
+                  fi
+              fi
+          done <<< "${{ steps.plan.outputs.delete_amis }}"
+          echo ""
+          echo "::notice::deregistered $dereg AMIs (failed $dereg_fail); deleted $snap_del snapshots (failed $snap_fail)"
+          if [ "$dereg_fail" -gt 0 ] || [ "$snap_fail" -gt 0 ]; then
+              echo "::warning::partial failures — see /tmp/cleanup.err in job artifacts (not uploaded for cost reasons; check the step log above)"
+              cat /tmp/cleanup.err >&2
+              # Don't hard-fail the workflow — a single API blip
+              # shouldn't keep alerting until next day's run.  Treat
+              # as a notice instead of an error.
+          fi
+
+      - name: Dry-run notice
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          echo "::notice::dry_run=true — no AMIs deleted.  Re-run with dry_run=false to execute the plan above."

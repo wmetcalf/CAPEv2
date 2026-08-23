@@ -1,0 +1,22 @@
+#!/bin/bash
+# /etc/networkd-dispatcher/routable.d/50-cape-fakenet
+#
+# Allow forwarding between virbr100 (CAPE VM bridge) and br-fakenet
+# (FakeNet-NG container bridge).  Conntrack handles reverse-NAT
+# transparently so VMs see original dest IPs.
+#
+# Fires when networkd reports virbr100 enters routable state — typical
+# on host boot after libvirt brings the cape-100 net up.  The dispatcher
+# also re-runs the hook for any other interface that becomes routable;
+# the IFACE check below scopes it to virbr100.
+#
+# Mirrors the rules `setup-host.sh` from the legacy bootstrap installed
+# manually.  Shipped here by cape-fakenet.deb so a fresh AMI doesn't
+# need any operator step to wire FakeNet routing.
+
+if [ "$IFACE" = "virbr100" ]; then
+    if ! iptables -C FORWARD -i virbr100 -o br-fakenet -d 172.28.100.2 -j ACCEPT -m comment --comment "CAPE-fakenet" 2>/dev/null; then
+        iptables -I FORWARD -i virbr100 -o br-fakenet -d 172.28.100.2 -j ACCEPT -m comment --comment "CAPE-fakenet"
+        iptables -I FORWARD -i br-fakenet -o virbr100 -s 172.28.100.2 -j ACCEPT -m comment --comment "CAPE-fakenet"
+    fi
+fi

@@ -1,0 +1,55 @@
+# cape-signatures: content from kevoreilly/community subtree.
+# Lands under the same /opt/CAPEv2/ tree that cape-core ships into;
+# debian/rules's override_dh_install handles file-level collisions
+# (community wins on the 3 yara files where both subtrees overlap;
+# see the "community wins" strip block in debian/rules for the list).
+
+# Python modules (behavior signatures + the CAPE/MWCP config decoders).
+community/modules/signatures   /opt/CAPEv2/modules/
+community/modules/parsers      /opt/CAPEv2/modules/
+
+# Sigma processing module (the producer that runs Zircolite over the
+# guest EVTX/Sysmon logs and populates results["sigma"]).  Shipped as a
+# single file rather than the whole community/modules/processing/ dir:
+# that dir also carries loldrivers/autoruns/cif/hollowshunter/etc which
+# we don't want silently shipped (they'd sit dormant since their config
+# sections aren't enabled, but after the mitre/pyattck incident we keep
+# net-new processing modules opt-in + scoped).  sigma.py lands beside
+# cape-core's modules/processing/__init__.py (different filename, no
+# dpkg conflict).  Enabled via the [sigma] section + cape-host-config.
+community/modules/processing/sigma.py   /opt/CAPEv2/modules/processing/
+
+# Data overlays.  Each subdir below comes from the upstream community
+# repo and corresponds to what `utils/community.py -cr` would copy on
+# a fresh install:
+#
+#   data/yara/    — CAPE/ (behavior YARA, 479 rules) + binaries/ (28).
+#                   Adds to cape-core's in-tree 111 CAPE rules + 2
+#                   binaries rules.  Community wins where filenames
+#                   overlap (DarkCloud.yar, NetSupport.yar in CAPE/,
+#                   HeavensGate.yar in binaries/ — see debian/rules).
+#   data/sigma/   — Just filters.json (signature noise-suppression
+#                   config).  The sigma RULES themselves live in
+#                   cape-sigma-rules.deb (Zircolite upstream, hourly
+#                   rebuild) — no filename overlap.
+#
+# NOT shipped (broken upstream — DO NOT RE-ADD without fixing pyattck):
+#   data/mitre/   — MITRE ATT&CK + NIST mapping JSONs.  Shipping these
+#                   activates cape's [mitre] reporting module (which
+#                   conditionally runs on presence of the data dir),
+#                   which uses the pyattck library.  pyattck calls
+#                   `requests.api.request(..., nested_techniques=True)`
+#                   in its Configuration.__download_url_data step,
+#                   and `requests.Session.request()` rejects the
+#                   `nested_techniques` kwarg → TypeError → the whole
+#                   reporting stage fails → task ends in
+#                   `failed_reporting` status, smoke gate fails.
+#                   Caught on a validation deploy 2026-06-02 against
+#                   the baked AMI.  Re-add when pyattck is
+#                   pinned/patched to either consume nested_techniques
+#                   internally or read from local files without HTTP
+#                   request (the local data files DO exist after this
+#                   overlay, but pyattck's Configuration doesn't point
+#                   at them).
+community/data/yara            /opt/CAPEv2/data/
+community/data/sigma           /opt/CAPEv2/data/

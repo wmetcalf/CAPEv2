@@ -1,0 +1,144 @@
+name: qemu-build
+
+# Builds the patched QEMU + SeaBIOS .deb (cape-qemu) from source.
+# Triggers on changes under aws-nested-virt/qemu-build/ or
+# aws-nested-virt/debian/cape-qemu.* (or manual workflow_dispatch).
+#
+# QEMU 9.2.4 cold compile is ~25 min on the standard GHA runner.
+# actions/cache stores the populated DESTDIR keyed on the build-input
+# hash, so re-runs from the same inputs (workflow yaml + scripts +
+# version) skip the compile entirely and re-run package.sh in seconds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/qemu-build/**'
+      - 'aws-nested-virt/debian/cape-qemu.*'
+      - '.github/workflows/qemu-build.yml'
+  workflow_dispatch:
+    inputs:
+      qemu_version:
+        description: 'Upstream QEMU version (default 9.2.4)'
+        type: string
+        required: false
+        default: '9.2.4'
+      cape_revision:
+        description: 'Package revision suffix (e.g. "1" → 9.2.4+cape.1)'
+        type: string
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ubuntu:24.04
+    env:
+      QEMU_VERSION: ${{ inputs.qemu_version || '9.2.4' }}
+      CAPE_REVISION: ${{ inputs.cape_revision || '1' }}
+      DESTDIR: ${{ github.workspace }}/build/cape-qemu-destdir
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install QEMU build toolchain
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          # QEMU build deps + SeaBIOS build deps + python (for SeaBIOS make).
+          # libaio-dev + liburing-dev satisfy --enable-linux-aio +
+          # --enable-linux-io-uring in aws-nested-virt/qemu-build/build.sh.  Configure
+          # ERRORS hard without them — by design, so this list cannot
+          # silently drift from the configure flags.  Adding native AIO
+          # is what fixes the "aio=native was specified, but is not
+          # supported in this build" failure that left all 24 clones
+          # unstartable on the first deb-baked AMI deploy to the reference host.
+          apt-get install -y -qq --no-install-recommends \
+              build-essential meson ninja-build pkg-config \
+              python3 python3-venv python3-pip python3-yaml python3-tomli \
+              libglib2.0-dev libpixman-1-dev libcap-ng-dev libssh-dev \
+              libsdl2-dev libusb-1.0-0-dev \
+              libusbredirhost-dev libusbredirparser-dev \
+              libnuma-dev libsasl2-dev libgnutls28-dev nettle-dev \
+              libcurl4-gnutls-dev libslirp-dev libsnappy-dev \
+              libgcrypt20-dev libxml2-dev libpcre2-dev liblzo2-dev \
+              libnbd-dev libudev-dev \
+              libaio-dev liburing-dev \
+              flex bison \
+              acpica-tools \
+              git curl ca-certificates dpkg-dev fakeroot file xz-utils
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Mark workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute cache key
+        id: cachekey
+        run: |
+          set -euo pipefail
+          h=$(cat \
+                aws-nested-virt/qemu-build/build.sh \
+                aws-nested-virt/qemu-build/package.sh \
+                aws-nested-virt/qemu-build/patches.sh \
+                aws-nested-virt/debian/cape-qemu.install \
+                aws-nested-virt/debian/cape-qemu.postinst \
+                <(echo "$QEMU_VERSION") \
+              | sha256sum | awk '{print $1}')
+          echo "key=qemu-destdir-${h:0:16}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DESTDIR cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DESTDIR }}
+          key: ${{ steps.cachekey.outputs.key }}
+
+      - name: Compile QEMU + SeaBIOS (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$DESTDIR"
+          cd aws-nested-virt && bash qemu-build/build.sh
+
+      - name: Sanity-check cached DESTDIR (cache hit)
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          test -x "$DESTDIR/usr/bin/qemu-system-x86_64" \
+            || { echo "::error::cached DESTDIR missing qemu-system-x86_64"; exit 1; }
+          if strings "$DESTDIR/usr/bin/qemu-system-x86_64" | grep -q 'KVMKVMKVM'; then
+              echo "::error::cached qemu still contains KVMKVMKVM — patches didn't take"
+              exit 1
+          fi
+
+      - name: Build cape-qemu.deb
+        env:
+          PACKAGE_VERSION: ${{ env.QEMU_VERSION }}+cape.${{ env.CAPE_REVISION }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          cd aws-nested-virt && bash qemu-build/package.sh
+          ls -la "$OUT_DIR"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-qemu-debs-${{ github.sha }}
+          path: aws-nested-virt/dist/cape-qemu_*.deb
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,44 @@
+.DS_Store
+*.swp
+*.tmp
+*.log
+.claude/
+
+# Local build artifacts
+dist/
+*.deb
+*.dsc
+*.changes
+*.buildinfo
+*.tar.gz
+*.tar.xz
+
+# debian/ build state
+debian/.debhelper/
+debian/files
+debian/cape-core/
+debian/cape-signatures/
+debian/cape-qemu/
+debian/cape-suricata/
+debian/cape-core.substvars
+debian/cape-signatures.substvars
+debian/cape-qemu.substvars
+debian/cape-suricata.substvars
+debian/debhelper-build-stamp
+
+# Frozen requirements gen'd from poetry export
+debian/cape-core/requirements.txt
+
+# SDD ledger + local apt-repo build dirs
+.superpowers/
+out/
+.aptly/
+
+# Terraform local state (cape-deb-e2e test stacks under terraform/test/)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+terraform.tfvars
+*.auto.tfvars

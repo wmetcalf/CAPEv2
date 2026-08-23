@@ -1,0 +1,275 @@
+name: cape-build
+
+# Builds cape-core + cape-signatures from this source package.
+# cape-qemu, cape-suricata, and (eventually) cape-seabios are NOT built
+# here — they have dedicated workflows that fire only on changes to
+# their respective source dirs, so cape-core/cape-signatures rebuilds
+# don't pay the 25-min QEMU compile every push. apt-publish.yml fans
+# the artifacts in.
+#
+# Triggers:
+#   - Tag push (v*) for releases
+#   - Manual dispatch for ad-hoc validation
+#   - Push to main when the CAPE source (now the repo root),
+#     community/, aws-nested-virt/scripts/, or the cape-core/signatures
+#     debian metadata (under aws-nested-virt/debian/) changes
+#
+# aws-nested-virt/scripts/ is included because
+# aws-nested-virt/debian/cape-core.install ships its contents to
+# /opt/CAPEv2/scripts/ (ami-bake-clone-phase.sh + clone-win11-vms.sh +
+# friends).  Without this, edits to those scripts merged via PR don't
+# trigger a rebuild, the cape-core deb in dev stays stale, and
+# apt-publish never fires the e2e/promote chain — caught when an
+# earlier clone-win11-vms.sh kvm.conf fix sat idle waiting for a
+# workflow trigger that didn't match.
+#
+# Phase 2 spec: docs/superpowers/specs/2026-05-06-cape-core-deb-design.md
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths:
+      # CAPE source is now the repo root (the cape/ prefix is gone in the
+      # 1a fork layout), so its top-level source dirs live at the root.
+      # Enumerated rather than a bare '**' so an edit to a repo doc or a
+      # sibling pipeline dir (aws-nested-virt/**) doesn't spuriously kick
+      # off the whole deb -> apt-publish -> e2e -> ami-bake chain.
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'requirements.txt'
+      - 'uv.lock'
+      - 'cuckoo.py'
+      - 'admin/**'
+      - 'agent/**'
+      - 'analyzer/**'
+      - 'conf/**'
+      - 'custom/**'
+      - 'data/**'
+      - 'dev_utils/**'
+      - 'extra/**'
+      - 'installer/**'
+      - 'lib/**'
+      - 'mcp/**'
+      - 'modules/**'
+      - 'systemd/**'
+      - 'tests/**'
+      - 'utils/**'
+      - 'uwsgi/**'
+      - 'web/**'
+      - 'community/**'
+      - 'aws-nested-virt/scripts/**'
+      - 'aws-nested-virt/debian/control'
+      - 'aws-nested-virt/debian/rules'
+      - 'aws-nested-virt/debian/changelog'
+      - 'aws-nested-virt/debian/cape-core.*'
+      - 'aws-nested-virt/debian/cape-signatures.*'
+      - '.github/workflows/cape-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: cape-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install base packaging toolchain
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          # Just enough to read debian/control and resolve Build-Depends;
+          # the heavy lib*-dev set is installed via mk-build-deps after
+          # checkout so the source-of-truth is debian/control, not the
+          # workflow yaml.
+          apt-get install -y -qq --no-install-recommends \
+              build-essential debhelper devscripts dh-virtualenv \
+              equivs \
+              python3.12 python3.12-venv python3.12-dev python3-pip pipx python3-virtualenv \
+              git curl ca-certificates lintian
+          pipx install poetry
+          pipx inject poetry poetry-plugin-export
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # Don't recurse submodules: with CAPE source at the repo root,
+          # upstream CAPEv2 carries tests/data as a submodule pointing at
+          # CAPESandbox/CAPE-TestFiles (their malware test corpus), declared
+          # in the root .gitmodules. The .deb build doesn't need that corpus,
+          # and recursing it only slows checkout; Layer 5 EICAR exercises
+          # real analysis paths instead.
+          submodules: false
+
+      - name: Mark workspace as a safe git directory
+        run: |
+          # Container runs as a different UID than the checkout owner;
+          # git refuses to operate on the tree without this exception.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Stage debian/ at the CAPE source root
+        run: |
+          set -euo pipefail
+          # 1a fork layout: CAPE source is the repo root, but the packaging
+          # metadata lives under aws-nested-virt/debian/. dpkg-buildpackage
+          # (and mk-build-deps, which reads debian/control) expect debian/
+          # at the source root, so copy it up to ./debian first. Every later
+          # step that references debian/ (mk-build-deps, dpkg-buildpackage,
+          # the MT gate's $PWD/debian venv lookup) sees this staged copy.
+          cp -r aws-nested-virt/debian ./debian
+
+      - name: Install Build-Depends from debian/control
+        run: |
+          set -euo pipefail
+          # mk-build-deps reads debian/control's Build-Depends:, generates
+          # a meta-package whose Depends is that list, installs it, then
+          # `--remove` strips the meta-package after — leaving the actual
+          # build deps installed. This keeps debian/control as the single
+          # source of truth for what's needed at build time.
+          export DEBIAN_FRONTEND=noninteractive
+          mk-build-deps --install --remove \
+              --tool='apt-get -y -o Debug::pkgProblemResolver=yes --no-install-recommends' \
+              debian/control
+
+      - name: Show tree depth + commit (for build trace)
+        run: |
+          # Tolerant of missing dirs — purpose is human debugging, not
+          # gating the build. Real structural assertions live in tests/.
+          git log -1 --oneline
+          # CAPE source is the repo root now, so '.' stands in for the old
+          # cape/ entry; debian/ is the copy staged above.
+          for d in . community debian; do
+            echo "--- $d ---"
+            ls -la "$d" 2>/dev/null || echo "(missing $d)"
+          done
+
+      - name: Check source subtree readiness
+        id: readiness
+        run: |
+          set -euo pipefail
+          # The CAPE source (now the repo root, from the CAPEv2 fork) and the
+          # community/ subtree (kevoreilly/community) must be populated before
+          # dpkg-buildpackage can produce real binaries. If they're still
+          # scaffold placeholders, exit early with a clear status — not a
+          # confusing dh_install error cascade.
+          have_cape=0
+          have_community=0
+          [[ -f pyproject.toml ]] && have_cape=1
+          [[ -d community/modules/signatures ]] && have_community=1
+
+          {
+            echo "have_cape=$have_cape"
+            echo "have_community=$have_community"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$have_cape" = 0 || "$have_community" = 0 ]]; then
+            echo "::warning::Source subtrees not yet populated — cape=$have_cape community=$have_community. Skipping dpkg-buildpackage; this run validates packaging scaffolding only."
+            echo "::notice::Next step: populate the CAPEv2 fork source at the repo root and git-subtree-add kevoreilly/community into community/. See spec 2026-05-06-cape-core-deb-design.md."
+          else
+            echo "Source subtrees present; proceeding to dpkg-buildpackage."
+          fi
+
+      - name: dpkg-buildpackage (binary only, no signing)
+        if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'
+        run: |
+          set -euo pipefail
+          # -us -uc skips dsc/buildinfo signing (apt-publish does signing
+          # later from the GHA-stored GPG key).
+          # -b builds binary packages only.
+          dpkg-buildpackage -us -uc -b
+
+      - name: Multi-tenant isolation test gate
+        if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'
+        env:
+          # The cape-build container runs as root; web/settings.py aborts under
+          # root ("Root is not allowed … RTM") unless this CI/container escape
+          # hatch is set. The tests are hermetic (in-memory DBs), so root is safe here.
+          CAPE_AS_ROOT: "1"
+        run: |
+          set -euo pipefail
+          # HARD GATE: tenant-isolation regressions must not ship. Runs the
+          # multi-tenant visibility/tenancy pytest suite against the just-built
+          # dh-virtualenv venv (same runtime deps the deb ships), mirroring the
+          # dev harness — pytest-django config (DJANGO_SETTINGS_MODULE=web.settings,
+          # pythonpath=[".","web"]) comes from pyproject.toml at the source root.
+          # Placed BEFORE the staging/upload steps: a failure here fails the job
+          # and skips the artifact upload (those steps imply success()), so a
+          # leaking deb is never published or promoted by apt-publish / cape-deb-e2e.
+          #
+          # Self-activating: the MT suite lands in the source tree via the
+          # feat/multi-tenant-visibility subtree sync. Until then the test files
+          # are absent and the gate warns + passes; it ENFORCES automatically the
+          # moment web/apiv2/test_visibility.py appears.
+          # debian/ was staged at the source root above, so $PWD/debian resolves
+          # the built dh-virtualenv python; the pytest paths below are root-relative.
+          VENV_PY="$(find "$PWD/debian" -path '*/opt/CAPEv2/bin/python' | head -1)"
+          if [[ -z "$VENV_PY" ]]; then
+            echo "::error::built dh-virtualenv python not found under debian/ — cannot run the MT isolation gate"
+            exit 1
+          fi
+          if ! ls web/apiv2/test_visibility.py >/dev/null 2>&1; then
+            echo "::warning::MT isolation suite not yet present in the source tree (subtree sync of feat/multi-tenant-visibility pending). Gate is wired but inactive — it will enforce automatically once the tests land."
+            exit 0
+          fi
+          # The deb venv ships runtime deps only; add the pytest plugins the
+          # suite needs (django + asyncio_mode=auto per pyproject.toml).
+          "$VENV_PY" -m pip install --quiet pytest pytest-django pytest-asyncio
+          # CAPE source is the repo root now — no `cd` needed; the file list
+          # below is root-relative.
+          # Run the MT suite as an EXPLICIT file list, NOT the whole web/+tests/
+          # tree: the deb venv ships runtime deps only, so collecting all of
+          # tests/ imports unrelated modules needing test-only plugins
+          # (pytest_mock, httpretty) and aborts collection. These 13 files ARE
+          # the MT isolation suite and need only pytest-django + pytest-asyncio.
+          "$VENV_PY" -m pytest -p no:cacheprovider -q \
+            web/apiv2/test_visibility.py web/apiv2/test_hash_isolation.py \
+            web/analysis/test_visibility.py web/submission/test_visibility.py \
+            web/compare/test_visibility.py web/guac/test_visibility.py \
+            web/dashboard/test_dashboard_scope.py web/users/test_tenancy.py \
+            tests/test_tenancy.py tests/test_task_visibility.py tests/test_scope_stats.py \
+            tests/test_mongo_stamp.py tests/test_mongo_backfill.py
+
+      - name: Stage built debs into ./dist/ for artifact upload
+        if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'
+        run: |
+          # dpkg-buildpackage writes the .debs to the parent directory of
+          # the source. actions/upload-artifact rejects `..` paths, so we
+          # move them into a workdir-relative dist/ before upload.
+          mkdir -p dist
+          shopt -s nullglob
+          for f in ../cape-*.deb ../sandbox-cape_*.{changes,buildinfo}; do
+            mv "$f" dist/ || true
+          done
+          ls -la dist/ || true
+
+      - name: lintian (best-effort, non-blocking on first iteration)
+        if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for deb in dist/cape-*.deb; do
+            echo "::group::lintian $deb"
+            lintian --no-tag-display-limit "$deb" || true
+            echo "::endgroup::"
+          done
+
+      - name: Upload .deb artifacts
+        if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cape-debs-${{ github.sha }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 30

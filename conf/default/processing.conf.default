@@ -159,24 +159,6 @@ definitions = data/trid/triddefs.trd
 enabled = no
 binary = /usr/bin/diec
 
-[magika]
-# Google Magika - deep-learning content type identification.
-# https://github.com/google/magika
-# Install: poetry run pip install -U magika
-# Main benfit is classification of text file types i.e. PowerShell, ini files etc.
-enabled = no
-# Optional path to a custom/pinned model directory. Empty = use the model
-# shipped with the installed magika package.
-model_dir =
-# high_confidence (default, most conservative) | medium_confidence | best_guess
-prediction_mode = high_confidence
-# Display-only: results scoring below this are still recorded and shown, just
-# flagged low_confidence so a weak prediction isn't read as a confident one.
-min_score = 0.5
-# Skip files larger than this (MB). 0 = no limit. Magika only reads the head,
-# middle and tail of a file, so this is cheap to raise.
-max_file_size = 100
-
 [virustotal]
 enabled = yes
 on_demand = no
@@ -250,6 +232,29 @@ nolog = yes
 per_lookup_limit = 20
 # max number of queries per analysis
 per_analysis_limit = 200
+
+[sigma]
+# Sigma detection over the guest's collected EVTX + Sysmon logs via
+# Zircolite (community/modules/processing/sigma.py).  Requires the
+# `evtx` auxiliary module (collects the logs), the cape-zircolite deb
+# (the engine at zircolite_path), the cape-sigma-rules deb (the
+# ruleset packs below), and the pysigma* venv deps.  Ships disabled;
+# cape-host-config flips enabled=yes on managed hosts.
+enabled = no
+# Path to the Zircolite entrypoint (shipped by the cape-zircolite deb).
+zircolite_path = /opt/zircolite/zircolite.py
+# Comma-separated Sigma ruleset packs (relative to CAPEv2 root or
+# absolute).  These JSONs are shipped by cape-sigma-rules.deb.
+ruleset = data/sigma/rules_windows_generic.json, data/sigma/rules_windows_sysmon.json
+# Max seconds Zircolite may run per scan.
+timeout = 120
+# JSON filter file (shipped via community/data/sigma by cape-signatures).
+filters = data/sigma/filters.json
+# Comma-separated Sigma rule UUIDs to suppress globally (added to the
+# module's built-in suppressions for CAPE's own eventlog clearing).
+suppress_rule_ids =
+# Comma-separated rule titles to suppress globally.
+suppress_rule_titles = Suspicious Eventlog Clearing or Configuration Change Activity, Potentially Suspicious EventLog Recon Activity Using Log Query Utilities, Start Windows Service Via Net.EXE
 
 [CAPE]
 enabled = yes
@@ -374,13 +379,4 @@ enabled = no
 [polarproxy]
 # Enable when using the PolarProxy option during analysis. This will merge the tls.pcap containing
 # plain-text TLS streams into the task PCAP.
-enabled = no
-
-# Code-similarity engine(s). See conf/integrations.conf [similarity].
-[similarity]
-enabled = no
-
-# Threat-intelligence enrichment. Engine and API settings live in
-# conf/threat_intel.conf.
-[threatintelligence]
 enabled = no

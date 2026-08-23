@@ -14,6 +14,10 @@ class Tenant(models.Model):
     idp_groups = models.JSONField(default=list, blank=True)  # groups -> membership
     admin_idp_groups = models.JSONField(default=list, blank=True)  # groups -> tenant-admin
     active = models.BooleanField(default=True)
+    # Central-store lifetime (days) for this tenant's analyses: how long S3 artifacts
+    # + DocumentDB reports are retained. Separate from the ephemeral worker NVMe
+    # cleanup. The central retention timer (UI node) stamps info.expire_at from this.
+    retention_days = models.PositiveIntegerField(default=90)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

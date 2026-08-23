@@ -1,0 +1,155 @@
+name: suricata-rules-build
+
+# Builds the suricata-update-protocol CDN tree (.tar.gz + .tar.gz.md5
+# + index.yaml) by running `suricata-update` against Emerging Threats
+# Open + cape-project rules from suricata-rules/sources/cape/.
+#
+# CDN-ONLY by design — Suricata rules update multiple times per day
+# and don't suit apt-managed deb cadence. The native consumer
+# (suricata-update) is shaped exactly for this; we serve through its
+# protocol so operator hosts pull when they want, with md5-gated
+# change detection.
+#
+# Cron + change-gate: a check-changed step compares the live upstream
+# ET Open .tar.gz.md5 against the marker we drop alongside every
+# successful publish (upstream-et-md5.txt on the CDN). If unchanged
+# AND the run isn't a manual/push trigger, we skip the build entirely
+# — workflow conclusion is "skipped", apt-publish's workflow_run
+# trigger short-circuits, no spurious cape-deb-e2e runs.
+
+on:
+  schedule:
+    - cron: '13 */6 * * *'   # every 6h, staggered (minutes :13)
+  workflow_dispatch:
+    inputs:
+      suricata_version:
+        description: 'ET Open ruleset variant (must match cape-suricata binary). Default 7.0.13.'
+        type: string
+        required: false
+        default: '7.0.13'
+      pinned_version_suffix:
+        description: 'Package revision suffix (deb Version becomes <date>+cape.<suffix>). Default 1.'
+        type: string
+        required: false
+        default: '1'
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/suricata-rules-build/**'
+      - 'aws-nested-virt/suricata-rules/sources/**'
+      - '.github/workflows/suricata-rules-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suricata-rules-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      et_md5:  ${{ steps.check.outputs.et_md5 }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare upstream ET md5 vs. last-published marker
+        id: check
+        env:
+          SURICATA_VERSION: ${{ inputs.suricata_version || '7.0.13' }}
+          # Schedule-triggered runs respect the change gate. Manual
+          # dispatches and pushes to source-tree paths force a rebuild
+          # (operator intent — we always honor it).
+          FORCE_REBUILD: ${{ github.event_name != 'schedule' }}
+          # check-changed.sh reads the upstream-et-md5.txt marker as a bare
+          # asset on the single rolling threat-content release (no channel
+          # prefix — publish overwrites the same release each run).
+          THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+        run: |
+          set -euo pipefail
+          cd aws-nested-virt && bash suricata-rules-build/check-changed.sh | tee /tmp/check.out
+          grep -E '^(changed|et_md5)=' /tmp/check.out >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build + upload artifact
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SURICATA_VERSION: ${{ inputs.suricata_version || '7.0.13' }}
+      CAPE_REVISION: ${{ inputs.pinned_version_suffix || '1' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev ca-certificates curl python3 python3-pip
+          # suricata-update is pip-installed by compile.sh on demand,
+          # but pre-install here so the cache warm-path is cheap.
+          python3 -m pip install --quiet --user 'suricata-update>=1.3'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch ET Open + verify md5
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+        run: cd aws-nested-virt && bash suricata-rules-build/fetch.sh
+
+      - name: Compile ruleset (suricata-update)
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+        run: cd aws-nested-virt && bash suricata-rules-build/compile.sh
+
+      - name: Determine PACKAGE_VERSION
+        id: ver
+        run: |
+          set -euo pipefail
+          # Stable version: <YYYYMMDD>+et<md5-short>+cape.<rev>
+          # Same upstream md5 → same Version → aptly's same-version
+          # skip prevents re-publishing identical content even if the
+          # change-gate misses (manual force, etc.).
+          ET_MD5_SHORT=$(head -c 8 .work/et-open.md5)
+          DATE=$(date -u +%Y%m%d)
+          VER="${DATE}+et${ET_MD5_SHORT}+cape.${CAPE_REVISION}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VER"
+
+      - name: Package CDN artifacts
+        env:
+          WORK_DIR: ${{ github.workspace }}/.work
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          ET_OPEN_MD5: ${{ needs.check.outputs.et_md5 }}
+          THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+        run: cd aws-nested-virt && bash suricata-rules-build/package.sh
+
+      - name: Sanity check artifacts
+        run: |
+          set -euo pipefail
+          echo "=== CDN tree ==="
+          ls -la aws-nested-virt/dist/cdn/suricata/cape/rules/
+          tar="aws-nested-virt/dist/cdn/suricata/cape/rules/cape-rules.tar.gz"
+          recorded=$(cat "${tar}.md5")
+          actual=$(md5sum "$tar" | awk '{print $1}')
+          [ "$recorded" = "$actual" ] || { echo "::error::md5 sidecar mismatch"; exit 1; }
+          echo "tarball md5 sidecar verified: $recorded"
+          grep -q 'cape-rules.tar.gz' aws-nested-virt/dist/cdn/suricata/cape/rules/index.yaml \
+              || { echo "::error::index.yaml missing expected url"; exit 1; }
+          # Upstream marker for next-run change detection.
+          [ -s 'aws-nested-virt/dist/cdn/suricata/cape/rules/upstream-et-md5.txt' ] \
+              || { echo "::error::missing upstream-et-md5.txt"; exit 1; }
+          echo "upstream-et-md5.txt: $(cat aws-nested-virt/dist/cdn/suricata/cape/rules/upstream-et-md5.txt)"
+
+      - name: Upload CDN artifact (suricata-update fan-in)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-suricata-rules-cdn-${{ steps.ver.outputs.version }}
+          path: aws-nested-virt/dist/cdn/**
+          if-no-files-found: error
+          retention-days: 90

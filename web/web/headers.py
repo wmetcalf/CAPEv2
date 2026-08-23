@@ -33,6 +33,6 @@ class CuckooHeaders(MiddlewareMixin):
         response["Cache-Control"] = "no-cache"
         response["Expires"] = "0"
         response["Permissions-Policy"] = (
-            "accelerometer=(); autoplay=(); camera=(); encrypted-media=(); fullscreen=(); geolocation=(); gyroscope=(); magnetometer=(); microphone=(); midi=(); payment=(); picture-in-picture=(); sync-xhr=(); usb=();"
+            "accelerometer=(), autoplay=(), camera=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), sync-xhr=(), usb=()"
         )
         return response

@@ -1,0 +1,647 @@
+name: apt-publish
+
+# Publishes .deb artifacts produced by cape-build.yml as a signed FLAT apt
+# repo hosted on a per-channel GitHub Release (rolling tag). Triggered when
+# cape-build completes successfully on main.
+#
+# Two channels, each its own rolling-tag Release:
+#   - main-dev -> release tag apt-dev:  every successful cape-build push lands here
+#   - main     -> release tag apt-prod: promoted explicitly via workflow_dispatch
+#                 with channel=main, after Layers 4 + 5 e2e tests pass against dev
+#
+# Consumers point apt at the release directly (no bucket, no CDN):
+#   deb [signed-by=<keyring>] https://github.com/<owner>/<repo>/releases/download/apt-<channel>/ ./
+#
+# Requires:
+#   - GITHUB_TOKEN          Built-in token, `contents: write` only. Used both
+#                           to fetch/merge the channel's existing pool and to
+#                           upload the regenerated flat repo back to the
+#                           Release. No AWS credentials are needed for the
+#                           deb publish itself.
+#   - APT_SIGNING_GPG_KEY   GHA org secret: ASCII-armored private key that
+#                           signs the flat repo's Release file, producing
+#                           InRelease/Release.gpg. The matching public key is
+#                           published as the `keyring.asc` asset on the same
+#                           Release for consumers to import.
+#   - APT_PUBLISH_REPO      Optional variable: `owner/repo` to publish to.
+#                           Defaults to this workflow's own repo
+#                           (github.repository) when unset.
+#
+# No AWS is used for publishing: both the deb repo and the threat-content
+# mirror (Suricata rules, ClamAV extra signatures, etc.) publish to GitHub
+# Releases — no S3 bucket, no CloudFront, no AWS OIDC role. Threat content
+# uploads its flat, bare-named assets to a dedicated rolling-tag Release
+# (tag: threat-content); consumers fetch them unauthenticated over the
+# release's 302 redirects.
+#
+# cape-deb-e2e is a same-repo workflow now (migrated from the IaC repo)
+# so no cross-repo dispatch token is needed — the trigger uses the run's
+# default GITHUB_TOKEN with `actions: write` permission.
+
+on:
+  # Fan-in: any of the four upstream build workflows can trigger us. We
+  # always re-pull the latest successful artifact from EACH of them so
+  # the published apt repo represents the current state of every binary
+  # package, not just whichever workflow happened to fire last.
+  workflow_run:
+    # seabios-build.yml is intentionally not in the list — bios.bin /
+    # vgabios* ship inside cape-qemu.deb (built from QEMU's bundled
+    # SeaBIOS source). Add seabios-build here when/if a dedicated
+    # workflow lands.
+    workflows: [cape-build, suricata-build, qemu-build, yara-forge-build, suricata-rules-build, sigma-rules-build, cape-zircolite-build, clamav-mirror-build, host-config-build, mongodb-build, host-runtime-build, libvirt-build, fakenet-build]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Apt channel to publish to'
+        type: choice
+        options: [main-dev, main]
+        default: main-dev
+
+permissions:
+  contents: write   # publish the flat apt repo + digest marker to the channel's
+                    # GitHub Release, and the threat-content mirror to its own
+                    # rolling-tag Release
+  # `actions: write` so the same-repo dispatch step can `gh workflow run
+  # cape-deb-e2e.yml` after a successful main-dev publish. read alone is
+  # enough for `gh run download` of upstream build artifacts.
+  actions: write
+
+concurrency:
+  group: apt-publish-${{ inputs.channel || 'main-dev' }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Skip if the upstream cape-build failed (workflow_run trigger fires
+    # on completion regardless of conclusion).
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    # "1a" fork layout: all pipeline dirs (scripts/, debian/, packer/,
+    # terraform/) live under aws-nested-virt/. The publish step invokes
+    # scripts/publish-apt-release.sh through the ${SUBDIR:+${SUBDIR}/}
+    # prefix, so point SUBDIR at that subtree — it resolves to
+    # aws-nested-virt/scripts/publish-apt-release.sh. The fanned-in dist/
+    # tree is created at the checkout root at runtime and is NOT under
+    # this prefix, so --debs dist stays root-relative.
+    env:
+      SUBDIR: aws-nested-virt
+    steps:
+      # Repo checkout so aws-nested-virt/scripts/publish-apt-release.sh
+      # (and its build-flat-apt-repo.sh helper) are on disk for the publish
+      # step; the SUBDIR job env prefixes the invocation path below.
+      # The old aptly path ran only inline shell, so no checkout existed.
+      - uses: actions/checkout@v6
+
+      - name: Resolve target channel
+        id: channel
+        run: |
+          set -euo pipefail
+          # Default channel: main-dev. workflow_dispatch may override.
+          channel="${{ inputs.channel || 'main-dev' }}"
+          # Translate the workflow's channel label (main-dev / main) to the
+          # publish-apt-release.sh channel name (dev / prod). The channel's
+          # flat apt repo AND its digest marker both live on the GitHub
+          # Release tagged apt-<name>, so this name drives both.
+          #
+          # PUBLISH_PREFIX (root for prod, dev/ for dev) is vestigial now:
+          # its only consumers were the threat-content S3-mirror + CloudFront
+          # steps, which have been replaced by a single flat threat-content
+          # GitHub Release shared across channels. Kept as a harmless no-op so
+          # the dev/prod case split below stays intact for any future use.
+          case "$channel" in
+            main-dev) name=dev;  prefix="dev/" ;;
+            main)     name=prod; prefix="" ;;
+            *) echo "::error::unknown channel $channel" >&2; exit 2 ;;
+          esac
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "PUBLISH_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "Publishing to apt channel: $channel (release tag: apt-$name)"
+
+      - name: Fan-in latest .debs from each build workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Each upstream build workflow uploads exactly one artifact pattern:
+          #   cape-build.yml         → cape-debs-*
+          #   suricata-build.yml     → cape-suricata-debs-*
+          #   qemu-build.yml         → cape-qemu-debs-*
+          #   yara-forge-build.yml   → cape-yara-forge-debs-*
+          #   sigma-rules-build.yml  → cape-sigma-rules-debs-*
+          #   host-config-build.yml  → cape-host-config-debs-*
+          #   mongodb-build.yml      → cape-mongodb-debs-*
+          #   host-runtime-build.yml → cape-host-runtime-debs-*
+          #   libvirt-build.yml      → cape-libvirt-debs-*
+          #   fakenet-build.yml      → cape-fakenet-debs-*
+          #   seabios-build.yml      → cape-seabios-debs-*        (future)
+          # suricata-rules-build + clamav-mirror-build NOT in this map:
+          # they emit CDN trees only. The CDN-mirror step below pulls
+          # their respective *-cdn-* artifacts separately.
+          declare -A workflows=(
+              [cape-build.yml]=cape-debs
+              [suricata-build.yml]=cape-suricata-debs
+              [qemu-build.yml]=cape-qemu-debs
+              [yara-forge-build.yml]=cape-yara-forge-debs
+              [sigma-rules-build.yml]=cape-sigma-rules-debs
+              [host-config-build.yml]=cape-host-config-debs
+              [mongodb-build.yml]=cape-mongodb-debs
+              [host-runtime-build.yml]=cape-host-runtime-debs
+              [libvirt-build.yml]=cape-libvirt-debs
+              [fakenet-build.yml]=cape-fakenet-debs
+              [cape-zircolite-build.yml]=cape-zircolite-debs
+          )
+
+          for wf in "${!workflows[@]}"; do
+              prefix="${workflows[$wf]}"
+              echo "::group::Pulling latest from $wf (artifact prefix: $prefix-*)"
+
+              # Most recent successful run on main. `gh run list` against
+              # a workflow file that doesn't exist returns 404, so guard
+              # with `|| true` and treat both that and empty results as
+              # "no artifact yet, skip with a warning."
+              # Filter head_branch + conclusion in jq, NOT via the gh
+              # `--branch`/`--status` flags: `--branch main` unreliably drops
+              # schedule-triggered runs (head_branch IS main, but the API
+              # branch filter omits them), which silently selected a STALE
+              # successful run and let aptly's force-replace clobber prod's
+              # index back to an older version (e.g. yara-forge 20260531 over
+              # the newer 20260607 already in the pool).
+              run_id=$(gh run list \
+                  --repo "$REPO" \
+                  --workflow "$wf" \
+                  --limit 50 \
+                  --json databaseId,headBranch,conclusion,createdAt \
+                  --jq 'map(select(.headBranch=="main" and .conclusion=="success"))
+                        | sort_by(.createdAt) | reverse | .[0].databaseId // empty' 2>/dev/null || true)
+
+              if [ -z "$run_id" ]; then
+                  echo "::warning::no successful $wf run on main yet — skipping $prefix"
+                  echo "::endgroup::"
+                  continue
+              fi
+
+              echo "run_id=$run_id"
+              gh run download "$run_id" \
+                  --repo "$REPO" \
+                  --pattern "$prefix-*" \
+                  --dir dist/ \
+                  || echo "::warning::no $prefix-* artifact on run $run_id (workflow may not produce one yet)"
+
+              # `gh run download` puts each artifact in its own subdir;
+              # flatten so dpkg/aptly sees the .debs at dist/*.deb.
+              find dist/ -mindepth 2 -name '*.deb' -exec mv -f {} dist/ \;
+              find dist/ -mindepth 1 -type d -empty -delete
+
+              echo "::endgroup::"
+          done
+
+          ls -la dist/
+
+      - name: Verify artifacts present
+        id: verify
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(dist/cape-*.deb)
+          if [ ${#debs[@]} -eq 0 ]; then
+            # cape-build's readiness gate may have skipped the build.
+            # Treat that as a no-op publish, not a failure. All downstream
+            # steps gate on this output so we don't blow away the live
+            # apt repo with an empty publish.
+            echo "::warning::No .deb artifacts to publish — cape-build likely gated on missing source subtrees. Skipping."
+            echo "has_debs=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_debs=true" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      - name: Skip when fan-in matches what's already published
+        # When a threat-content cron fires but its build job was gated
+        # off (suricata-rules / clamav-mirror / sigma-rules / yara-forge
+        # check-changed.sh said "no change"), the workflow_run trigger
+        # for apt-publish still fires.  Our fan-in then re-pulls the
+        # latest *previous* artifact from each workflow and would
+        # republish a byte-identical set, then dispatch cape-deb-e2e
+        # (~25 min) and prod-publish + ami-bake-check (~5 min) for
+        # nothing.
+        #
+        # Compute a digest of the deb file set we're about to publish
+        # (sha256 of sorted-JSON {pkg: sha256}).  Compare to the marker
+        # stored as the apt-publish-digest.txt asset on the channel's
+        # GitHub Release (tag apt-<name>).  Match → exit success, skip the
+        # entire chain.  Differ / no marker / no release / any error →
+        # proceed (fail-safe).
+        #
+        # The digest is collapsed into 64 chars (sha256 of the dict) for
+        # the same reason as OsDebHashes in ami-bake: it stays short and
+        # easy to read.  The per-package dict is logged for debug.
+        id: noop_check
+        if: ${{ steps.verify.outputs.has_debs == 'true' && github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN:     ${{ github.token }}
+          REPO:         ${{ vars.APT_PUBLISH_REPO || github.repository }}
+          CHANNEL:      ${{ steps.channel.outputs.channel }}
+          RELEASE_NAME: ${{ steps.channel.outputs.name }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+
+          # Build sorted JSON dict of {fname: sha256} across all
+          # fan-in debs — caller-agnostic vs the OS-affecting subset
+          # used by ami-bake's OsDebHashes.  Whole-set hashing
+          # is right here because apt-publish republishes everything,
+          # not just OS-affecting.
+          digest_json=$(
+              for deb in dist/cape-*.deb; do
+                  printf '%s\t%s\n' "$(basename "$deb")" \
+                      "$(sha256sum "$deb" | awk '{print $1}')"
+              done \
+              | jq -Rn --slurp '[inputs | split("\n") | map(select(length>0)) | .[]
+                                | split("\t") | {key: .[0], value: .[1]}]
+                                | from_entries' \
+              | jq -cS .
+          )
+          new_digest=$(printf '%s' "$digest_json" | sha256sum | awk '{print $1}')
+          echo "fanin_digest=$new_digest" >> "$GITHUB_OUTPUT"
+          echo "::notice::fan-in deb-set digest: $new_digest"
+          echo "::notice::fan-in per-deb dict: $digest_json"
+
+          # Pull the previous marker from the channel's Release asset.
+          # Missing release OR missing asset (first publish on channel) →
+          # gh exits non-zero → prev_digest stays empty → must publish.
+          tmpd="$(mktemp -d)"
+          prev_digest=""
+          if gh release download "apt-${RELEASE_NAME}" --repo "$REPO" \
+                --pattern apt-publish-digest.txt --dir "$tmpd" --clobber 2>/dev/null; then
+              prev_digest=$(tr -d '[:space:]' < "$tmpd/apt-publish-digest.txt" 2>/dev/null || echo "")
+          fi
+          rm -rf "$tmpd"
+          if [ -z "$prev_digest" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::no digest marker on release apt-${RELEASE_NAME} — proceeding with publish (first run on $CHANNEL?)"
+              exit 0
+          fi
+
+          if [ "$new_digest" = "$prev_digest" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::fan-in deb set unchanged from $CHANNEL's previous publish ($prev_digest) — skipping publish + downstream chain"
+          else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::fan-in deb set changed: prev=$prev_digest new=$new_digest — publishing"
+          fi
+
+      - name: Import signing key
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          APT_SIGNING_GPG_KEY: ${{ secrets.APT_SIGNING_GPG_KEY }}
+        run: |
+          set -euo pipefail
+          # Tooling for the flat-repo generator: apt-utils ships
+          # apt-ftparchive; gnupg signs the Release. The key is piped via
+          # stdin so it never lands on disk; export its fingerprint for the
+          # publish script's --gpg-key flag.
+          sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils gnupg
+          echo "$APT_SIGNING_GPG_KEY" | gpg --batch --import
+          echo "GPG_FP=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')" >> "$GITHUB_ENV"
+
+      - name: Publish flat apt repo to the channel's GitHub Release
+        # Additive flat-repo publish: fetch the channel's current pool from
+        # its Release (tag apt-<name>), merge dist/*.deb, regenerate the
+        # signed index, clobber-upload every asset. Uses gh/GITHUB_TOKEN
+        # only — no aws for the deb path (S3/aptly/CloudFront are gone here).
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash "${SUBDIR:+${SUBDIR}/}scripts/publish-apt-release.sh" \
+            --channel "${{ steps.channel.outputs.name }}" \
+            --debs dist \
+            --repo "${{ vars.APT_PUBLISH_REPO || github.repository }}" \
+            --gpg-key "$GPG_FP"
+
+      # ----------------------------------------------------------------
+      # CDN mirror — fan in tree-shaped artifacts from builds that ship
+      # native-tool-consumed content rather than debs:
+      #   suricata-rules-build → cape-suricata-rules-cdn-*  (suricata-update protocol)
+      #   clamav-mirror-build  → cape-clamav-feeds-cdn-*    (freshclam protocol)
+      # Both artifact trees contain a top-level cdn/ directory; we flatten
+      # them to bare-named assets and upload them to the threat-content
+      # GitHub Release, so consumers fetch each file as <release-base>/
+      # <basename> (one flat namespace, no path segment).
+      # ----------------------------------------------------------------
+      - name: Fan-in CDN artifacts (suricata-rules + clamav-mirror)
+        id: cdn_fan
+        # Stays gated on has_debs to match the rest of the publish chain.
+        # In practice that's a non-issue: apt-publish runs after ANY
+        # upstream build workflow and we always fan in the cape-* debs
+        # from cape-build etc., so has_debs is essentially always true.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p cdn-fan
+          declare -A cdn_workflows=(
+              [suricata-rules-build.yml]=cape-suricata-rules-cdn
+              [clamav-mirror-build.yml]=cape-clamav-feeds-cdn
+          )
+          for wf in "${!cdn_workflows[@]}"; do
+              prefix="${cdn_workflows[$wf]}"
+              echo "::group::Fan-in $wf → $prefix-*"
+              # See the head_branch/conclusion-in-jq note above: the
+              # gh `--branch` flag unreliably drops schedule-triggered runs.
+              run_id=$(gh run list --repo "$REPO" --workflow "$wf" --limit 50 \
+                  --json databaseId,headBranch,conclusion,createdAt \
+                  --jq 'map(select(.headBranch=="main" and .conclusion=="success"))
+                        | sort_by(.createdAt) | reverse | .[0].databaseId // empty' 2>/dev/null || true)
+              if [ -z "$run_id" ]; then
+                  echo "::notice::no successful $wf run yet; skipping"
+                  echo "::endgroup::"
+                  continue
+              fi
+              gh run download "$run_id" --repo "$REPO" \
+                  --pattern "${prefix}-*" --dir cdn-fan/ \
+                  || { echo "::notice::no $prefix-* artifact on run $run_id"; echo "::endgroup::"; continue; }
+              echo "::endgroup::"
+          done
+          # Each artifact ships its files already rooted at the bucket-
+          # relative CDN path:
+          #   cape-clamav-feeds-cdn-<sha>/clamav-extra/<file>
+          #   cape-suricata-rules-cdn-<ver>/suricata/cape/rules/<file>
+          # (actions/upload-artifact v4 with `path: dir/cdn/**` strips
+          # the cdn/ prefix from the artifact root.)
+          #
+          # The previous fan-in expected a literal cdn/ subdirectory
+          # inside each artifact and a `find -name cdn` lookup, which
+          # matched nothing — so CDN content has never been mirrored
+          # to the bucket since clamav-mirror/suricata-rules landed.
+          # cape-deb-e2e caught the symptom in earlier testing
+          # (clamav-extra-mirror-cdn: pass=false, size=0).
+          #
+          # Recursive-copy each artifact's contents into cdn-mirror/
+          # directly.  Path overlap is fine — distinct top-level dirs
+          # per consumer (clamav-extra/, suricata/).
+          mkdir -p cdn-mirror
+          for artifact_dir in cdn-fan/*/; do
+              [ -d "$artifact_dir" ] || continue
+              cp -a "${artifact_dir}." cdn-mirror/
+          done
+          if find cdn-mirror -type f -print -quit | grep -q .; then
+              echo "has_cdn=true" >> "$GITHUB_OUTPUT"
+              echo "CDN tree to mirror:"
+              find cdn-mirror -type f | head -20
+          else
+              echo "has_cdn=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish CDN artifacts to the threat-content GitHub Release
+        # Flatten the fanned-in CDN tree (clamav-extra/<f>,
+        # suricata/cape/rules/<f>) to bare-named assets and upload them to a
+        # single rolling-tag Release (tag: threat-content). Release assets
+        # share one flat namespace — no '/' in names — so consumers fetch
+        # each file as <release-base>/<basename>, with no path segment. Two
+        # feeds that ship the same basename would silently clobber each other
+        # in that flat namespace, so FAIL LOUDLY if any two source files
+        # collapse to the same basename before uploading.
+        if: ${{ steps.cdn_fan.outputs.has_cdn == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ vars.APT_PUBLISH_REPO || github.repository }}
+        run: |
+          set -euo pipefail
+          # Basename-collision guard: a basename appearing more than once
+          # across the whole CDN tree would overwrite itself when flattened.
+          dupes=$(find cdn-mirror -type f -printf '%f\n' | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+              echo "::error::threat-content basename collision — two CDN feeds ship the same filename:" >&2
+              printf '%s\n' "$dupes" >&2
+              exit 1
+          fi
+          # No collisions: flatten every file to a staging dir by basename.
+          staging="$(mktemp -d)"
+          find cdn-mirror -type f -exec cp -a -t "$staging/" {} +
+          # Ensure the rolling threat-content Release exists (view returns
+          # non-zero on the first run when the tag is absent), then clobber-
+          # upload the flat, bare-named assets.
+          gh release view threat-content --repo "$REPO" >/dev/null 2>&1 \
+              || gh release create threat-content --repo "$REPO" \
+                    --prerelease --title "threat-content" \
+                    --notes "Rolling ClamAV/Suricata threat-content mirror (flat, bare-named assets)."
+          gh release upload threat-content --repo "$REPO" --clobber "$staging"/*
+          echo "::notice::Uploaded $(find "$staging" -type f | wc -l) threat-content assets to release threat-content"
+
+      - name: Extract published .deb versions for downstream dispatch
+        id: versions
+        # Both channels need the version map: main-dev fans out to
+        # cape-deb-e2e; main fans out to ami-bake.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Pull versions out of the staged .deb filenames; these go in
+          # the dispatch payload so the e2e harness pins the install.
+          # Filename shape: <pkg>_<version>_<arch>.deb where arch is
+          # amd64 (compiled bits) or all (signatures).
+          extract() {
+              local pkg="$1"
+              local matches=( dist/${pkg}_*_*.deb )
+              [ ${#matches[@]} -gt 0 ] || { echo "" ; return ; }
+              local fname
+              fname="$(basename "${matches[0]}")"
+              # strip leading "<pkg>_" and trailing "_<arch>.deb"
+              local stripped="${fname#${pkg}_}"
+              echo "${stripped%_*.deb}"
+          }
+          {
+              echo "cape_core_version=$(extract cape-core)"
+              echo "cape_signatures_version=$(extract cape-signatures)"
+              echo "cape_qemu_version=$(extract cape-qemu)"
+              echo "cape_suricata_version=$(extract cape-suricata)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write apt-publish digest marker
+        # Stamp the just-published deb-set digest as the apt-publish-
+        # digest.txt asset on the channel's Release (tag apt-<name>) so the
+        # next apt-publish run (via the noop_check step above) has something
+        # to compare against.  Skips when the publish itself was skipped
+        # (steps.noop_check.outputs.skip=='true') — the existing marker is
+        # already correct.  The publish step above created/updated the
+        # release, so it exists here.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN:     ${{ github.token }}
+          REPO:         ${{ vars.APT_PUBLISH_REPO || github.repository }}
+          RELEASE_NAME: ${{ steps.channel.outputs.name }}
+          # On workflow_dispatch runs (manual + cape-deb-e2e dispatch to
+          # channel=main), the noop_check step is gated off (only runs on
+          # workflow_run), so steps.noop_check.outputs.fanin_digest is
+          # empty.  Recompute here to write a marker.
+          FANIN_DIGEST: ${{ steps.noop_check.outputs.fanin_digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FANIN_DIGEST" ]; then
+              shopt -s nullglob
+              digest_json=$(
+                  for deb in dist/cape-*.deb; do
+                      printf '%s\t%s\n' "$(basename "$deb")" \
+                          "$(sha256sum "$deb" | awk '{print $1}')"
+                  done \
+                  | jq -Rn --slurp '[inputs | split("\n") | map(select(length>0)) | .[]
+                                    | split("\t") | {key: .[0], value: .[1]}]
+                                    | from_entries' \
+                  | jq -cS .
+              )
+              FANIN_DIGEST=$(printf '%s' "$digest_json" | sha256sum | awk '{print $1}')
+          fi
+          # Marker rides as an asset on the channel's Release, alongside the
+          # signed apt index the publish step uploaded.
+          printf '%s\n' "$FANIN_DIGEST" > apt-publish-digest.txt
+          gh release upload "apt-${RELEASE_NAME}" --repo "$REPO" \
+              --clobber apt-publish-digest.txt
+          echo "::notice::Wrote apt-publish-digest.txt = $FANIN_DIGEST to release apt-${RELEASE_NAME}"
+
+      - name: Trigger cape-deb-e2e (same-repo workflow_dispatch)
+        # Only fire on the auto-publish path (channel=main-dev); the
+        # main-channel promotion has already been blessed by an earlier
+        # e2e run, so we don't loop.
+        #
+        # cape-deb-e2e lives in this repo now (migrated from the IaC
+        # repo) so dispatch uses GITHUB_TOKEN with the workflow's own
+        # `actions: write` permission — no PAT or GitHub App needed.
+        #
+        # Also gated on noop_check.skip — when the fan-in deb set
+        # matches what's already published, the version-
+        # extract step above is skipped, leaving cape_core_version
+        # empty.  Dispatching cape-deb-e2e with an empty required
+        # input returns HTTP 422 "Required input 'cape_core_version'
+        # not provided" — caught in earlier testing the
+        # first time the noop_check skip path actually fired.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main-dev' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run cape-deb-e2e.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f cape_core_version="${{ steps.versions.outputs.cape_core_version }}" \
+            -f cape_signatures_version="${{ steps.versions.outputs.cape_signatures_version }}" \
+            -f cape_qemu_version="${{ steps.versions.outputs.cape_qemu_version }}" \
+            -f cape_suricata_version="${{ steps.versions.outputs.cape_suricata_version }}" \
+            -f run_layer5=false \
+            -f promote_on_success=true
+          echo "::notice::Dispatched cape-deb-e2e for cape-core=${{ steps.versions.outputs.cape_core_version }}; on green, will promote to channel=main."
+
+      - name: Compute OS-affecting deb sha256s
+        # Compute a sha256 per OS-affecting deb, then a single combined
+        # digest = sha256(sorted-json-dict).  These are the packages
+        # that install binaries/configs into the AMI filesystem, so a
+        # content change requires an AMI rebake.
+        #
+        # Threat-content debs (cape-yara-forge, cape-sigma-rules) are
+        # intentionally NOT in this list — their content is consumed
+        # at analysis-time and refreshed at runtime by host-side timers
+        # (cape-suricata-update.timer, clamav-freshclam.service,
+        # cape-yara-forge cron, etc.).  A host on a 3-day-old AMI
+        # converges to today's threat content after one timer tick;
+        # baking a new AMI just to swap the rules tarball wastes ~70
+        # min of CI + ~100 GB of EBS snapshot storage per change.
+        #
+        # cape-libvirt is listed even though we currently skip its
+        # install in packer (noble t64 transition Depends are
+        # broken).  When that's fixed, no further wiring is needed for
+        # ami-bake to track it.
+        #
+        # Why a combined digest instead of the full dict on the AMI:
+        # AWS tag value limit is 256 chars and 8 packages × 64-char
+        # sha256 + JSON syntax = ~700 chars.  The combined digest
+        # collapses to 64 chars and is still a stable equality check.
+        # Trade-off: tag inspection can't tell you WHICH package
+        # changed — operators have to look at the apt-publish run log
+        # (printed below) to see the per-package dict.
+        id: os_hashes
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          declare -A h
+          for pkg in cape-core cape-signatures cape-qemu cape-suricata \
+                     cape-host-config cape-host-runtime cape-mongodb cape-libvirt \
+                     cape-fakenet cape-zircolite; do
+              matches=( dist/${pkg}_*_*.deb )
+              if [ ${#matches[@]} -gt 0 ]; then
+                  h[$pkg]=$(sha256sum "${matches[0]}" | awk '{print $1}')
+              fi
+          done
+          # Build a stable sorted JSON dict, then digest it.
+          os_hashes_json=$(
+              for pkg in "${!h[@]}"; do
+                  printf '%s\t%s\n' "$pkg" "${h[$pkg]}"
+              done \
+              | jq -Rn --slurp '[inputs | split("\n") | map(select(length>0)) | .[]
+                                | split("\t") | {key: .[0], value: .[1]}]
+                                | from_entries' \
+              | jq -cS .
+          )
+          os_hashes_digest=$(printf '%s' "$os_hashes_json" | sha256sum | awk '{print $1}')
+          echo "os_hashes_json=$os_hashes_json"   >> "$GITHUB_OUTPUT"
+          echo "os_hashes_digest=$os_hashes_digest" >> "$GITHUB_OUTPUT"
+          echo "::notice::OS-affecting deb hashes (per-package): $os_hashes_json"
+          echo "::notice::OS-affecting deb combined digest: $os_hashes_digest"
+
+      - name: Trigger ami-bake (same-repo workflow_dispatch)
+        # Closes the chain: prod publish (channel=main) → ami-bake →
+        # tagged AMI → IaC nestedvirt-ami stack picks it up via
+        # data "aws_ami" lookup on next `terraform apply`. No cross-repo
+        # dispatch needed; ami-bake is in this repo.
+        #
+        # Dispatch is UNCONDITIONAL on a prod publish. This job has no AWS
+        # credentials (no id-token / OIDC role — the deb path is pure
+        # GitHub Releases), so the old "an AMI already exists for these
+        # exact versions ⇒ skip the bake" check that queried
+        # `aws ec2 describe-images` / `describe-tags` could only ever
+        # fail-safe-degrade to always-bake here anyway. That optimization
+        # belongs in the ami-bake workflow, which legitimately has
+        # AWS/OIDC: ami-bake receives os_deb_hashes_digest below and can
+        # compare it against the latest cape-host-base AMI's OsDebHashes
+        # tag and no-op early. ami-bake's own `concurrency: ami-bake` group
+        # serializes runs, so an unconditional dispatch can't pile up.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run ami-bake.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f cape_core_version="${{ steps.versions.outputs.cape_core_version }}" \
+            -f cape_signatures_version="${{ steps.versions.outputs.cape_signatures_version }}" \
+            -f cape_qemu_version="${{ steps.versions.outputs.cape_qemu_version }}" \
+            -f cape_suricata_version="${{ steps.versions.outputs.cape_suricata_version }}" \
+            -f os_deb_hashes_digest='${{ steps.os_hashes.outputs.os_hashes_digest }}' \
+            -f previous_ami_id=""
+          echo "::notice::Dispatched ami-bake for cape-core=${{ steps.versions.outputs.cape_core_version }}; new cape-host-base AMI in ~45 min."
+
+      - name: Summary
+        if: always()
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## apt-publish
+
+          | Field | Value |
+          | --- | --- |
+          | Channel | \`${{ steps.channel.outputs.channel }}\` |
+          | Triggered by run | ${{ github.event.workflow_run.id || github.run_id }} |
+          | Apt release base URL | https://github.com/${{ vars.APT_PUBLISH_REPO || github.repository }}/releases/download/apt-${{ steps.channel.outputs.name }}/ |
+          | Threat-content release | https://github.com/${{ vars.APT_PUBLISH_REPO || github.repository }}/releases/download/threat-content/ |
+          | Status | ${{ job.status }} |
+
+          Hosts using the dev channel pick this up on the next \`apt-get update\`.
+          EOF

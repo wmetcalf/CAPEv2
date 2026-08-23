@@ -1,0 +1,12 @@
+[Unit]
+Description=CAPE Guest Routing via VPN
+After=openvpn-pia.service libvirtd.service network-online.target
+Wants=openvpn-pia.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-cape-routing.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+#!/bin/sh
+# cape-signatures postinst: cape-processor + cape-web pick up signature
+# changes on restart.  Service restart fires via the cape-processor-reload
+# dpkg trigger — see DEBIAN/triggers + cape-host-runtime's postinst
+# (interest holder).  Coalesces with cape-yara-forge and cape-sigma-rules
+# when multiple threat debs upgrade in one apt transaction.
+
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "cape-signatures postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

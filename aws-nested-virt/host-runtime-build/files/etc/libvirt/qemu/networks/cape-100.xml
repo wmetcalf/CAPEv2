@@ -1,0 +1,50 @@
+<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>
+  <name>cape-100</name>
+  <uuid>867bf4ba-1d5e-4e83-b4d4-f1313153d6af</uuid>
+  <forward mode='open'/>
+  <bridge name='virbr100' stp='on' delay='0'/>
+  <mac address='52:0c:77:a3:3e:e1'/>
+  <domain name='cape-100'/>
+  <dns>
+    <forwarder addr='8.8.8.8'/>
+    <forwarder addr='8.8.4.4'/>
+  </dns>
+  <ip address='192.168.100.1' netmask='255.255.255.0'>
+    <dhcp>
+      <host mac='02:63:52:CE:1F:BB' name='win11_seabios_101' ip='192.168.100.101'/>
+      <host mac='02:A8:72:B2:B5:75' name='win11_seabios_102' ip='192.168.100.102'/>
+      <host mac='02:D6:E0:B6:80:A6' name='win11_seabios_103' ip='192.168.100.103'/>
+      <host mac='02:8C:6F:AD:2D:F2' name='win11_seabios_104' ip='192.168.100.104'/>
+      <host mac='02:F5:3B:DD:9D:4D' name='win11_seabios_105' ip='192.168.100.105'/>
+      <host mac='02:18:8B:7C:53:7E' name='win11_seabios_106' ip='192.168.100.106'/>
+      <host mac='02:CB:D1:39:92:E3' name='win11_seabios_107' ip='192.168.100.107'/>
+      <host mac='02:10:CC:44:B5:26' name='win11_seabios_108' ip='192.168.100.108'/>
+      <host mac='02:08:CD:C6:E1:22' name='win11_seabios_109' ip='192.168.100.109'/>
+      <host mac='02:5D:23:D1:80:68' name='win11_seabios_110' ip='192.168.100.110'/>
+      <host mac='02:C5:4C:31:0E:A6' name='win11_seabios_111' ip='192.168.100.111'/>
+      <host mac='02:5B:A8:8A:59:0E' name='win11_seabios_112' ip='192.168.100.112'/>
+      <host mac='02:A2:C4:7D:0C:D5' name='win11_seabios_113' ip='192.168.100.113'/>
+      <host mac='02:7F:88:C2:3A:12' name='win11_seabios_114' ip='192.168.100.114'/>
+      <host mac='02:A2:20:A8:3E:AE' name='win11_seabios_115' ip='192.168.100.115'/>
+      <host mac='02:95:07:38:D1:2C' name='win11_seabios_116' ip='192.168.100.116'/>
+      <host mac='02:BE:CB:E3:EE:B2' name='win11_seabios_117' ip='192.168.100.117'/>
+      <host mac='02:81:6C:AF:91:DA' name='win11_seabios_118' ip='192.168.100.118'/>
+      <host mac='02:50:C3:2F:25:A8' name='win11_seabios_119' ip='192.168.100.119'/>
+      <host mac='02:A9:18:91:B0:5A' name='win11_seabios_120' ip='192.168.100.120'/>
+      <host mac='02:60:53:07:26:0D' name='win11_seabios_121' ip='192.168.100.121'/>
+      <host mac='02:A1:5E:C8:8F:21' name='win11_seabios_122' ip='192.168.100.122'/>
+      <host mac='02:F9:16:5A:DC:BA' name='win11_seabios_123' ip='192.168.100.123'/>
+      <host mac='02:33:25:B8:14:24' name='win11_seabios_124' ip='192.168.100.124'/>
+    </dhcp>
+  </ip>
+  <dnsmasq:options>
+    <dnsmasq:option value='dhcp-option=3,192.168.100.1'/>
+    <dnsmasq:option value='dhcp-option=6,8.8.8.8,8.8.4.4'/>
+    <dnsmasq:option value='dhcp-option=44,0.0.0.0'/>
+    <dnsmasq:option value='dhcp-option=45,0.0.0.0'/>
+    <dnsmasq:option value='dhcp-option=46,8'/>
+    <dnsmasq:option value='dhcp-option=252,&quot;\n&quot;'/>
+    <dnsmasq:option value='stop-dns-rebind'/>
+  </dnsmasq:options>
+</network>
+

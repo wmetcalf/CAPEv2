@@ -1,0 +1,103 @@
+name: fakenet-build
+
+# Builds `cape-fakenet.deb` — the FakeNet-NG containerized network-
+# simulation stack used by CAPE's rooter inetsim_trap() when an
+# analysis is submitted with route=inetsim.
+#
+# Ships only the source tree (Dockerfile + fakenet.ini + patch_fakenet
+# + CA pair) at /opt/CAPEv2/docker/fakenet-ng/.  The image itself is
+# built at deb install time (postinst runs `docker compose build`)
+# so the .deb stays small (~10 KB) and ami-bake's installed-size
+# remains modest.
+#
+# Triggers:
+#   - workflow_dispatch (ad-hoc rebuilds — Dockerfile / fakenet.ini
+#     edits, CA pair rotation)
+#   - push to aws-nested-virt/fakenet-build/ or this workflow file
+#
+# Artifact: cape-fakenet-debs-<version>
+#   Consumed by apt-publish.yml fan-in (same shape as cape-host-
+#   runtime-debs-* / cape-host-config-debs-*).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override package version (default: YYYYMMDD)'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'aws-nested-virt/fakenet-build/**'
+      - '.github/workflows/fakenet-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fakenet-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+              dpkg-dev ca-certificates
+
+      - name: Determine PACKAGE_VERSION
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+              VER="${{ inputs.version }}"
+          else
+              VER=$(date -u +%Y%m%d)
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VER"
+
+      - name: Build cape-fakenet.deb
+        env:
+          PACKAGE_VERSION: ${{ steps.ver.outputs.version }}
+          OUT_DIR: ${{ github.workspace }}/aws-nested-virt/dist
+        run: cd aws-nested-virt && bash fakenet-build/package.sh
+
+      - name: Sanity check the .deb
+        run: |
+          set -euo pipefail
+          deb=$(ls aws-nested-virt/dist/cape-fakenet_*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::no .deb produced"; exit 1; }
+          echo "=== deb metadata ==="
+          dpkg-deb -I "$deb"
+          echo ""
+          echo "=== contents ==="
+          dpkg-deb -c "$deb"
+          # Confirm the four shipped opt/ files are all present + the
+          # cape-fakenet.service unit + the networkd-dispatcher hook.
+          for f in opt/CAPEv2/docker/fakenet-ng/Dockerfile \
+                   opt/CAPEv2/docker/fakenet-ng/docker-compose.yml \
+                   opt/CAPEv2/docker/fakenet-ng/fakenet.ini \
+                   opt/CAPEv2/docker/fakenet-ng/patch_fakenet.py \
+                   etc/systemd/system/cape-fakenet.service \
+                   etc/networkd-dispatcher/routable.d/50-cape-fakenet; do
+              dpkg-deb -c "$deb" | awk '{print $6}' | grep -qx "./$f" \
+                  || { echo "::error::missing $f in deb"; exit 1; }
+          done
+
+      - name: Upload artifact for apt-publish fan-in
+        uses: actions/upload-artifact@v4
+        with:
+          name: cape-fakenet-debs-${{ steps.ver.outputs.version }}
+          path: aws-nested-virt/dist/*.deb
+          if-no-files-found: error
+          retention-days: 90
