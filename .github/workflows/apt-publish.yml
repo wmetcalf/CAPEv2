@@ -536,8 +536,8 @@ jobs:
             -f cape_qemu_version="${{ steps.versions.outputs.cape_qemu_version }}" \
             -f cape_suricata_version="${{ steps.versions.outputs.cape_suricata_version }}" \
             -f run_layer5=false \
-            -f promote_on_success=true
-          echo "::notice::Dispatched cape-deb-e2e for cape-core=${{ steps.versions.outputs.cape_core_version }}; on green, will promote to channel=main."
+            -f promote_on_success=${{ vars.AUTO_PROMOTE_TO_PROD || 'false' }}
+          echo "::notice::Dispatched cape-deb-e2e for cape-core=${{ steps.versions.outputs.cape_core_version }}; promote_on_success=${{ vars.AUTO_PROMOTE_TO_PROD || 'false' }} (set repo var AUTO_PROMOTE_TO_PROD=true to auto-promote dev->prod and bake an AMI; default off so a dev push never launches a paid m8i ami-bake unprompted)."
 
       - name: Compute OS-affecting deb sha256s
         # Compute a sha256 per OS-affecting deb, then a single combined

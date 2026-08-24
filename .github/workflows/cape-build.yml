@@ -130,6 +130,29 @@ jobs:
           # the MT gate's $PWD/debian venv lookup) sees this staged copy.
           cp -r aws-nested-virt/debian ./debian
 
+      - name: Stamp a tilde-free, build-unique deb version
+        env:
+          DEBEMAIL: "noreply@example.invalid"
+          DEBFULLNAME: "CAPEv2 CI"
+        run: |
+          set -euo pipefail
+          # debian/changelog ships a Debian pre-release version (…~unreleased).
+          # GitHub Releases (the apt host) sanitizes '~' -> '.' in asset
+          # filenames, so the published .deb name diverges from the Packages
+          # index Filename: and apt 404s — this hits cape-core AND cape-signatures
+          # (the only debs whose version carries '~'; '+cape.N' packages are fine).
+          # Stamp a tilde-free, build-unique version instead: 0.1.0+<UTCdate>.g<sha7>.
+          # '+' and '.' pass through GitHub Releases verbatim, the version sorts
+          # forward on every build (so apt sees newer + upgrades), and the short
+          # sha ties each build to its commit. cape-core and cape-signatures both
+          # derive from this single source changelog.
+          base="$(dpkg-parsechangelog -l debian/changelog -S Version | sed 's/[~+-].*$//')"
+          ver="${base}+$(date -u +%Y%m%d).g${GITHUB_SHA::7}"
+          dch -c debian/changelog -b -v "$ver" -D unstable \
+              "CI build ${GITHUB_SHA::7}: tilde-free, GitHub-Releases-safe filename."
+          echo "stamped deb version: $ver"
+          head -1 debian/changelog
+
       - name: Install Build-Depends from debian/control
         run: |
           set -euo pipefail
