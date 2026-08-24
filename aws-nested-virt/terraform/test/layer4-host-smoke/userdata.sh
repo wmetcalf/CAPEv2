@@ -192,7 +192,7 @@ fail=0
     # threat-content release (the same sidecar suricata-update fetches
     # first on a real client refresh). Bare-named asset — no path segments.
     srules_md5_url="${threat_content_url}/cape-rules.tar.gz.md5"
-    srules_md5=$(curl -fsS "$${srules_md5_url}" 2>/dev/null || echo "")
+    srules_md5=$(curl -fsSL "$${srules_md5_url}" 2>/dev/null || echo "")
     if [[ -n "$srules_md5" && "$${#srules_md5}" -ge 32 ]]; then
         echo "    ,{\"name\": \"suricata-rules-cdn\", \"pass\": true, \"md5\": \"$srules_md5\"}"
     else
@@ -232,8 +232,8 @@ fail=0
     # release (3rd-party-only; Cisco's standard CVDs stay on
     # database.clamav.net, not mirrored).
     clamav_url="${threat_content_url}/junk.ndb"
-    clamav_size=$(curl -fsSI "$${clamav_url}" 2>/dev/null \
-        | awk 'tolower($0) ~ /^content-length:/ {gsub(/\r/,""); print $2}' | head -1)
+    clamav_size=$(curl -fsSIL "$${clamav_url}" 2>/dev/null \
+        | awk 'tolower($0) ~ /^content-length:/ {gsub(/\r/,""); v=$2} END{print v}')
     if [[ -n "$clamav_size" && "$clamav_size" -gt 1000 ]]; then
         echo "    ,{\"name\": \"clamav-extra-mirror-cdn\", \"pass\": true, \"size\": $clamav_size}"
     else
