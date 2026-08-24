@@ -25,9 +25,9 @@
 
 set -euo pipefail
 
-: "$${INSTANCE_ID:?INSTANCE_ID required}"
-: "$${REGION:?REGION required}"
-: "$${REPO_ROOT:?REPO_ROOT required}"
+: "${INSTANCE_ID:?INSTANCE_ID required}"
+: "${REGION:?REGION required}"
+: "${REPO_ROOT:?REPO_ROOT required}"
 
 LOG=/tmp/layer5-eicar-driver.log
 exec > >(tee -a "$LOG") 2>&1
@@ -140,6 +140,9 @@ fi
 
 log "Running report through sandbox_forensics adapter"
 
+# set +e so a non-zero python exit (assertions failed) does not abort the
+# driver at the assignment under `set -e` before the reason is printed below.
+set +e
 ASSERT_OUT=$(REPO_ROOT="$REPO_ROOT" REPORT_JSON="$REPORT_JSON" python3 - <<'PYEOF'
 import json, os, sys
 
@@ -149,31 +152,36 @@ from sandbox_forensics.adapters import normalize  # noqa: E402
 with open(os.environ["REPORT_JSON"]) as f:
     report = json.load(f)
 
-result = normalize({"source": "cape", "report": report})
+# normalize(native, source, job_id) -> sandbox-forensics-v1 dict. The v1
+# schema names the detection list "detections" (not "signatures") and
+# "disposition" is a LIST of tags (e.g. ["malicious"]).
+result = normalize(report, "cape", os.environ.get("LAYER5_JOB_ID", "layer5-eicar"))
 
-# Layer 5 day-1 floor: looser than the golden fixture's 13 sigs / score 10.0
-# because the AMI under test may not have ET Open / freshclam current.
-# Tighten as the test corpus stabilizes.
-floor = {
-    "min_signatures": 5,
-    "min_score": 5.0,
-    "expect_disposition": "malicious",
-}
-
-sig_count = len(result.get("signatures", []))
-score = float(result.get("score", 0))
-disposition = result.get("disposition", "")
+# EICAR floor. EICAR is a STATIC antivirus test string, not a behavioral
+# payload: a 16-bit DOS .com does not execute on 64-bit Win11, so behavioral
+# CAPE signatures fire ~zero and the golden fixture's 13 sigs / 10.0 score /
+# "malicious" disposition are unreachable. The ONLY reliably-true fact is that
+# EICAR produces at least one DETECTION (the ClamAV Eicar static hit) — CAPE's
+# malscore and disposition for a static-only hit are UNKNOWN until a real run
+# (a low malscore maps disposition to "unknown", so hard-requiring "malicious"
+# would false-red a genuine detection). So HARD-gate only on detections >= 1
+# and RECORD score/disposition/eicar-named for calibration. Tighten UP once the
+# first real run gives concrete numbers.
+sig_count = len(result.get("detections", []))
+score = float(result.get("score", 0) or 0)
+disposition = result.get("disposition", [])
+eicar_named = any(
+    "eicar" in (str(d.get("rule", "")) + " " + str(d.get("description", ""))).lower()
+    for d in result.get("detections", [])
+)
 
 failures = []
-if sig_count < floor["min_signatures"]:
-    failures.append(f"signatures: got {sig_count}, expected ≥ {floor['min_signatures']}")
-if score < floor["min_score"]:
-    failures.append(f"score: got {score}, expected ≥ {floor['min_score']}")
-if floor["expect_disposition"] not in disposition:
-    failures.append(f"disposition: got '{disposition}', expected to contain '{floor['expect_disposition']}'")
+if sig_count < 1:
+    failures.append(f"detections: got {sig_count}, expected >= 1 (EICAR should trigger a ClamAV static detection)")
 
 print(json.dumps({
-    "signatures_fired": sig_count,
+    "detections_fired": sig_count,
+    "eicar_named_detection": eicar_named,
     "score": score,
     "disposition": disposition,
     "fail": 1 if failures else 0,
@@ -184,6 +192,7 @@ sys.exit(1 if failures else 0)
 PYEOF
 )
 ASSERT_RC=$?
+set -e
 
 echo "$ASSERT_OUT"
 
@@ -194,7 +203,8 @@ fi
 
 log "Layer 5 EICAR assertions passed"
 
-# Stamp result on-host so run-layer-test.sh's marker poll can finalize.
-ssm_run "echo '$ASSERT_OUT' | sudo tee /var/log/layer5-eicar-result.json"
+# Stamp result on-host (best-effort). Never flip an already-passed detonation
+# to a failure if this SSM echo hiccups — the file is not read back anyway.
+ssm_run "echo '$ASSERT_OUT' | sudo tee /var/log/layer5-eicar-result.json" || true
 
 exit 0

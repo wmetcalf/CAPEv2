@@ -143,7 +143,10 @@ case "$LAYER" in
             -var "cape_admin_secret_name=$CAPE_ADMIN_SECRET_NAME"
             -var "aws_region=$REGION"
         )
-        BOOTSTRAP_DEADLINE_SEC=2400  # 40 min — clone rebuild + cape startup is the slow part
+        BOOTSTRAP_DEADLINE_SEC=3600  # 60 min — a full 24-clone rebuild (~32-35m)
+                                     # + apt overlay + cape startup can brush 40m
+                                     # on a HEALTHY host; give margin so a green
+                                     # host is not reported as a timeout.
         ;;
 esac
 

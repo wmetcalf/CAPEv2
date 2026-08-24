@@ -92,24 +92,88 @@ jobs:
             --region          us-east-1
 
   layer5:
-    name: Layer 5 — EICAR e2e
+    name: Layer 5 — EICAR detonation
     needs: layer4
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    if: ${{ inputs.run_layer5 }}
+    timeout-minutes: 75
+    # Real EICAR detonation gate. Runs when we intend to promote (its whole
+    # purpose is to gate promotion) or when explicitly forced via run_layer5.
+    # It launches the latest baked cape-host-base AMI, overlays the dev debs
+    # under test, rebuilds the Win11 fleet, and submits EICAR through the CAPE
+    # API — asserting score/disposition/detections via broker/sandbox_forensics.
+    # Before the FIRST bake no cape-host-base AMI exists, so the resolve step
+    # SKIPS the detonation (non-blocking): the first promotion proceeds on
+    # Layer 4 alone and every later one is detonation-gated. A real detonation
+    # FAILURE fails this job, which blocks promote via its !failure() gate.
+    if: ${{ needs.layer4.result == 'success' && (inputs.run_layer5 || inputs.promote_on_success) }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-      - name: Layer 5 stub
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.E2E_TEST_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Resolve baseline cape-host-base AMI (skip detonation if none yet)
+        id: baseline
         run: |
-          echo "::warning::Layer 5 implementation is a stub. EICAR e2e on nestedvirt-ami stack lands in a follow-up commit."
-          echo "Pinned versions that *would* be tested:"
-          echo "  cape-core=${{ inputs.cape_core_version }}"
-          echo "  cape-signatures=${{ inputs.cape_signatures_version }}"
-          echo "  cape-qemu=${{ inputs.cape_qemu_version }}"
-          echo "  cape-suricata=${{ inputs.cape_suricata_version }}"
+          set -euo pipefail
+          ami=$(aws ec2 describe-images --region us-east-1 --owners self \
+            --filters 'Name=tag:Owner,Values=capev2' \
+                      'Name=tag:Purpose,Values=cape-host-base' \
+                      'Name=tag:Retention,Values=keep' \
+                      'Name=state,Values=available' \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text 2>/dev/null || echo None)
+          if [ -z "$ami" ] || [ "$ami" = None ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::No cape-host-base AMI exists yet — EICAR detonation SKIPPED (bootstrap). Layer 5 gates every promotion once the first AMI is baked."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "ami_id=$ami" >> "$GITHUB_OUTPUT"
+            echo "::notice::Detonating EICAR against cape-host-base AMI $ami (dev debs overlaid)."
+          fi
+
+      - name: Install terraform + jq
+        if: ${{ steps.baseline.outputs.skip == 'false' }}
+        run: |
+          set -euo pipefail
+          TF_VERSION="1.13.5"
+          curl -fsSL -o /tmp/terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/terraform
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends jq
+
+      - name: Run Layer 5 EICAR detonation
+        if: ${{ steps.baseline.outputs.skip == 'false' }}
+        env:
+          THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+          LAYER5_JOB_ID: ${{ github.run_id }}
+          CAPE_ADMIN_SECRET_NAME: ${{ vars.CAPE_ADMIN_SECRET_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CAPE_ADMIN_SECRET_NAME}" ]; then
+            echo "::error::vars.CAPE_ADMIN_SECRET_NAME is unset — Layer 5 needs the CAPE admin Secrets Manager secret name for API auth."
+            exit 1
+          fi
+          ./aws-nested-virt/terraform/test/scripts/run-layer-test.sh \
+            --layer 5 \
+            --apt-repo-url       "${{ vars.APT_DEV_REPO_URL }}" \
+            --apt-keyring-url    "${{ vars.APT_DEV_REPO_URL }}/keyring.asc" \
+            --threat-content-url "$THREAT_CONTENT_URL" \
+            --cape-core-version       "${{ inputs.cape_core_version }}" \
+            --cape-signatures-version "${{ inputs.cape_signatures_version }}" \
+            --cape-qemu-version       "${{ inputs.cape_qemu_version }}" \
+            --cape-suricata-version   "${{ inputs.cape_suricata_version }}" \
+            --cape-host-base-ami-id   "${{ steps.baseline.outputs.ami_id }}" \
+            --cape-admin-secret-name  "${CAPE_ADMIN_SECRET_NAME}" \
+            --test-run-id     "$GITHUB_RUN_ID" \
+            --region          us-east-1
 
   promote:
     name: Promote dev → prod apt channel

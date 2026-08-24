@@ -17,6 +17,13 @@ exec > >(tee /var/log/layer5-userdata.log | logger -t layer5-userdata -s 2>/dev/
 
 echo "[$(date -Iseconds)] Layer 5 EICAR e2e bootstrap starting"
 
+# The nested-virt enablement restarts this instance, so userdata runs twice
+# (pre- and post-restart). Reset any marker a preempted first boot may have
+# left on the persistent root — the runner treats ANY non-NOT_READY content as
+# "ready", so a stale marker would hand the driver a still-reprovisioning host.
+RESULT=/var/log/layer5-bootstrap-result.json
+rm -f /var/log/layer5-bootstrap-result.json /var/log/layer5-eicar-result.json
+
 export DEBIAN_FRONTEND=noninteractive
 export AWS_REGION="${aws_region}"
 export AWS_DEFAULT_REGION="${aws_region}"
@@ -86,8 +93,15 @@ else
   exit 1
 fi
 
-echo "[$(date -Iseconds)] Rebuilding 24 clones via $CLONE_SCRIPT..."
-bash "$CLONE_SCRIPT" win11_seabios 101 124 192.168.100 linked
+echo "[$(date -Iseconds)] Rebuilding clones via $CLONE_SCRIPT..."
+# clone-win11-vms.sh has many hard exit-1 paths. Under `set -e` a bare call
+# would abort userdata BEFORE the marker block, leaving the runner to poll
+# NOT_READY for the full 40-min deadline. Emit a fail:1 marker so it fails fast.
+if ! bash "$CLONE_SCRIPT" win11_seabios 101 124 192.168.100 linked; then
+  echo '{"fail": 1, "stage": "clone-rebuild", "reason": "clone-win11-vms.sh exited non-zero"}' > "$RESULT"
+  echo "[$(date -Iseconds)] FATAL: clone rebuild failed" >&2
+  exit 1
+fi
 
 ############################################################
 # 3. Service restart, in the same order nestedvirt-ami uses.
@@ -112,13 +126,18 @@ systemctl restart cape.service cape-web.service cape-processor.service guac-web.
 
 CAPE_ADMIN_SECRET_ARN="${cape_admin_secret_arn}"
 if [[ -n "$${CAPE_ADMIN_SECRET_ARN}" ]]; then
-  CAPE_ADMIN_SECRET_JSON=$(aws secretsmanager get-secret-value \
-    --secret-id "$${CAPE_ADMIN_SECRET_ARN}" \
-    --query SecretString --output text)
-
-  sudo -u cape -H \
-    CAPE_ADMIN_SECRET_JSON="$${CAPE_ADMIN_SECRET_JSON}" \
-    bash -c "cd /opt/CAPEv2/web && /etc/poetry/bin/poetry run python manage.py shell" <<'PYEOF'
+  # Best-effort admin sync. If apiv2 is AllowAny on this AMI the admin user is
+  # unused; and a failure here (e.g. the known absent-cape-pg-role bake defect)
+  # must NOT abort userdata under `set -e` nor red the run — the EICAR submit
+  # below reveals whether auth was actually required (it 401s). So it is
+  # guarded and non-fatal, with the secret never echoed.
+  if CAPE_ADMIN_SECRET_JSON=$(aws secretsmanager get-secret-value \
+       --secret-id "$${CAPE_ADMIN_SECRET_ARN}" \
+       --query SecretString --output text 2>/dev/null); then
+    sudo -u cape -H \
+      CAPE_ADMIN_SECRET_JSON="$${CAPE_ADMIN_SECRET_JSON}" \
+      bash -c "cd /opt/CAPEv2/web && /etc/poetry/bin/poetry run python manage.py shell" <<'PYEOF' \
+      || echo "[$(date -Iseconds)] WARN: CAPE admin sync failed (continuing; apiv2 may be AllowAny)"
 import json, os
 from django.contrib.auth import get_user_model
 data = json.loads(os.environ["CAPE_ADMIN_SECRET_JSON"])
@@ -134,7 +153,10 @@ u.set_password(data["password"])
 u.save()
 print(f"admin user provisioned: {u.username}")
 PYEOF
-  unset CAPE_ADMIN_SECRET_JSON
+    unset CAPE_ADMIN_SECRET_JSON
+  else
+    echo "[$(date -Iseconds)] WARN: could not read CAPE admin secret (continuing)"
+  fi
 fi
 
 ############################################################
@@ -159,9 +181,13 @@ done
 #    landed before we tell the driver "go ahead with EICAR".
 ############################################################
 
-RESULT=/var/log/layer5-bootstrap-result.json
 fail=0
 [[ "$ready" -eq 1 ]] || fail=1
+
+# The driver submits pinned to machine=win11_seabios_101, so a green marker
+# MUST guarantee that domain is DEFINED. Clones are snapshotted-then-off, so a
+# running-only check reads ~0 even on a healthy host — check dominfo, not list.
+if virsh dominfo win11_seabios_101 >/dev/null 2>&1; then vm101_defined=1; else vm101_defined=0; fail=1; fi
 
 declare -A expect=(
     [cape-core]="${cape_core_version}"
@@ -183,7 +209,8 @@ declare -A expect=(
         sep=","
     done
     echo "  },"
-    echo "  \"vms_running\": $(virsh list --name 2>/dev/null | grep -c '^win11_seabios_1' || echo 0),"
+    echo "  \"vms_defined\": $(virsh list --all --name 2>/dev/null | grep -c '^win11_seabios_1' || echo 0),"
+    echo "  \"vm101_defined\": $vm101_defined,"
     echo "  \"fail\": $fail"
     echo "}"
 } > "$RESULT"
