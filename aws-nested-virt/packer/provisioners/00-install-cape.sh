@@ -159,9 +159,31 @@ apt-get install -y -qq "${APT_NONINTERACTIVE[@]}" \
 # tooling (mongodb-org-mongos etc.) comes along too; --no-install-
 # recommends keeps the bake lean and stops mongodb-org-mongos from
 # claiming port 27018 alongside cape-mongodb's 27017.
+# Load-bearing runtime debs — these MUST install or the baked AMI is broken:
+#   cape-host-config  — the operational CAPE config mirror (without it CAPE
+#                       runs upstream defaults and behavioral analysis fails)
+#   cape-host-runtime — the systemd units/timers the host runs on
+#   cape-mongodb      — the report sink reporting.conf enables; cape.service
+#                       crash-loops on a missing mongod (127.0.0.1:27017 refused)
+# A transient apt failure here used to slip through a trailing `|| true` and a
+# log-only verify, silently producing an AMI whose cape.service never starts
+# (and whose post-deploy smoke gate then just times out). Retry, and hard-fail
+# the bake if it still can't install rather than swallowing the error.
+_req_ok=0
+for _attempt in 1 2 3; do
+    if apt-get install -y -qq --no-install-recommends "${APT_NONINTERACTIVE[@]}" \
+        cape-host-config cape-host-runtime cape-mongodb; then _req_ok=1; break; fi
+    echo "[00-install-cape] required-deb install attempt ${_attempt}/3 failed; retrying" >&2
+    apt-get update -qq || true
+    sleep 5
+done
+[ "$_req_ok" = 1 ] || { echo "[00-install-cape] FATAL: required cape-* debs (host-config/host-runtime/mongodb) failed to install after 3 attempts — refusing to bake a broken AMI" >&2; exit 1; }
+
+# Best-effort debs — threat content (cape-yara-forge/cape-sigma-rules may not be
+# published yet on a fresh apt repo) + cape-fakenet (inetsim fabric; not
+# load-bearing for a basic host). Logged, not hard-failed, by the verify below.
 apt-get install -y -qq --no-install-recommends "${APT_NONINTERACTIVE[@]}" \
-    cape-yara-forge cape-sigma-rules cape-host-config cape-host-runtime \
-    cape-mongodb cape-fakenet || true
+    cape-yara-forge cape-sigma-rules cape-fakenet || true
 
 # cape-libvirt installation is INTENTIONALLY DISABLED.
 #
@@ -190,15 +212,24 @@ apt-get install -y -qq --no-install-recommends "${APT_NONINTERACTIVE[@]}" \
 # unholds before its own `apt-get upgrade` step.
 apt-mark hold cape-core cape-signatures cape-qemu cape-suricata
 
-# Sanity: every cape-* package is present at the pinned version.
-for pkg in cape-core cape-signatures cape-qemu cape-suricata; do
-    installed=$(dpkg-query -W -f='${Version}' "$pkg")
+# Sanity: every load-bearing cape-* package must be present, else hard-fail the
+# bake — a missing required deb produces an AMI whose cape.service never starts,
+# so it must never be published (belt-and-suspenders with the retry above).
+# cape-host-config/host-runtime/mongodb are as load-bearing as the core four.
+_missing=""
+for pkg in cape-core cape-signatures cape-qemu cape-suricata \
+           cape-host-config cape-host-runtime cape-mongodb; do
+    installed=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo MISSING)
     echo "  $pkg: $installed"
+    [ "$installed" = MISSING ] && _missing="$_missing $pkg"
 done
-# Threat-content packages — log presence, don't hard-fail (some may
-# legitimately not be published yet on a fresh apt repo).
-for pkg in cape-yara-forge cape-sigma-rules cape-host-config cape-host-runtime \
-           cape-mongodb cape-fakenet; do
+if [ -n "$_missing" ]; then
+    echo "[00-install-cape] FATAL: required deb(s) missing:$_missing — refusing to bake a broken AMI" >&2
+    exit 1
+fi
+# Best-effort packages — log presence, don't hard-fail (threat content may not
+# be published yet on a fresh apt repo; cape-fakenet is not load-bearing).
+for pkg in cape-yara-forge cape-sigma-rules cape-fakenet; do
     installed=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo MISSING)
     echo "  $pkg: $installed"
 done
