@@ -362,6 +362,63 @@ APPARMOR_RULE
             sed -i "/^\\[auxiliary_modules\\]/,/^\\[/{s/^$key = yes$/$key = no/;}" /etc/cape/auxiliary.conf || true
         }
 
+        # cuckoo.conf — core engine settings.  cape-core ships the
+        # upstream default (conf/default/cuckoo.conf.default ->
+        # /etc/cape/cuckoo.conf) and the section-toggle helpers above
+        # never touch it, so the operational values that actually make
+        # behavioral analysis stream back on this fleet were silently
+        # dropped by the deb pipeline (the retired mirror-live-host
+        # mechanism used to carry them).  Restore them here.
+        CUCKOO_CONF=/etc/cape/cuckoo.conf
+        if [ -f "$CUCKOO_CONF" ]; then
+            # [resultserver] ip -> 0.0.0.0 (bind ALL interfaces).  The
+            # upstream default 192.168.1.1 is a foreign/absent subnet on
+            # the nestedvirt host: the ResultServer binds to a dead
+            # address, the guest analyzer can't reach it to stream its
+            # behavioral logs, and the task dies with "Agent is likely
+            # unresponsive" (hard timeout, ZERO captured — no procs, no
+            # dump.pcap, no screenshots; a static/file task still works,
+            # so it looks like a network bug but isn't).  0.0.0.0 makes
+            # the per-VM resultserver_ip=192.168.100.1 entries that
+            # clone-win11-vms.sh writes into kvm.conf reachable; the
+            # upstream comment in the file mandates exactly this pairing.
+            sed -i "/^\\[resultserver\\]/,/^\\[/{s/^ip = 192\\.168\\.1\\.1$/ip = 0.0.0.0/;}" \
+                "$CUCKOO_CONF" || true
+
+            # [resultserver] multiworker -> yes: run one ResultServer per
+            # analysis VM, each bound to that VM's own resultserver_port
+            # (21NN) as generated into kvm.conf.  REQUIRED with the
+            # per-machine distinct ports — without it a single ResultServer
+            # listens only on the global :2042 and every guest told to
+            # reach :21NN hangs.  Upstream ships the key as
+            # `multiworker = no`, so flip it in place; append only as a
+            # fallback if a future default drops the key entirely.
+            sed -i "/^\\[resultserver\\]/,/^\\[/{s/^multiworker = no$/multiworker = yes/;}" \
+                "$CUCKOO_CONF" || true
+            if ! grep -qE '^multiworker = ' "$CUCKOO_CONF"; then
+                sed -i "/^\\[resultserver\\]/a multiworker = yes" "$CUCKOO_CONF" || true
+            fi
+
+            # [cuckoo] max_machines_count -> 24: concurrent-analysis cap =
+            # the default single-node fleet size (24 linked clones).
+            # Upstream default 10 would leave 14 of the 24 VMs idle.
+            sed -i "/^\\[cuckoo\\]/,/^\\[/{s/^max_machines_count = 10$/max_machines_count = 24/;}" \
+                "$CUCKOO_CONF" || true
+
+            # [timeouts] default -> 180: default per-analysis timeout
+            # (seconds) the reference host runs.
+            sed -i "/^\\[timeouts\\]/,/^\\[/{s/^default = 200$/default = 180/;}" \
+                "$CUCKOO_CONF" || true
+
+            # [processing] dns_over_https -> on: resolve post-analysis DNS
+            # via DoH (dns.google) instead of the system resolver.  Key is
+            # absent from the upstream default, so append it under the
+            # [processing] header (idempotent).
+            if ! grep -qE '^dns_over_https = ' "$CUCKOO_CONF"; then
+                sed -i "/^\\[processing\\]/a dns_over_https = on" "$CUCKOO_CONF" || true
+            fi
+        fi
+
         # web.conf — UI/feature toggles.  display_* sections drive the
         # analysis-list column visibility (ETW, CAPE YARA, ET/PT portal,
         # sigma signatures, authenticode, submitter) + the per-task
@@ -420,9 +477,22 @@ APPARMOR_RULE
         # [auxiliary_modules] block below.
         for s in suricata curtain sysmon analysisinfo decompression \
                  dumptls amsi behavior amsi_etw network_etw decryptpcap \
-                 sigma; do
+                 sigma deduplication; do
             flip_section_enabled /etc/cape/processing.conf "$s"
         done
+
+        # processing.conf sub-keys the section-enable loop above can't
+        # reach (they're not `enabled = no` — they're named keys inside
+        # already-enabled sections).  [detections] clamav surfaces ClamAV
+        # hits in the report's detections summary (the section is on but
+        # clamav ships off); [behavior] network_map + [network]
+        # process_map build the process<->network correlation the
+        # reference host reports.  All pure-Python, no external dependency.
+        if [ -f /etc/cape/processing.conf ]; then
+            sed -i "/^\\[detections\\]/,/^\\[/{s/^clamav = no$/clamav = yes/;}" /etc/cape/processing.conf || true
+            sed -i "/^\\[behavior\\]/,/^\\[/{s/^network_map = no$/network_map = yes/;}" /etc/cape/processing.conf || true
+            sed -i "/^\\[network\\]/,/^\\[/{s/^process_map = no$/process_map = yes/;}" /etc/cape/processing.conf || true
+        fi
 
         # Suricata: socket mode (not cli).  Our cape-suricata binary is
         # built --enable-unix-socket and cape-host-runtime ships+enables
