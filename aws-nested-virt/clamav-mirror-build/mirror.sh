@@ -17,7 +17,7 @@
 # Operator host's freshclam.conf will then be:
 #   DatabaseMirror database.clamav.net            # Cisco standard
 #   DatabaseCustomURL https://apt.example.invalid/junk.ndb
-#   DatabaseCustomURL https://apt.example.invalid/urlhaus.ndb
+#   DatabaseCustomURL https://apt.example.invalid/twinclams.ldb
 #   ...
 #
 # Inputs:

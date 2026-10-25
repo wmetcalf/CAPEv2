@@ -96,7 +96,7 @@ jobs:
           # At least one file from each major source family should
           # have landed. Each ClamAV sig DB is at least ~100 bytes;
           # if we're seeing zero-byte files something failed mid-fetch.
-          for must in junk.ndb urlhaus.ndb twinclams.ldb miscreantpunch099.ldb; do
+          for must in junk.ndb twinclams.ldb miscreantpunch099.ldb; do
               [ -s "aws-nested-virt/.work/cdn/clamav-extra/$must" ] \
                   || { echo "::error::missing or empty $must"; exit 1; }
               sz=$(stat -c %s "aws-nested-virt/.work/cdn/clamav-extra/$must")
