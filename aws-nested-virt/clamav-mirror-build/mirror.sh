@@ -22,6 +22,8 @@
 #
 # Inputs:
 #   WORK_DIR             required, staging dir
+#   ABUSECH_AUTH_KEY     optional, abuse.ch Auth-Key for keyed feeds
+#                        (URLhaus); those feeds are skipped when unset
 #
 # Outputs:
 #   $WORK_DIR/cdn/clamav-extra/<basename>    one file per sources.txt entry
@@ -48,9 +50,20 @@ while IFS= read -r line; do
     line="$(echo "$line" | xargs)"
     [ -z "$line" ] && continue
 
-    fname=$(basename "$line")
-    log "Fetching $line → $fname"
-    if curl -fsSL --max-time 60 -o "$OUT_DIR/$fname.tmp" "$line"; then
+    read -r url fname <<< "$line"
+    fname="${fname:-$(basename "$url")}"
+    if [[ "$url" == *@ABUSECH_AUTH_KEY@* ]]; then
+        if [ -z "${ABUSECH_AUTH_KEY:-}" ]; then
+            log "::warning::ABUSECH_AUTH_KEY unset — skipping $fname"
+            continue
+        fi
+        fetch_url="${url//@ABUSECH_AUTH_KEY@/$ABUSECH_AUTH_KEY}"
+    else
+        fetch_url="$url"
+    fi
+    # Log the template URL so the Auth-Key never reaches the job log.
+    log "Fetching $url → $fname"
+    if curl -fsSL --max-time 120 -o "$OUT_DIR/$fname.tmp" "$fetch_url"; then
         # Sanity: every ClamAV signature DB is at least a few hundred bytes.
         # Empty / tiny files almost always indicate an error page returned
         # as 200 (some sources do that on transient outages).
@@ -64,7 +77,7 @@ while IFS= read -r line; do
         mv "$OUT_DIR/$fname.tmp" "$OUT_DIR/$fname"
         ok=$((ok + 1))
     else
-        log "::warning::failed to fetch $line"
+        log "::warning::failed to fetch $url"
         rm -f "$OUT_DIR/$fname.tmp"
         fail=$((fail + 1))
     fi

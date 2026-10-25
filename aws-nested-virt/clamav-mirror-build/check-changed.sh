@@ -15,6 +15,7 @@
 #   THREAT_CONTENT_URL     required threat-content release base URL (single
 #                          rolling release; flat, bare-named assets)
 #   FORCE_REBUILD          if "true" → always proceed
+#   ABUSECH_AUTH_KEY       optional, abuse.ch Auth-Key for keyed feeds
 #
 # Outputs (printed in `KEY=VALUE` form for $GITHUB_OUTPUT consumption):
 #   changed=true|false
@@ -37,13 +38,30 @@ while IFS= read -r line; do
     line="${line%%#*}"
     line="$(echo "$line" | xargs)"
     [ -z "$line" ] && continue
+    read -r url _ <<< "$line"
+    # Keyed feeds: substitute the Auth-Key for the HEAD, but fingerprint
+    # the template URL so the key never lands in the published marker's
+    # preimage. Without a key the feed is skipped, fingerprinted as MISS.
+    if [[ "$url" == *@ABUSECH_AUTH_KEY@* ]]; then
+        if [ -n "${ABUSECH_AUTH_KEY:-}" ]; then
+            head_url="${url//@ABUSECH_AUTH_KEY@/$ABUSECH_AUTH_KEY}"
+        else
+            head_url=""
+        fi
+    else
+        head_url="$url"
+    fi
     # HEAD with timeout; if a source is down the missing header is
     # naturally part of the fingerprint (different from "source up").
-    hdrs=$(curl -fsSI --max-time 15 "$line" 2>/dev/null || echo "MISS")
+    if [ -n "$head_url" ]; then
+        hdrs=$(curl -fsSI --max-time 15 "$head_url" 2>/dev/null || echo "MISS")
+    else
+        hdrs="MISS"
+    fi
     lm=$(echo "$hdrs" | grep -i '^last-modified:' | tr -d '\r' || echo "")
     cl=$(echo "$hdrs" | grep -i '^content-length:' | tr -d '\r' || echo "")
     et=$(echo "$hdrs" | grep -i '^etag:'          | tr -d '\r' || echo "")
-    FP_LINES+="$line | $lm | $cl | $et"$'\n'
+    FP_LINES+="$url | $lm | $cl | $et"$'\n'
 done < "$SOURCES_FILE"
 
 NEW_FP=$(printf '%s' "$FP_LINES" | sha256sum | awk '{print $1}')

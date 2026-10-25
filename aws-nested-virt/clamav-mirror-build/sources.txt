@@ -26,7 +26,16 @@ http://ftp.swin.edu.au/sanesecurity/spamattach.hdb
 http://ftp.swin.edu.au/sanesecurity/spamimg.hdb
 http://ftp.swin.edu.au/sanesecurity/winnow_malware_links.ndb
 
-# URLhaus urlhaus.ndb removed: abuse.ch retired the ClamAV feed (410 Gone).
+# Line format: <url> [<output-basename>]. The basename defaults to the
+# URL's last path segment. @ABUSECH_AUTH_KEY@ is substituted from the
+# ABUSECH_AUTH_KEY env var; lines needing it are skipped when it's unset.
+
+# URLhaus (abuse.ch malware URL list, CC0). The keyless
+# /downloads/urlhaus.ndb was retired (410 Gone, 2026-10); the export
+# now needs an abuse.ch Auth-Key (https://auth.abuse.ch/). Published
+# under the old urlhaus.ndb name so deployed freshclam.conf keeps working.
+https://urlhaus-api.abuse.ch/v2/files/exports/@ABUSECH_AUTH_KEY@/urlhaus_clamav.ndb urlhaus.ndb
+
 # Sanesecurity winnow.attachments/winnow_bad_cw/winnow_extended_malware/
 # winnow_malware removed: retired upstream, now EICAR-only stubs.
 

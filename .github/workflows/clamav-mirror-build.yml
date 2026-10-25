@@ -62,6 +62,7 @@ jobs:
           # check-changed.sh reads the upstream-fingerprint.txt marker as a
           # bare asset on the single rolling threat-content release.
           THREAT_CONTENT_URL: ${{ vars.THREAT_CONTENT_URL }}
+          ABUSECH_AUTH_KEY: ${{ secrets.ABUSECH_AUTH_KEY }}
         run: |
           set -euo pipefail
           cd aws-nested-virt && bash clamav-mirror-build/check-changed.sh | tee /tmp/check.out
@@ -87,16 +88,22 @@ jobs:
         env:
           WORK_DIR: ${{ github.workspace }}/aws-nested-virt/.work
           UPSTREAM_FINGERPRINT: ${{ needs.check.outputs.upstream_fingerprint }}
+          ABUSECH_AUTH_KEY: ${{ secrets.ABUSECH_AUTH_KEY }}
         run: cd aws-nested-virt && bash clamav-mirror-build/mirror.sh
 
       - name: Sanity check the mirror tree
+        env:
+          HAVE_ABUSECH_KEY: ${{ secrets.ABUSECH_AUTH_KEY != '' }}
         run: |
           set -euo pipefail
           ls -la aws-nested-virt/.work/cdn/clamav-extra/
           # At least one file from each major source family should
           # have landed. Each ClamAV sig DB is at least ~100 bytes;
           # if we're seeing zero-byte files something failed mid-fetch.
-          for must in junk.ndb twinclams.ldb miscreantpunch099.ldb; do
+          # URLhaus is only required once the abuse.ch key is configured.
+          required="junk.ndb twinclams.ldb miscreantpunch099.ldb"
+          [ "$HAVE_ABUSECH_KEY" = "true" ] && required="$required urlhaus.ndb"
+          for must in $required; do
               [ -s "aws-nested-virt/.work/cdn/clamav-extra/$must" ] \
                   || { echo "::error::missing or empty $must"; exit 1; }
               sz=$(stat -c %s "aws-nested-virt/.work/cdn/clamav-extra/$must")
