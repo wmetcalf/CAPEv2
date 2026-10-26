@@ -24,14 +24,11 @@ http://ftp.swin.edu.au/sanesecurity/scam.ndb
 http://ftp.swin.edu.au/sanesecurity/sigwhitelist.ign2
 http://ftp.swin.edu.au/sanesecurity/spamattach.hdb
 http://ftp.swin.edu.au/sanesecurity/spamimg.hdb
-http://ftp.swin.edu.au/sanesecurity/winnow.attachments.hdb
-http://ftp.swin.edu.au/sanesecurity/winnow_bad_cw.hdb
-http://ftp.swin.edu.au/sanesecurity/winnow_extended_malware.hdb
-http://ftp.swin.edu.au/sanesecurity/winnow_malware.hdb
 http://ftp.swin.edu.au/sanesecurity/winnow_malware_links.ndb
 
-# URLhaus (abuse.ch malware URL list)
-https://urlhaus.abuse.ch/downloads/urlhaus.ndb
+# URLhaus urlhaus.ndb removed: abuse.ch retired the ClamAV feed (410 Gone).
+# Sanesecurity winnow.attachments/winnow_bad_cw/winnow_extended_malware/
+# winnow_malware removed: retired upstream, now EICAR-only stubs.
 
 # Splunk twinclams / twinwave
 https://raw.githubusercontent.com/splunk/twinclams/master/twinclams.ldb
