@@ -442,6 +442,9 @@ jobs:
         # Both channels need the version map: main-dev fans out to
         # cape-deb-e2e; main fans out to ami-bake.
         if: ${{ steps.verify.outputs.has_debs == 'true' && steps.noop_check.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ vars.APT_PUBLISH_REPO || github.repository }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -459,12 +462,40 @@ jobs:
               local stripped="${fname#${pkg}_}"
               echo "${stripped%_*.deb}"
           }
-          {
-              echo "cape_core_version=$(extract cape-core)"
-              echo "cape_signatures_version=$(extract cape-signatures)"
-              echo "cape_qemu_version=$(extract cape-qemu)"
-              echo "cape_suricata_version=$(extract cape-suricata)"
-          } >> "$GITHUB_OUTPUT"
+          # A package whose build artifact has expired (90-day retention)
+          # is absent from dist/ even though the additive publish kept it in
+          # the pool. Pin it to the highest version on apt-prod — the last
+          # e2e-blessed build — rather than the dev pool, which can hold
+          # non-release debs (e.g. 0.1.0.unreleased) that dpkg ranks higher.
+          prod_assets=$(gh release view apt-prod --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          from_prod() {
+              local pkg="$1" best="" v
+              while IFS= read -r a; do
+                  [[ "$a" == "${pkg}"_*_*.deb ]] || continue
+                  v="${a#${pkg}_}"; v="${v%_*.deb}"
+                  if [ -z "$best" ] || dpkg --compare-versions "$v" gt "$best"; then best="$v"; fi
+              done <<< "$prod_assets"
+              echo "$best"
+          }
+          missing=""
+          for pkg in cape-core cape-signatures cape-qemu cape-suricata; do
+              v="$(extract "$pkg")"
+              if [ -z "$v" ]; then
+                  v="$(from_prod "$pkg")"
+                  if [ -n "$v" ]; then
+                      echo "::notice::$pkg not in this fan-in (artifact expired?) — pinning apt-prod version $v for e2e"
+                  else
+                      missing="$missing $pkg"
+                  fi
+              fi
+              echo "${pkg//-/_}_version=$v" >> "$GITHUB_OUTPUT"
+          done
+          if [ -n "$missing" ]; then
+              echo "::warning::no version resolvable for:$missing — cape-deb-e2e dispatch will be skipped"
+              echo "complete=false" >> "$GITHUB_OUTPUT"
+          else
+              echo "complete=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Write apt-publish digest marker
         # Stamp the just-published deb-set digest as the apt-publish-
@@ -523,7 +554,10 @@ jobs:
         # input returns HTTP 422 "Required input 'cape_core_version'
         # not provided" — caught in earlier testing the
         # first time the noop_check skip path actually fired.
-        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main-dev' && steps.noop_check.outputs.skip != 'true' }}
+        #
+        # Also gated on versions.complete: every pinned input must resolve
+        # (from this fan-in or apt-prod), otherwise the dispatch 422s.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main-dev' && steps.noop_check.outputs.skip != 'true' && steps.versions.outputs.complete == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -613,7 +647,8 @@ jobs:
         # compare it against the latest cape-host-base AMI's OsDebHashes
         # tag and no-op early. ami-bake's own `concurrency: ami-bake` group
         # serializes runs, so an unconditional dispatch can't pile up.
-        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main' }}
+        # Gated on versions.complete for the same 422 reason as e2e above.
+        if: ${{ steps.verify.outputs.has_debs == 'true' && steps.channel.outputs.channel == 'main' && steps.versions.outputs.complete == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
