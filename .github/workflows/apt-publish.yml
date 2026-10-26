@@ -465,8 +465,10 @@ jobs:
           # A package whose build artifact has expired (90-day retention)
           # is absent from dist/ even though the additive publish kept it in
           # the pool. Pin it to the highest version on apt-prod — the last
-          # e2e-blessed build — rather than the dev pool, which can hold
-          # non-release debs (e.g. 0.1.0.unreleased) that dpkg ranks higher.
+          # e2e-blessed build — rather than whatever happens to sit in the
+          # dev pool. Asset names are GitHub-sanitized ('~' -> '.'), so the
+          # pre-d8a0e08 0.1.0~unreleased debs look like 0.1.0.unreleased
+          # here; prod never carried those, so comparing names is safe.
           prod_assets=$(gh release view apt-prod --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
           from_prod() {
               local pkg="$1" best="" v
