@@ -9,8 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-from lib.cuckoo.core.database import Database, init_database
-
 if sys.version_info[:2] < (3, 8):
     sys.exit("You are running an incompatible version of Python, please use >= 3.8")
 
@@ -24,6 +22,7 @@ try:
 
     from lib.cuckoo.common.constants import CUCKOO_ROOT, CUCKOO_VERSION
     from lib.cuckoo.common.logo import logo
+    from lib.cuckoo.core.database import Database, init_database
     from lib.cuckoo.core.resultserver import ResultServer
     from lib.cuckoo.core.scheduler import Scheduler
     from lib.cuckoo.core.startup import (
@@ -83,8 +82,8 @@ def cuckoo_init(quiet=False, debug=False, artwork=False, test=False):
     init_modules()
     with Database().session.begin():
         init_tasks()
-    init_rooter()
-    init_routing()
+    init_rooter(apply_state=True)  # scheduler owns the rooter state reset (codex P1)
+    init_routing(apply_nexthop_state=True)  # scheduler owns the nexthop sweep/build/arm (codex P2)
     check_tcpdump_permissions()
 
     # This is just a temporary hack, we need an actual test suite to integrate with Travis-CI.

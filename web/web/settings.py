@@ -106,16 +106,8 @@ NETWORK_PROC_MAP = pro_cfg.network.process_map
 # python3 manage.py runserver_plus 0.0.0.0:8000 --traceback --keep-meta-shutdown
 DEBUG = True
 
-# Django's auth/sessions/admin SQLite DB.  The cape-core deb ships
-# /opt/CAPEv2/web as root:root via dpkg, so the upstream relative
-# "siteauth.sqlite" default lands cape-services unable to write the
-# SQLite journal/WAL companion files in that directory (SQLite
-# requires write on the enclosing dir, not just the file).  Anchor
-# at the cape state directory under /var/lib/cape/django/, which
-# cape-core.postinst creates with cape:cape ownership.  CAPE's own
-# analysis DB still lives at postgres://cape:...@localhost/cape; this
-# SQLite handles only Django's auth/sessions tables.
-DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "/var/lib/cape/django/siteauth.sqlite"}}
+# Database settings. We don't need it.
+DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "siteauth.sqlite"}}
 
 SITE_ID = 1
 
@@ -322,25 +314,6 @@ if OIDC_CFG is not None and OIDC_CFG.get("enabled", False):
         ],
     }
 
-
-def _users_app_present() -> bool:
-    """True iff the multi-tenant `users` app is deployed (its package dir exists).
-
-    The MT layer is import-optional: an upstream / central-only build simply omits
-    web/users/. This (drop the app from INSTALLED_APPS) and the tenancy_optional facades
-    (ImportError -> see-all) key off the SAME presence signal, so there is ONE source of
-    truth — no separate env flag that could diverge from the import-availability the facades
-    actually see (which previously left a flag-set-but-files-present build hitting non-migrated
-    tables). To run single-tenant WITH the files present, use `[multitenancy] enabled = no`
-    (the existing runtime toggle), not app removal.
-    """
-    return (BASE_DIR / "users").is_dir()
-
-
-# Drop the optional MT `users` app (and its migrations) when its package isn't deployed.
-if not _users_app_present():
-    INSTALLED_APPS = [a for a in INSTALLED_APPS if a != "users"]
-
 AUDIT_FRAMEWORK = web_cfg.audit_framework.get("enabled", False)
 
 if api_cfg.api.token_auth_enabled:
@@ -364,12 +337,16 @@ if api_cfg.api.token_auth_enabled:
     REST_FRAMEWORK = {
         "DEFAULT_AUTHENTICATION_CLASSES": _api_auth_classes,
         "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
-        "DEFAULT_THROTTLE_CLASSES": ["apiv2.throttling.SubscriptionRateThrottle"],
-        "DEFAULT_THROTTLE_RATES": {
-            "user": api_cfg.api.default_user_ratelimit,
-            "subscription": api_cfg.api.default_subscription_ratelimit,
-        },
     }
+
+    if api_cfg.api.ratelimit:
+        REST_FRAMEWORK.update({
+            "DEFAULT_THROTTLE_CLASSES": ["apiv2.throttling.SubscriptionRateThrottle"],
+            "DEFAULT_THROTTLE_RATES": {
+                "user": api_cfg.api.default_user_ratelimit,
+                "subscription": api_cfg.api.default_subscription_ratelimit,
+            },
+        })
 
 else:
     REST_FRAMEWORK = {
@@ -409,16 +386,39 @@ SETTINGS_EXPORT = [
     "HUNT_ENABLED"
 ]
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-if web_cfg.registration.get("email_confirmation", False):
-    EMAIL_HOST = web_cfg.registration.get("email_host", False)
-    EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
-    EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
-    EMAIL_PORT = web_cfg.registration.get("email_port", 465)
-    EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
-    EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
-    SERVER_EMAIL = EMAIL_HOST_USER
-    DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+import django
+
+if django.VERSION >= (6, 1):
+    _mailer_options = {"host": "localhost", "port": 25}
+    if web_cfg.registration.get("email_confirmation", False):
+        _email_user = web_cfg.registration.get("email_user", "") or ""
+        _mailer_options = {
+            "host": web_cfg.registration.get("email_host", "") or "localhost",
+            "username": _email_user,
+            "password": web_cfg.registration.get("email_password", "") or "",
+            "port": web_cfg.registration.get("email_port", 465),
+            "use_tls": bool(web_cfg.registration.get("use_tls", False)),
+            "use_ssl": bool(web_cfg.registration.get("use_ssl", False)),
+        }
+        SERVER_EMAIL = _email_user
+        DEFAULT_FROM_EMAIL = _email_user
+    MAILERS = {
+        "default": {
+            "BACKEND": "django.core.mail.backends.smtp.EmailBackend",
+            "OPTIONS": _mailer_options,
+        }
+    }
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    if web_cfg.registration.get("email_confirmation", False):
+        EMAIL_HOST = web_cfg.registration.get("email_host", False)
+        EMAIL_HOST_USER = web_cfg.registration.get("email_user", False)
+        EMAIL_HOST_PASSWORD = web_cfg.registration.get("email_password", False)
+        EMAIL_PORT = web_cfg.registration.get("email_port", 465)
+        EMAIL_TLS_SSL = web_cfg.registration.get("use_tls", False)
+        EMAIL_USE_SSL = web_cfg.registration.get("use_ssl", False)
+        SERVER_EMAIL = EMAIL_HOST_USER
+        DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 SITE_ID = 1
 
@@ -538,6 +538,26 @@ except NameError:
     with suppress(ImportError):
         from .local_settings import *  # noqa: F403
 
+from lib.cuckoo.common.hooks import bootstrap_tenancy  # noqa: E402
+
+bootstrap_tenancy(Config("cuckoo"), settings_globals=globals())
+
 from lib.cuckoo.core.database import init_database
 
 init_database()
+
+# Prevent Django's and Werkzeug's auto-reloader from scanning/watching files inside workers/ folder
+RUNSERVER_PLUS_EXCLUDE_PATTERNS = [*globals().get("RUNSERVER_PLUS_EXCLUDE_PATTERNS", []), "*/workers/*"]
+
+with suppress(ImportError):
+    from werkzeug import _reloader
+
+    _reloader._ignore_common_dirs.add("workers")
+
+from django.dispatch import receiver
+from django.utils.autoreload import file_changed
+
+@receiver(file_changed)
+def ignore_workers_changes(sender, file_path, **kwargs):
+    if "/workers/" in str(file_path).replace("\\", "/"):
+        return True

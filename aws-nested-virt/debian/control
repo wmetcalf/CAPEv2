@@ -31,7 +31,6 @@ Depends:
  ${shlibs:Depends},
  ${misc:Depends},
  python3.12,
- python3-poetry,
  postgresql,
  postgresql-client,
  clamav,

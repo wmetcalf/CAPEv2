@@ -4,10 +4,12 @@
 # See the file 'docs/LICENSE' for copying permission.
 
 import logging
+import random
+import threading
 from contextlib import suppress
 
 from lib.cuckoo.common.config import Config
-from lib.cuckoo.common.socket_utils import send_socket_command
+from lib.cuckoo.common.socket_utils import DEFAULT_SOCKET_TIMEOUT, send_socket_command
 
 cfg = Config()
 router_cfg = Config("routing")
@@ -15,6 +17,9 @@ log = logging.getLogger(__name__)
 
 vpns = {}
 socks5s = {}
+gateways = {}            # profile-id -> profile object (.name/.interface/.rt_table/.priority)
+_gw_cursor = 0           # process-global round-robin cursor
+_gw_lock = threading.Lock()
 
 
 def _load_socks5_operational():
@@ -54,8 +59,78 @@ def _load_socks5_operational():
     return socks5s
 
 
+# Key set in the response returned by rooter() when the rooter socket is missing or refuses connections.
+ROOTER_UNAVAILABLE = "rooter_unavailable"
+
+
+def rooter_required(routing=None) -> bool:
+    """True when the routing configuration needs a running rooter.
+
+    The default configuration (route = none, internet = none, drop = no,
+    no VPN/tor/inetsim/socks5/nexthop) runs without one.
+    """
+    routing = routing or router_cfg
+    nexthop_enabled = hasattr(routing, "nexthop") and routing.nexthop.enabled
+    internet = getattr(routing.routing, "internet", "none")
+    drop_enabled = bool(getattr(routing.routing, "drop", False))
+    return bool(
+        routing.vpn.enabled
+        or routing.tor.enabled
+        or routing.inetsim.enabled
+        or routing.socks5.enabled
+        or str(routing.routing.route).lower() not in ("none", "false")
+        or (internet and str(internet).lower() not in ("none", "false"))
+        or drop_enabled
+        or nexthop_enabled
+    )
+
+
 def rooter(command, *args, **kwargs):
-    ret = send_socket_command(cfg.cuckoo.rooter, command, *args, **kwargs)
+    """Send a command to the rooter. Always returns a dict with "output" and "exception" keys.
+
+    If the rooter cannot be reached, "exception" is set and ROOTER_UNAVAILABLE is True, so callers that
+    check "exception" fail closed instead of treating a command that never ran as a success.
+    """
+    ret = send_socket_command(
+        cfg.cuckoo.rooter, command, *args, socket_timeout=cfg.cuckoo.get("rooter_timeout", DEFAULT_SOCKET_TIMEOUT), **kwargs
+    )
+    if ret is None:
+        # send_socket_command() already logged why (socket missing or connection refused).
+        return {"output": None, "exception": f"rooter is not reachable at {cfg.cuckoo.rooter}", ROOTER_UNAVAILABLE: True}
     if ret and ret.get("exception"):
         log.warning("Rooter returned error: %s", ret["exception"])
     return ret
+
+
+def _gw_live(profile):
+    """True if the profile's egress interface exists AND is administratively up. A down gateway NIC
+    must not be selected -- round-robin/random would otherwise bind a task to a dead exit. Delegates
+    to the rooter nic_up check (nic_available only proves existence, incl. DOWN links); overridable
+    in tests."""
+    resp = rooter("nic_up", str(profile.interface))
+    return bool(resp and resp.get("output"))
+
+
+def _select_gateway(route):
+    """Resolve a task route to a LIVE gateway profile, or None (=> caller fails closed).
+    route: an explicit profile id, or a default_policy token 'roundrobin'/'random'."""
+    global _gw_cursor
+    if not gateways:
+        return None
+    if route in gateways:
+        p = gateways[route]
+        return p if _gw_live(p) else None
+    live = [gateways[k] for k in gateways if _gw_live(gateways[k])]
+    if not live:
+        return None
+    if route == "random":
+        return random.choice(live)
+    if route != "roundrobin":
+        # not a gateway id, not 'random', not 'roundrobin' => unknown selector, FAIL CLOSED
+        # rather than silently treating it as roundrobin (gemini #15).
+        return None
+    # roundrobin: advance the process-global cursor under the lock
+    with _gw_lock:
+        p = live[_gw_cursor % len(live)]
+        _gw_cursor += 1
+    return p

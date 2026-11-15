@@ -12,7 +12,7 @@ Dependencies
 The distributed script uses a few Python libraries which can be installed
 through the following command (on Debian/Ubuntu)::
 
-    $ poetry run pip install flask flask-restful flask-sqlalchemy requests
+    $ poetry install --with dist
 
 Starting the Distributed REST API
 =================================
@@ -20,6 +20,21 @@ Starting the Distributed REST API
 The Distributed REST API requires a few command line options in order to run::
 
     $ cd /opt/CAPEv2/web && poetry run python manage.py runserver_plus 0.0.0.0:8000 --traceback --keep-meta-shutdown
+
+Authentication
+==============
+
+To protect the Distributed CAPE daemon (SSRF and DoS prevention), you should configure an authentication token.
+Configure the ``auth_token`` value in ``conf/distributed.conf`` under the ``[distributed]`` section::
+
+    [distributed]
+    ...
+    # Authentication token for Distributed CAPE Daemon API
+    auth_token = SEUPER_SECRET_TOKEN
+
+Once configured, the FastAPI endpoints running on port 9003 will require this token to be provided as an ``X-API-Token`` header::
+
+    $ curl -H "X-API-Token: SEUPER_SECRET_TOKEN" http://localhost:9003/node
 
 
 RESTful resources
@@ -74,11 +89,11 @@ machines are returned::
 POST /node
 ----------
 
-Register a new CAPE node by providing the name and the URL. Optionally the apikey if auth is enabled,
+Register a new CAPE node by providing the name and the URL in JSON format. Optionally the apikey if auth is enabled,
 You might need to enable ``list_exitnodes`` and ``machinelist`` in ``custom/conf/api.conf``
 if your Node API is using htaccess authentication::
 
-    $ curl http://localhost:9003/node -F name=master -F url=http://localhost:8000/apiv2/ -F apikey=apikey -F enabled=1
+    $ curl -H "Content-Type: application/json" -d '{"name": "master", "url": "http://localhost:8000/apiv2/", "apikey": "apikey", "enabled": true}' http://localhost:9003/node
     {
         "machines": [
             {
@@ -108,19 +123,18 @@ Get basic information about a particular CAPE node::
 PUT /node/<name>
 ----------------
 
-Update basic information of a CAPE node::
+Update basic information of a CAPE node using a JSON payload::
 
-    $ curl -XPUT http://localhost:9003/node/localhost -F name=newhost \
-        -F url=http://1.2.3.4:8000/apiv2/
+    $ curl -XPUT -H "Content-Type: application/json" -d '{"url": "http://1.2.3.4:8000/apiv2/"}' http://localhost:9003/node/localhost
     null
 
-    Additional Arguments:
+    Additional JSON fields:
 
-    * enabled
-        False=0 or True=1 to activate or deactivate worker node
-    * exitnodes
-        exitnodes=1 - Update exit nodes list, to show on main web UI
-    * apikey
+    * enabled (boolean)
+        False or True to activate or deactivate worker node
+    * exitnodes (boolean)
+        True to update exit nodes list, to show on main web UI
+    * apikey (string)
         apikey for authorization
 
 .. _node_delete:
@@ -139,12 +153,39 @@ keep its history in the Distributed's database::
 Quick usage
 ===========
 
-For practical usage the following few commands will be most interesting.
+For practical usage, you can manage nodes either using the JSON REST API or via the much simpler **Command Line Administration tool**.
+
+CLI Admin Tools (Recommended)
+-----------------------------
+
+Get cluster and task queue status::
+
+    $ poetry run python utils/dist.py --status
+
+List all registered nodes and their associated VMs::
+
+    $ poetry run python utils/dist.py --list-nodes
+
+Register a CAPE worker node::
+
+    $ poetry run python utils/dist.py --register-node --node NAME --url http://1.2.3.4:8000/apiv2/ [--apikey KEY]
+
+Disable/deactivate a CAPE node::
+
+    $ poetry run python utils/dist.py --modify-node --node NAME --disable
+
+Enable/activate a CAPE node::
+
+    $ poetry run python utils/dist.py --modify-node --node NAME --enable
+
+
+JSON REST API
+-------------
 
 Register a CAPE node - a CAPE REST API running on the same machine in this
 case::
 
-    $ curl http://localhost:9003/node -F name=master -F url=http://localhost:8000/apiv2/
+    $ curl -H "Content-Type: application/json" -d '{"name": "master", "url": "http://localhost:8000/apiv2/"}' http://localhost:9003/node
     Master server must be called master, the rest of names we don't care
 
 
@@ -154,7 +195,7 @@ Disable a CAPE node::
 
 or::
 
-    $ curl -XPUT http://localhost:9003/node/localhost -F enable=0
+    $ curl -XPUT -H "Content-Type: application/json" -d '{"enabled": false}' http://localhost:9003/node/localhost
     null
 
 or::
@@ -230,12 +271,11 @@ the Distributed CAPE script
 
 without htaccess::
 
-    $ curl http://localhost:9003/node -F name=master -F url=http://localhost:8000/apiv2/
+    $ curl -H "Content-Type: application/json" -d '{"name": "master", "url": "http://localhost:8000/apiv2/"}' http://localhost:9003/node
 
 with htaccess::
 
-    $ curl http://localhost:9003/node -F name=worker -F url=http://1.2.3.4:8000/apiv2/ \
-      -F username=user -F password=password
+    $ curl -H "Content-Type: application/json" -d '{"name": "worker", "url": "http://1.2.3.4:8000/apiv2/", "apikey": "apikey"}' http://localhost:9003/node
 
 Having registered the CAPE nodes all that's left to do now is to submit
 tasks and fetch reports once finished. Documentation on these commands can be

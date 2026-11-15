@@ -14,7 +14,13 @@ from lib.cuckoo.common.config import Config
 try:
     from pymongo.errors import InvalidDocument, OperationFailure
 
-    from dev_utils.mongodb import mongo_collection_names, mongo_create_index, mongo_delete_data, mongo_find_one, mongo_insert_one, mongo_update_one
+    from dev_utils.mongodb import (  # noqa: F401
+        mongo_collection_names,
+        mongo_delete_data,
+        mongo_find_one,
+        mongo_insert_one,
+        mongo_update_one,
+    )
 
     HAVE_MONGO = True
 except ImportError:
@@ -27,39 +33,6 @@ log = logging.getLogger(__name__)
 reporting_conf = Config("reporting")
 
 
-def stamp_tenant_info(info: dict, task) -> None:
-    """Write tenant_id/user_id/visibility into the report's info subdict so mongo
-    aggregations can be scoped. Missing task (deleted) -> public/legacy."""
-    if task is None:
-        info.setdefault("tenant_id", None)
-        info.setdefault("user_id", None)
-        info["visibility"] = "public"
-        return
-    info["tenant_id"] = getattr(task, "tenant_id", None)
-    info["user_id"] = getattr(task, "user_id", None)
-    info["visibility"] = getattr(task, "visibility", "public") or "public"
-
-
-def _task_tenant_ctx(task_id):
-    """Load a task's tenant context on an INDEPENDENT session (its own pooled
-    connection), so this never touches the processor's shared scoped session.
-    Using Database().session here left an implicit transaction open and broke
-    processing with 'A transaction is already begun on this Session'. Returns a
-    detached holder with tenant_id/user_id/visibility, or None if not found."""
-    from sqlalchemy.orm import Session
-
-    from lib.cuckoo.core.database import Database
-    from lib.cuckoo.core.data.task import Task
-
-    with Session(Database().engine) as s:
-        t = s.get(Task, task_id)
-        if t is None:
-            return None
-        return type("_TaskCtx", (), {
-            "tenant_id": t.tenant_id, "user_id": t.user_id, "visibility": t.visibility,
-        })()
-
-
 class MongoDB(Report):
     """Stores report in MongoDB."""
 
@@ -67,6 +40,19 @@ class MongoDB(Report):
 
     # Mongo schema version, used for data migration.
     SCHEMA_VERSION = "1"
+    _schema_checked = False
+
+    @classmethod
+    def _ensure_schema(cls):
+        if cls._schema_checked:
+            return
+        schema_doc = mongo_find_one("cuckoo_schema", {}, {"version": 1})
+        if schema_doc is not None:
+            if schema_doc.get("version") != cls.SCHEMA_VERSION:
+                raise CuckooReportError("Mongo schema version not expected, check data migration tool")
+        elif mongo_insert_one("cuckoo_schema", {"version": cls.SCHEMA_VERSION}) is None:
+            return
+        cls._schema_checked = True
 
     def debug_dict_size(self, dct):
         if isinstance(dct, list):
@@ -135,30 +121,7 @@ class MongoDB(Report):
         if not HAVE_MONGO:
             raise CuckooDependencyError("Unable to import pymongo (install with `pip3 install pymongo`)")
 
-        # move to startup
-        # Set mongo schema version.
-        # TODO: This is not optimal because it run each analysis. Need to run only one time at startup.
-        if "cuckoo_schema" in mongo_collection_names():
-            if mongo_find_one("cuckoo_schema", {}, {"version": 1})["version"] != self.SCHEMA_VERSION:
-                CuckooReportError("Mongo schema version not expected, check data migration tool")
-        else:
-            mongo_insert_one("cuckoo_schema", {"version": self.SCHEMA_VERSION})
-            # Best-effort compound index for tenant-scoped aggregations — only
-            # when multitenancy is enabled (a disabled install stays exactly
-            # upstream; the index backs the scope_match queries that only run
-            # in locked mode).
-            from lib.cuckoo.common.tenancy import multitenancy_config
-
-            if multitenancy_config().enabled:
-                try:
-                    mongo_create_index(
-                        "analysis",
-                        [("info.tenant_id", 1), ("info.visibility", 1), ("info.user_id", 1)],
-                        background=True,
-                        name="tenant_scope_idx",
-                    )
-                except Exception as idx_err:
-                    log.warning("Could not create tenant_scope_idx on analysis collection: %s", idx_err)
+        self._ensure_schema()
 
         # Create a copy of the dictionary. This is done in order to not modify
         # the original dictionary and possibly compromise the following
@@ -174,10 +137,13 @@ class MongoDB(Report):
             return
 
         # trick for distributed api
-        main_task_id = results.get("info", {}).get("options", {}).get("main_task_id")
-        if main_task_id:
+        main_task_id = None
+        attributes = (self.task or {}).get("attributes") or {}
+        if main_task_id := attributes.get("main_task_id"):
             with suppress(ValueError, TypeError):
                 report["info"]["id"] = int(main_task_id)
+                # Object storage may have renumbered it already and recorded the real local id.
+                report["info"].setdefault("local_task_id", local_task_id)
 
         if "network" not in report:
             report["network"] = {}
@@ -185,24 +151,21 @@ class MongoDB(Report):
         if "behavior" not in report or not isinstance(report["behavior"], dict):
             report["behavior"] = {"processes": [], "processtree": [], "summary": {}}
 
-        # Stamp tenant context so mongo aggregations can be scoped. Use an
-        # INDEPENDENT session (not the processor's shared scoped session) so we
-        # don't leave a transaction open and break processing. Gated on
-        # multitenancy being enabled so a disabled/public install writes EXACTLY
-        # the upstream report shape (no info.tenant_id/user_id/visibility keys);
-        # the migration backfill stamps existing docs when MT is first enabled.
-        from lib.cuckoo.common.tenancy import multitenancy_config
+        from lib.cuckoo.common.hooks import run_report_hooks
 
-        if multitenancy_config().enabled:
-            try:
-                stamp_tenant_info(report["info"], _task_tenant_ctx(int(report["info"]["id"])))
-            except Exception as _db_err:
-                log.warning("Failed to look up task for tenant stamping (task %s): %s", report["info"].get("id"), _db_err)
-                stamp_tenant_info(report["info"], None)
+        run_report_hooks(report, task=self.task, stage="mongodb")
 
         # Delete old data just before inserting new one to avoid "missing report" window
-        # or data loss if insertion fails during preparation (e.g. OOM)
-        ids_to_delete = {local_task_id, int(report["info"]["id"])}
+        # or data loss if insertion fails during preparation (e.g. OOM).
+        # When main_task_id or object-storage bridging renumbered info.id on a worker, never include
+        # worker-local local_task_id (which collides with an unrelated central task in shared MongoDB).
+        report_id = int(report["info"]["id"])
+        renumbered = bool(
+            main_task_id
+            or report["info"].get("local_task_id") is not None
+            or report["info"].get("_renumbered_from") is not None
+        )
+        ids_to_delete = [report_id] if (renumbered and report_id != local_task_id) else sorted({local_task_id, report_id})
         log.debug("Deleting previous MongoDB data for Task IDs: %s", ids_to_delete)
         mongo_delete_data(list(ids_to_delete))
 
@@ -212,7 +175,8 @@ class MongoDB(Report):
 
         # Store iocs as file
         if reporting_conf.mongodb.dump_iocs:
-            dump_iocs(report, local_task_id)
+            # this node's own task directory, even when the report was renumbered to another server's id
+            dump_iocs(report, int(report["info"].get("local_task_id") or local_task_id))
 
         ensure_valid_utf8(report)
         gc.collect()
@@ -227,19 +191,22 @@ class MongoDB(Report):
             # (10334 BSONObjectTooLarge) or the maximum nested object depth was
             # exceeded (15 Overflow).
             if e.code in (10334, 15):
-                log.error("Got MongoDB OperationFailure, code %d", e.code)
-                # ToDo rewrite how children are stored
-                log.warning("Deleting behavior process tree children from results.")
-                del report["behavior"]["processtree"][0]["children"]
+                log.warning("Got MongoDB OperationFailure (code %d); pruning behavior.processtree children", e.code)
+                processtree = report.get("behavior", {}).get("processtree") or []
+                for proc_entry in processtree:
+                    if isinstance(proc_entry, dict):
+                        proc_entry.pop("children", None)
                 try:
                     mongo_insert_one("analysis", report)
-                except Exception as e:
-                    log.error("Deleting behavior process tree parent from results: %s", str(e))
-                    del report["behavior"]["processtree"][0]
+                except Exception as retry_err:
+                    log.warning("Clearing behavior.processtree after retry failure: %s", retry_err)
+                    if "behavior" in report and isinstance(report["behavior"], dict):
+                        report["behavior"]["processtree"] = []
                     mongo_insert_one("analysis", report)
         except InvalidDocument as e:
             if str(e).startswith("cannot encode object") or "must not contain" in str(e):
                 self.loop_saver(report)
+                run_report_hooks(report, task=self.task, stage="post_mongodb")
                 return
             parent_key, psize = self.debug_dict_size(report)[0]
             log.warning("Largest parent key: %s (%d MB)", parent_key, int(psize) // MEGABYTE)
@@ -288,3 +255,6 @@ class MongoDB(Report):
                     log.error("Failed to insert report into MongoDB even after attempting to fix large documents for Task %s", report["info"]["id"])
         except Exception as e:
             log.exception("Failed to store report in MongoDB for Task %s: %s", report["info"]["id"], e)
+            return
+
+        run_report_hooks(report, task=self.task, stage="post_mongodb")

@@ -96,11 +96,8 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
               build-essential debhelper devscripts dh-virtualenv \
               equivs \
-              python3.12 python3.12-venv python3.12-dev python3-pip pipx python3-virtualenv \
+              python3.12 python3.12-venv python3.12-dev python3-pip python3-virtualenv \
               git curl ca-certificates lintian
-          pipx install poetry
-          pipx inject poetry poetry-plugin-export
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v6
         with:
@@ -112,6 +109,17 @@ jobs:
           # and recursing it only slows checkout; Layer 5 EICAR exercises
           # real analysis paths instead.
           submodules: false
+
+      # Match upstream's reusable Python setup action. uv exports the checked-in
+      # lock; it is a build tool only, not a runtime dependency in the deb.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Test packaging compatibility
+        run: python3 -m unittest discover -s aws-nested-virt/tests/packaging -v
 
       - name: Mark workspace as a safe git directory
         run: |
@@ -231,38 +239,20 @@ jobs:
           # and skips the artifact upload (those steps imply success()), so a
           # leaking deb is never published or promoted by apt-publish / cape-deb-e2e.
           #
-          # Self-activating: the MT suite lands in the source tree via the
-          # feat/multi-tenant-visibility subtree sync. Until then the test files
-          # are absent and the gate warns + passes; it ENFORCES automatically the
-          # moment web/apiv2/test_visibility.py appears.
-          # debian/ was staged at the source root above, so $PWD/debian resolves
-          # the built dh-virtualenv python; the pytest paths below are root-relative.
+          # The inline tenancy tests moved into the plugin. Missing tests are
+          # an error, never a warning that silently disables the isolation gate.
           VENV_PY="$(find "$PWD/debian" -path '*/opt/CAPEv2/bin/python' | head -1)"
           if [[ -z "$VENV_PY" ]]; then
             echo "::error::built dh-virtualenv python not found under debian/ — cannot run the MT isolation gate"
             exit 1
           fi
-          if ! ls web/apiv2/test_visibility.py >/dev/null 2>&1; then
-            echo "::warning::MT isolation suite not yet present in the source tree (subtree sync of feat/multi-tenant-visibility pending). Gate is wired but inactive — it will enforce automatically once the tests land."
-            exit 0
-          fi
-          # The deb venv ships runtime deps only; add the pytest plugins the
-          # suite needs (django + asyncio_mode=auto per pyproject.toml).
-          "$VENV_PY" -m pip install --quiet pytest pytest-django pytest-asyncio
-          # CAPE source is the repo root now — no `cd` needed; the file list
-          # below is root-relative.
-          # Run the MT suite as an EXPLICIT file list, NOT the whole web/+tests/
-          # tree: the deb venv ships runtime deps only, so collecting all of
-          # tests/ imports unrelated modules needing test-only plugins
-          # (pytest_mock, httpretty) and aborts collection. These 13 files ARE
-          # the MT isolation suite and need only pytest-django + pytest-asyncio.
+          # Install test-only tools separately; runtime dependencies remain the
+          # exact set baked into the deb and are not upgraded by uv sync.
+          "$VENV_PY" -m pip install --quiet pytest pytest-django pytest-asyncio pytest-mock
           "$VENV_PY" -m pytest -p no:cacheprovider -q \
-            web/apiv2/test_visibility.py web/apiv2/test_hash_isolation.py \
-            web/analysis/test_visibility.py web/submission/test_visibility.py \
-            web/compare/test_visibility.py web/guac/test_visibility.py \
-            web/dashboard/test_dashboard_scope.py web/users/test_tenancy.py \
-            tests/test_tenancy.py tests/test_task_visibility.py tests/test_scope_stats.py \
-            tests/test_mongo_stamp.py tests/test_mongo_backfill.py
+            tests/test_tenancy.py tests/test_tenancy_multicompany.py \
+            tests/test_tenancy_wiring.py tests/test_tenancy_process_pipeline.py \
+            tests/test_tenancy_worker_pipeline.py
 
       - name: Stage built debs into ./dist/ for artifact upload
         if: steps.readiness.outputs.have_cape == '1' && steps.readiness.outputs.have_community == '1'

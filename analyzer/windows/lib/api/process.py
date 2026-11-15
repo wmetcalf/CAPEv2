@@ -194,7 +194,7 @@ class Process:
     # which check whether the VM has only been up for <10 minutes.
     startup_time = random.randint(1, 30) * 20 * 60 * 1000
 
-    def __init__(self, options=None, config=None, pid=0, h_process=0, thread_id=0, h_thread=0, suspended=False):
+    def __init__(self, options=None, config=None, pid=0, h_process=0, thread_id=0, h_thread=0):
         """@param pid: PID.
         @param h_process: process handle.
         @param thread_id: thread id.
@@ -208,10 +208,10 @@ class Process:
         self.h_process = HANDLE(h_process)
         self.thread_id = thread_id
         self.h_thread = HANDLE(h_thread)
-        self.suspended = suspended
         self.system_info = SYSTEM_INFO()
         self.critical = False
         self.path = None
+        self.last_error = None
 
     def __del__(self):
         """Close open handles."""
@@ -569,12 +569,14 @@ class Process:
                 "InitializeProcThreadAttributeList(size probe) unexpected result: ok=%s last_error=%d size=%d",
                 ok, last_error, cb_attribute_list_size.value
             )
+            return None, None, None
 
         attr_buf = create_string_buffer(cb_attribute_list_size.value)
         attr_list = cast(attr_buf, LPVOID)
 
         if not KERNEL32.InitializeProcThreadAttributeList(attr_list, 1, 0, byref(cb_attribute_list_size)):
             log.error("InitializeProcThreadAttributeList(init)")
+            return None, None, None
 
         hwnd = windll.user32.GetShellWindow()
         explorer_pid = DWORD()
@@ -584,6 +586,7 @@ class Process:
         if not raw_parent:
             KERNEL32.DeleteProcThreadAttributeList(attr_list)
             log.error("OpenProcess")
+            return None, None, None
 
         h_parent = HANDLE(raw_parent)
         if not KERNEL32.UpdateProcThreadAttribute(
@@ -598,6 +601,7 @@ class Process:
             KERNEL32.CloseHandle(h_parent)
             KERNEL32.DeleteProcThreadAttributeList(attr_list)
             log.error("UpdateProcThreadAttribute")
+            return None, None, None
 
         return attr_list, attr_buf, h_parent
 
@@ -627,11 +631,10 @@ class Process:
         except subprocess.CalledProcessError as e:
             log.error("Failed to collect %s process info: %s", process_name, e.output)
 
-    def execute(self, path, args=None, suspended=False, kernel_analysis=False):
+    def execute(self, path, args=None, kernel_analysis=False):
         """Execute sample process.
         @param path: sample path.
         @param args: process args.
-        @param suspended: is suspended.
         @return: operation status.
         """
         if not os.access(path, os.X_OK):
@@ -653,15 +656,13 @@ class Process:
             arguments += args
 
         self.path = path
-
-        creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT
-        if suspended:
-            self.suspended = True
-            creation_flags += CREATE_SUSPENDED
+        creation_flags = CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
 
         # Use the custom execution directory if provided, otherwise launch in the same location
         # where the sample resides (default %TEMP%)
         execution_directory = self.options.get(OPT_EXECUTIONDIR) or self.options.get(OPT_CURDIR) or os.getenv("TEMP")
+        if execution_directory:
+            execution_directory = os.path.expandvars(execution_directory)
 
         # Try to create the custom directories so that the execution path is deemed valid
         create_custom_folders(execution_directory)
@@ -669,15 +670,43 @@ class Process:
         created = KERNEL32.CreateProcessW(
             path, arguments, None, None, False, creation_flags, None, execution_directory, byref(startup_info), byref(process_info)
         )
+        last_error = KERNEL32.GetLastError()
 
-        KERNEL32.CloseHandle(h_parent)
-        KERNEL32.DeleteProcThreadAttributeList(attr_list)
+        if h_parent:
+            KERNEL32.CloseHandle(h_parent)
+        if attr_list:
+            KERNEL32.DeleteProcThreadAttributeList(attr_list)
+
+        if not created:
+            log.warning(
+                'Failed to execute process from path "%s" with explorer parent (Error: %s), retrying without parent attribute',
+                path,
+                get_error_string(last_error),
+            )
+            fallback_startup_info = STARTUPINFO()
+            fallback_startup_info.cb = sizeof(fallback_startup_info)
+            fallback_startup_info.dwFlags = 1
+            fallback_startup_info.wShowWindow = 1
+            fallback_flags = CREATE_NEW_CONSOLE | CREATE_SUSPENDED
+            created = KERNEL32.CreateProcessW(
+                path,
+                arguments,
+                None,
+                None,
+                False,
+                fallback_flags,
+                None,
+                execution_directory,
+                byref(fallback_startup_info),
+                byref(process_info),
+            )
 
         if created:
             self.pid = process_info.dwProcessId
             self.h_process = process_info.hProcess
             self.thread_id = process_info.dwThreadId
             self.h_thread = process_info.hThread
+            self.last_error = None
             log.info('Successfully executed process from path "%s" with arguments "%s" with pid %d', path, args or "", self.pid)
             # self.log_process_tree(os.path.basename(path))
             if kernel_analysis:
@@ -685,11 +714,13 @@ class Process:
 
             return True
         else:
+            error_code = KERNEL32.GetLastError()
+            self.last_error = get_error_string(error_code)
             log.error(
                 'Failed to execute process from path "%s" with arguments "%s" (Error: %s)',
                 path,
                 args,
-                get_error_string(KERNEL32.GetLastError()),
+                self.last_error,
             )
             return False
 
@@ -697,17 +728,12 @@ class Process:
         """Resume a suspended thread.
         @return: operation status.
         """
-        if not self.suspended:
-            log.warning("The process with pid %d was not suspended at creation", self.pid)
-            return False
-
         if not self.h_thread:
             return False
 
         KERNEL32.Sleep(2000)
 
         if KERNEL32.ResumeThread(self.h_thread) != -1:
-            self.suspended = False
             log.info("Successfully resumed process with pid %d", self.pid)
             return True
         else:

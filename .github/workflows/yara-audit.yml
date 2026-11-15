@@ -1,0 +1,34 @@
+name: YARA tests
+
+on:
+  schedule:
+  - cron: '0 8 * * 1'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Checkout test files repo
+        uses: actions/checkout@v4
+        with:
+          repository: CAPESandbox/CAPE-TestFiles
+          path: tests/data/
+
+      - uses: ./.github/actions/python-setup/
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          sudo USE_UV=True bash ./installer/cape2.sh yara
+
+      - name: Run unit tests
+        run: uv run pytest tests/test_yara.py -s --import-mode=append

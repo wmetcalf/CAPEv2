@@ -243,44 +243,35 @@ run_django_migrations() {
 }
 
 install_poetry_wrapper() {
-    # All cape systemd units shell into /etc/poetry/bin/poetry — that
-    # path comes from the legacy install-nestedvirt.sh which pip-installs
-    # poetry under POETRY_HOME=/etc/poetry.  On the deb-baked AMI we
-    # already have poetry (apt python3-poetry, installed via Depends:),
-    # but at /usr/bin/poetry.  Drop a thin wrapper at /etc/poetry/bin/
-    # so the existing systemd unit ExecStart= lines (and operator
-    # muscle memory) keep working unchanged.
-    #
-    # The wrapper sets VIRTUAL_ENV=/opt/CAPEv2 so poetry uses the
-    # dh-virtualenv tree the deb already shipped, instead of trying
-    # to create its own venv when it doesn't find one alongside the
-    # pyproject.toml at /opt/CAPEv2/.
+    # Preserve the legacy systemd/operator command path, but execute the
+    # deb-managed venv directly. Ubuntu's Poetry cannot parse upstream's
+    # PEP 621 metadata, and runtime startup must not resolve dependencies.
     install -d -m 0755 /etc/poetry/bin
     cat > /etc/poetry/bin/poetry <<'POETRY_WRAP'
 #!/bin/sh
-# /etc/poetry/bin/poetry — cape wrapper.
-#
-# Drop-in for the install-nestedvirt.sh-era POETRY_HOME=/etc/poetry
-# install.  Tells poetry to use the dh-virtualenv tree at /opt/CAPEv2/
-# as the active venv (which is what dh_virtualenv produced when
-# cape-core was built) and forwards to the apt-installed poetry.
+set -eu
 export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/CAPEv2}"
-exec /usr/bin/poetry "$@"
+export PATH="$VIRTUAL_ENV/bin:$PATH"
+if [ "${1:-}" = "--directory" ] || [ "${1:-}" = "-C" ]; then
+    [ "$#" -ge 3 ] || exit 2
+    cd "$2"
+    shift 2
+fi
+case "${1:-}" in
+    run)
+        shift
+        [ "$#" -gt 0 ] || exit 2
+        exec "$@"
+        ;;
+    config)
+        # Existing rooter/fstab ExecStartPre sets Poetry's unused cache dir.
+        if [ "$#" -eq 3 ] && [ "$2" = "cache-dir" ]; then exit 0; fi
+        ;;
+esac
+echo "CAPE uses a deb-managed venv; this compatibility shim supports run and config cache-dir only." >&2
+exit 2
 POETRY_WRAP
     chmod 0755 /etc/poetry/bin/poetry
-
-    # System-wide poetry knob: never auto-create a fresh venv.  Without
-    # this, `poetry install`/`poetry env use` invocations on this host
-    # could land in ~/.cache/pypoetry/virtualenvs/ and drift from the
-    # deb-managed /opt/CAPEv2/ tree.
-    install -d -m 0755 /etc/poetry
-    cat > /etc/poetry/config.toml <<'POETRY_CONF'
-# managed — written by cape-core.postinst.
-# Override per-user with `poetry config <key> <val> --local` if needed.
-[virtualenvs]
-create = false
-in-project = false
-POETRY_CONF
 }
 
 case "$1" in

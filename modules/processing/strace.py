@@ -63,6 +63,7 @@ class ParseProcessLog(list):
         self.children_ids = []
         self.first_seen = None
         self.process_name = None
+        self.module_path = None
         self.calls = self
         self.file_descriptors = []
         self.options = options
@@ -127,6 +128,8 @@ class ParseProcessLog(list):
                     self.process_name = " ".join(ast.literal_eval(args[1]))
                 except Exception:
                     self.process_name = str(args[1])
+                if len(args) > 0:
+                    self.module_path = args[0].strip('"').strip("'")
 
             if syscall in ["fork", "vfork", "clone", "clone3"]:
                 # Identify if thread or fork with reference to:
@@ -315,16 +318,19 @@ class Processes:
         matching '<unfinished ...>' and '<... {syscall} resumed>' strings accordingly,
         returns the `resumed` time as that is the completed syscall time.
         """
-        data = ""
-        for key in unfinished.keys():
-            for head in unfinished[key]:
-                for tail in resumed[key]:
+        lines = []
+        for key, heads in unfinished.items():
+            tails = resumed.get(key)
+            if not tails:
+                continue
+            for head in heads:
+                for tail in tails:
                     if head["syscall"] != tail["syscall"]:
                         continue
-                    data += " ".join([str(key), tail["time"], head["unfinished"] + tail["resumed"] + "\n"])
-                    resumed[key].remove(tail)
+                    lines.append(" ".join([str(key), tail["time"], head["unfinished"] + tail["resumed"] + "\n"]))
+                    tails.remove(tail)
                     break
-        return data
+        return "".join(lines)
 
     def extract_logs(self, raw_logs, pattern):
         extracted_logs = dict()
@@ -350,7 +356,7 @@ class Processes:
         resumed_pattern = re.compile(
             r"(?P<pid>\d+)\s+(?P<time>\d+:\d+:\d+\.\d+)\s+<\.\.\.\s(?P<syscall>\w+)\sresumed>(?P<resumed>.*)\n"
         )
-        with open(self._logs_path, "r") as log_file:
+        with open(self._logs_path, "r", encoding="utf-8", errors="replace") as log_file:
             raw_logs = log_file.read()
 
         normal_logs = self.extract_logs(raw_logs, log_pattern)
@@ -390,6 +396,7 @@ class Processes:
                 {
                     "process_id": current_log.process_id,
                     "process_name": current_log.process_name,
+                    "module_path": current_log.module_path or "",
                     "parent_id": None,
                     "first_seen": current_log.first_seen,
                     "calls": current_log.calls,
@@ -449,6 +456,7 @@ class ProcessTree:
                 "name": process["process_name"],
                 "pid": process["process_id"],
                 "parent_id": process["parent_id"],
+                "module_path": process.get("module_path", ""),
                 "children": [],
             }
         )
