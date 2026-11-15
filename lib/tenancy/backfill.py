@@ -431,6 +431,73 @@ def cleanup_legacy_inline_schema(engine, *, dry_run: bool = False) -> Dict[str, 
     return stats
 
 
+
+class DryRunUnavailable(RuntimeError):
+    """The existing database cannot be inspected without initialization."""
+
+
+def _readonly_reconcile_engine():
+    """Open an existing SQL database without the schema/version writes in Database()."""
+    from pathlib import Path
+
+    from sqlalchemy import create_engine, event, inspect
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from lib.cuckoo.common.config import Config
+    from lib.cuckoo.common.constants import CUCKOO_ROOT
+
+    cfg = Config().database
+    url = make_url(cfg.connection or f"sqlite:///{CUCKOO_ROOT}/db/cuckoo.db")
+    engine_args = {}
+    if url.get_backend_name() == "sqlite":
+        if not url.database or url.database == ":memory:":
+            raise DryRunUnavailable("dry-run requires an existing on-disk SQLite database")
+        database = url.database
+        if not database.startswith("file:"):
+            database = Path(database).absolute().as_uri()
+        url = url.set(database=database).update_query_dict({"mode": "ro", "uri": "true"})
+    elif url.get_backend_name() == "postgresql":
+        if url.drivername == "postgresql":
+            try:
+                import psycopg  # noqa: F401
+                url = url.set(drivername="postgresql+psycopg")
+            except ImportError:
+                pass
+        if url.drivername not in ("postgresql", "postgresql+psycopg", "postgresql+psycopg2"):
+            raise DryRunUnavailable("dry-run requires the psycopg or psycopg2 PostgreSQL driver")
+        engine_args["connect_args"] = {"sslmode": cfg.psql_ssl_mode}
+    else:
+        raise DryRunUnavailable("dry-run supports read-only SQLite and PostgreSQL connections only")
+    engine = create_engine(url, **engine_args)
+
+    @event.listens_for(engine, "connect")
+    def enforce_read_only(connection, record):
+        cursor = connection.cursor()
+        try:
+            if engine.dialect.name == "sqlite":
+                cursor.execute("PRAGMA query_only = ON")
+            else:
+                cursor.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                connection.commit()
+        finally:
+            cursor.close()
+
+    try:
+        with engine.connect() as conn:
+            inspector = inspect(conn)
+            if not {"tasks", "task_acl"}.issubset(inspector.get_table_names()):
+                raise DryRunUnavailable("dry-run requires existing tasks and task_acl schema; no schema was created")
+            if "attributes" not in {c["name"] for c in inspector.get_columns("tasks")}:
+                raise DryRunUnavailable("dry-run requires the migrated tasks.attributes schema; no migration was run")
+    except (SQLAlchemyError, DryRunUnavailable) as error:
+        engine.dispose()
+        if isinstance(error, DryRunUnavailable):
+            raise
+        raise DryRunUnavailable("dry-run could not open the existing database read-only; no initialization was attempted") from error
+    return engine
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """`utils/tenancy_reconcile.py [--dry-run]`: restamp Mongo/ES report docs from `task_acl`.
 
@@ -471,11 +538,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def _report(store: str, changed: int, skipped: List[Any]) -> None:
         print(f"{store}: {changed} analysis docs {verb}; {len(skipped)} left alone (a broker job's report)")
 
-    init_database()
-    db = Database()
-    ensure_acl_schema_once(db.engine)
-    reporting = Config("reporting")
-    with Session(db.engine) as session:
+    if args.dry_run:
+        try:
+            engine = _readonly_reconcile_engine()
+        except DryRunUnavailable as error:
+            print(str(error), file=sys.stderr)
+            return 2
+    else:
+        init_database()
+        engine = Database().engine
+        ensure_acl_schema_once(engine)
+    try:
+        return _run_reconcile(args, engine, Config("reporting"), abort_on_unrecorded_public, unrecorded_public, _report)
+    finally:
+        if args.dry_run:
+            engine.dispose()
+
+
+def _run_reconcile(args, engine, reporting, abort_on_unrecorded_public, unrecorded_public, _report):
+    with Session(engine) as session:
         foreign = None if args.force else runs_dist_tasks(session)
         if args.task is not None and foreign is None:
             if args.dry_run:
@@ -495,7 +576,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        cleanup_legacy_inline_schema(db.engine, dry_run=args.dry_run)
+        cleanup_legacy_inline_schema(engine, dry_run=args.dry_run)
         if reporting.mongodb.enabled:
             from pymongo import UpdateOne
 

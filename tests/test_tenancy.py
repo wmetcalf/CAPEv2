@@ -746,7 +746,7 @@ def test_reconcile_es_stamps_writes_by_index_and_id():
     ]
 
 
-def test_reconcile_cli_initializes_the_database_first(monkeypatch):
+def test_reconcile_write_cli_initializes_the_database_first(monkeypatch):
     # Database() raises CuckooDatabaseInitializationError until init_database() has run.
     import lib.cuckoo.common.config as config_mod
     import lib.cuckoo.core.database as database_mod
@@ -763,7 +763,7 @@ def test_reconcile_cli_initializes_the_database_first(monkeypatch):
     )
     off = types.SimpleNamespace(enabled=False)
     monkeypatch.setattr(config_mod, "Config", lambda name: types.SimpleNamespace(mongodb=off, elasticsearchdb=off))
-    assert main(["--dry-run"]) == 0
+    assert main([]) == 0
     assert calls[:2] == ["init", "db"]
 
 
@@ -1907,6 +1907,10 @@ def _patch_reconcile_cli(monkeypatch, engine, seen):
 
     monkeypatch.setattr(database_mod, "init_database", lambda *a, **k: None)
     monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
+    # CLI dry-run opens an existing read-only schema instead of initializing Database.
+    from lib.tenancy.acl import ensure_acl_schema
+    ensure_acl_schema(engine)
+    monkeypatch.setattr(backfill, "_readonly_reconcile_engine", lambda: engine)
     on, off = types.SimpleNamespace(enabled=True), types.SimpleNamespace(enabled=False)
     monkeypatch.setattr(config_mod, "Config", lambda name: types.SimpleNamespace(mongodb=on, elasticsearchdb=off))
     monkeypatch.setitem(sys.modules, "dev_utils.mongodb", types.SimpleNamespace(results_db=None))
@@ -2490,3 +2494,92 @@ def test_gcp_pubsub_service_sanitizes_prefix_and_cleans_temp_files(monkeypatch, 
     assert existing_bin.read_bytes() == b"existing-sample"
 
 
+
+
+def test_reconcile_dry_run_does_not_initialize_empty_database(monkeypatch, tmp_path, capsys):
+    import sqlite3
+    import lib.cuckoo.common.config as config_mod
+    import lib.cuckoo.core.database as database_mod
+    from lib.tenancy.backfill import main
+
+    path = tmp_path / "empty.db"
+    sqlite3.connect(path).close()
+    dsn = f"sqlite:///{path}"
+    dbs = []
+    monkeypatch.setattr(database_mod, "init_database", lambda: dbs.append(database_mod._Database(dsn=dsn)))
+    monkeypatch.setattr(database_mod, "Database", lambda: dbs[-1])
+    off = types.SimpleNamespace(enabled=False)
+    monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
+        database=types.SimpleNamespace(connection=dsn, psql_ssl_mode="disable"), mongodb=off, elasticsearchdb=off))
+    result = main(["--dry-run", "--force"])
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
+    assert result == 2
+    assert "schema" in capsys.readouterr().err
+
+
+def _configure_dry_run_sqlite(monkeypatch, path):
+    import lib.cuckoo.common.config as config_mod
+    import lib.cuckoo.core.database as database_mod
+    off = types.SimpleNamespace(enabled=False)
+    monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
+        database=types.SimpleNamespace(connection=f"sqlite:///{path}", psql_ssl_mode="disable"),
+        mongodb=off, elasticsearchdb=off))
+    def forbidden_init(*args, **kwargs):
+        pytest.fail("dry-run must not call the database initializer")
+    monkeypatch.setattr(database_mod, "init_database", forbidden_init)
+
+
+def test_reconcile_dry_run_missing_sqlite_file_is_not_created(monkeypatch, tmp_path, capsys):
+    from lib.tenancy.backfill import main
+    path = tmp_path / "missing.db"
+    _configure_dry_run_sqlite(monkeypatch, path)
+    assert main(["--dry-run"]) == 2
+    assert not path.exists()
+    assert "read-only" in capsys.readouterr().err
+
+
+def test_reconcile_dry_run_existing_schema_is_read_only(monkeypatch, tmp_path):
+    import sqlalchemy as sa
+    from lib.cuckoo.core.data.db_common import Base
+    from lib.tenancy.acl import ensure_acl_schema
+    from lib.tenancy.backfill import _readonly_reconcile_engine, main
+    path = tmp_path / "existing.db"
+    writable = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(writable)
+    ensure_acl_schema(writable)
+    # A legacy field gives cleanup a schema-changing action to count, not execute.
+    with writable.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
+        conn.execute(sa.text("INSERT INTO users_userprofile VALUES (1, 1)"))
+    writable.dispose()
+    before = path.read_bytes()
+    _configure_dry_run_sqlite(monkeypatch, path)
+    assert main(["--dry-run", "--force"]) == 0
+    assert main(["--dry-run", "--task", "1", "--force"]) == 0
+    assert path.read_bytes() == before
+    readonly = _readonly_reconcile_engine()
+    try:
+        with pytest.raises(sa.exc.OperationalError):
+            with readonly.begin() as conn:
+                conn.execute(sa.text("DELETE FROM users_userprofile"))
+        with pytest.raises(sa.exc.OperationalError):
+            with readonly.begin() as conn:
+                conn.execute(sa.text("CREATE TABLE unwanted (id INTEGER)"))
+    finally:
+        readonly.dispose()
+    assert path.read_bytes() == before
+
+
+def test_reconcile_dry_run_missing_acl_does_not_create_it(monkeypatch, tmp_path, capsys):
+    from lib.cuckoo.core.data.db_common import Base
+    from lib.tenancy.backfill import main
+    path = tmp_path / "without-acl.db"
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    before = path.read_bytes()
+    _configure_dry_run_sqlite(monkeypatch, path)
+    assert main(["--dry-run", "--force"]) == 2
+    assert "task_acl schema" in capsys.readouterr().err
+    assert path.read_bytes() == before
