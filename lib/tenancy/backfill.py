@@ -538,6 +538,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def _report(store: str, changed: int, skipped: List[Any]) -> None:
         print(f"{store}: {changed} analysis docs {verb}; {len(skipped)} left alone (a broker job's report)")
 
+    # Refusing ambiguous public reports must happen before *any* SQL cleanup,
+    # initialization or report-store write, including writes to an earlier backend.
+    # Services must remain stopped for both passes: this is a preflight, not a
+    # distributed transaction/snapshot across SQL, MongoDB and Elasticsearch.
+    if abort_on_unrecorded_public and args.task is None:
+        try:
+            preflight_engine = _readonly_reconcile_engine()
+        except DryRunUnavailable as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        preflight_args = argparse.Namespace(**vars(args))
+        preflight_args.dry_run = True
+        try:
+            result = _run_reconcile(
+                preflight_args, preflight_engine, Config("reporting"), True, unrecorded_public,
+                lambda *args: None,
+            )
+        finally:
+            preflight_engine.dispose()
+        if result:
+            return result
+
     if args.dry_run:
         try:
             engine = _readonly_reconcile_engine()

@@ -763,7 +763,7 @@ def test_reconcile_write_cli_initializes_the_database_first(monkeypatch):
     )
     off = types.SimpleNamespace(enabled=False)
     monkeypatch.setattr(config_mod, "Config", lambda name: types.SimpleNamespace(mongodb=off, elasticsearchdb=off))
-    assert main([]) == 0
+    assert main(["--demote-public"]) == 0
     assert calls[:2] == ["init", "db"]
 
 
@@ -2583,3 +2583,60 @@ def test_reconcile_dry_run_missing_acl_does_not_create_it(monkeypatch, tmp_path,
     assert main(["--dry-run", "--force"]) == 2
     assert "task_acl schema" in capsys.readouterr().err
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("backend", ["mongo", "es", "both"])
+@pytest.mark.parametrize("refuse", [True, False])
+def test_reconcile_refusal_preflights_all_stores_before_any_write(monkeypatch, tmp_path, backend, refuse, capsys):
+    import sqlalchemy as sa
+    import lib.cuckoo.common.config as config_mod
+    import lib.cuckoo.core.database as database_mod
+    from lib.cuckoo.core.data.db_common import Base
+    from lib.tenancy.acl import ensure_acl_schema
+    from lib.tenancy.backfill import main
+
+    path = tmp_path / "preflight.db"
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    ensure_acl_schema(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
+        conn.execute(sa.text("INSERT INTO users_userprofile VALUES (1, 1)"))
+    before = path.read_bytes()
+    initialized = []
+    monkeypatch.setattr(database_mod, "init_database", lambda: initialized.append(True))
+    monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
+    monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
+        database=types.SimpleNamespace(connection=f"sqlite:///{path}", psql_ssl_mode="disable"),
+        mongodb=types.SimpleNamespace(enabled=backend in ("mongo", "both")),
+        elasticsearchdb=types.SimpleNamespace(enabled=backend in ("es", "both"))))
+    # Over one batch of restamp candidates, followed by an ambiguous public report.
+    candidates = [{"_id": str(i), "info": {"id": i, "visibility": "tenant", "tenant_id": 8}} for i in range(1, 502)]
+    ambiguous = {"_id": "public", "info": {"id": 900, "visibility": "public", "tenant_id": None}}
+    mongo_docs = candidates + ([ambiguous] if backend == "mongo" and refuse else [])
+    es_docs = [{"_index": "analysis", "_id": d["_id"], "_source": {"info": d["info"]}}
+               for d in candidates + ([ambiguous] if refuse else [])]
+    writes = []
+    collection = types.SimpleNamespace(find=lambda *a: iter(mongo_docs), bulk_write=lambda ops, **kw: writes.extend(ops))
+    monkeypatch.setitem(sys.modules, "dev_utils.mongodb", types.SimpleNamespace(results_db=types.SimpleNamespace(analysis=collection)))
+    monkeypatch.setitem(sys.modules, "dev_utils.elasticsearchdb", types.SimpleNamespace(
+        elastic_handler=object(), get_analysis_index=lambda: "analysis"))
+    def es_bulk(client, actions, **kwargs):
+        actions = list(actions)
+        writes.extend(actions)
+        return len(actions), []
+    monkeypatch.setitem(sys.modules, "elasticsearch.helpers", types.SimpleNamespace(scan=lambda *a, **kw: iter(es_docs), bulk=es_bulk))
+    try:
+        assert main(["--force"]) == (3 if refuse else 0)
+        if refuse:
+            assert initialized == []
+            assert writes == []
+            assert path.read_bytes() == before
+            assert "public report" in capsys.readouterr().err
+        else:
+            assert initialized == [True]
+            assert len(writes) == len(candidates) * (2 if backend == "both" else 1)
+            with engine.connect() as conn:
+                assert "is_tenant_admin" not in {c["name"] for c in sa.inspect(conn).get_columns("users_userprofile")}
+    finally:
+        engine.dispose()
