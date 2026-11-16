@@ -2585,6 +2585,46 @@ def test_reconcile_dry_run_missing_acl_does_not_create_it(monkeypatch, tmp_path,
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("public_report", [False, True])
+def test_reconcile_full_run_on_just_upgraded_db_creates_missing_acl(monkeypatch, tmp_path, public_report, capsys):
+    # A pre-stack install has no task_acl right after migration: the full run must create the
+    # empty table and preflight against it, not exit 2 like a dry-run does.
+    import sqlalchemy as sa
+    import lib.cuckoo.common.config as config_mod
+    import lib.cuckoo.core.database as database_mod
+    from lib.cuckoo.core.data.db_common import Base
+    from lib.tenancy import acl as acl_mod
+    from lib.tenancy.backfill import main
+
+    path = tmp_path / "upgraded.db"
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.text("DROP TABLE IF EXISTS task_acl"))
+    initialized = []
+    monkeypatch.setattr(database_mod, "init_database", lambda: initialized.append(True))
+    monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
+    monkeypatch.setattr(acl_mod, "_acl_schema_ready", set())
+    monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
+        database=types.SimpleNamespace(connection=f"sqlite:///{path}", psql_ssl_mode="disable"),
+        mongodb=types.SimpleNamespace(enabled=True), elasticsearchdb=types.SimpleNamespace(enabled=False)))
+    docs = [{"_id": "p", "info": {"id": 900, "visibility": "public", "tenant_id": None}}] if public_report else []
+    writes = []
+    collection = types.SimpleNamespace(find=lambda *a: iter(docs), bulk_write=lambda ops, **kw: writes.extend(ops))
+    monkeypatch.setitem(sys.modules, "dev_utils.mongodb", types.SimpleNamespace(results_db=types.SimpleNamespace(analysis=collection)))
+    try:
+        assert main(["--force"]) == (3 if public_report else 0)
+        assert initialized == [True]
+        assert "task_acl" in sa.inspect(engine).get_table_names()
+        assert writes == []
+        err = capsys.readouterr().err
+        assert "task_acl schema" not in err
+        if public_report:
+            assert "public report" in err
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize("backend", ["mongo", "es", "both"])
 @pytest.mark.parametrize("refuse", [True, False])
 def test_reconcile_refusal_preflights_all_stores_before_any_write(monkeypatch, tmp_path, backend, refuse, capsys):

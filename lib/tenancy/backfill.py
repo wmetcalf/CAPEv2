@@ -436,6 +436,10 @@ class DryRunUnavailable(RuntimeError):
     """The existing database cannot be inspected without initialization."""
 
 
+class AclSchemaMissing(DryRunUnavailable):
+    """`tasks` exists but `task_acl` does not yet: a pre-stack install that was just migrated."""
+
+
 def _readonly_reconcile_engine():
     """Open an existing SQL database without the schema/version writes in Database()."""
     from pathlib import Path
@@ -486,8 +490,11 @@ def _readonly_reconcile_engine():
     try:
         with engine.connect() as conn:
             inspector = inspect(conn)
-            if not {"tasks", "task_acl"}.issubset(inspector.get_table_names()):
+            tables = set(inspector.get_table_names())
+            if "tasks" not in tables:
                 raise DryRunUnavailable("dry-run requires existing tasks and task_acl schema; no schema was created")
+            if "task_acl" not in tables:
+                raise AclSchemaMissing("dry-run requires existing tasks and task_acl schema; no schema was created")
             if "attributes" not in {c["name"] for c in inspector.get_columns("tasks")}:
                 raise DryRunUnavailable("dry-run requires the migrated tasks.attributes schema; no migration was run")
     except (SQLAlchemyError, DryRunUnavailable) as error:
@@ -542,9 +549,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # initialization or report-store write, including writes to an earlier backend.
     # Services must remain stopped for both passes: this is a preflight, not a
     # distributed transaction/snapshot across SQL, MongoDB and Elasticsearch.
+    engine = None
     if abort_on_unrecorded_public and args.task is None:
         try:
             preflight_engine = _readonly_reconcile_engine()
+        except AclSchemaMissing:
+            # A just-upgraded pre-stack install has no task_acl yet, and the read-only preflight
+            # needs one. Creating the empty table is schema-only: no task data and no report store
+            # is written, and with no rows every tenantless public report is (correctly) unrecorded.
+            init_database()
+            engine = Database().engine
+            ensure_acl_schema_once(engine)
+            try:
+                preflight_engine = _readonly_reconcile_engine()
+            except DryRunUnavailable as error:
+                print(str(error), file=sys.stderr)
+                return 2
         except DryRunUnavailable as error:
             print(str(error), file=sys.stderr)
             return 2
@@ -567,8 +587,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(str(error), file=sys.stderr)
             return 2
     else:
-        init_database()
-        engine = Database().engine
+        if engine is None:
+            init_database()
+            engine = Database().engine
         ensure_acl_schema_once(engine)
     try:
         return _run_reconcile(args, engine, Config("reporting"), abort_on_unrecorded_public, unrecorded_public, _report)
