@@ -19,7 +19,7 @@ export PYTHONUNBUFFERED = 1
 
 # ---- cape-core: dh-virtualenv ---------------------------------------------
 
-# Export Poetry's resolved deps to debian/cape-core/requirements.txt before
+# Export uv's resolved runtime deps to debian/cape-core/requirements.txt before
 # dh_virtualenv runs, so the venv installs from a frozen, lockfile-backed
 # manifest rather than from pyproject.toml directly.
 override_dh_auto_clean:
@@ -27,19 +27,13 @@ override_dh_auto_clean:
 	rm -f debian/cape-core/requirements.txt
 
 override_dh_virtualenv:
-	# Generate frozen requirements.txt from Poetry. Source-of-truth is
-	# the root pyproject.toml + poetry.lock (CAPE source is the package
-	# root now); no other path writes to debian/cape-core/requirements.txt.
-	poetry export -f requirements.txt --without-hashes \
-	    --output debian/cape-core/requirements.txt
+	# Export only locked runtime dependencies, not development tools or CAPE itself.
+	# --locked fails on pyproject/lock drift instead of silently re-resolving.
+	uv export --locked --no-default-groups --group debian --no-emit-project --no-hashes \
+	    --format requirements.txt --output-file debian/cape-core/requirements.txt
 
-	# CAPE's root pyproject.toml declares `[tool.poetry] package-mode = false`
-	# because upstream runs CAPE as an application (`python manage.py ...`),
-	# not as a library. dh_virtualenv unconditionally invokes
-	# `pip install <sourcedirectory>` after installing requirements.txt,
-	# which makes pip ask poetry-core to build a wheel — and poetry-core
-	# refuses because of package-mode=false.
-	#
+	# CAPE is an application, not an installable library (tool.uv.package=false).
+	# dh_virtualenv nevertheless invokes `pip install <sourcedirectory>`.
 	# Workaround: swap in a stub pyproject.toml that pip can build (an
 	# empty setuptools no-op pkg). Real CAPE source ships via
 	# debian/cape-core.install at /opt/CAPEv2/{lib,web,modules,...} so
@@ -91,9 +85,9 @@ override_dh_virtualenv:
 	# needs python and the pip module, both of which dh_virtualenv
 	# always installs.
 	#
-	# --no-deps: the requirements.txt is poetry-resolved (so every
+	# --no-deps: the requirements.txt is uv-resolved (so every
 	# transitive is already listed as its own line) and we MUST skip
-	# pip's own resolver because poetry export emits direct-URL deps
+	# pip's own resolver because the lockfile contains direct-URL deps
 	# (pyattck, pyattck-data, httpreplay) where parent and child have
 	# different URL forms — pyattck 7.2.1's wheel metadata declares
 	# 'pyattck-data @ git+https://github.com/CAPESandbox/pyattck-data'
@@ -101,7 +95,7 @@ override_dh_virtualenv:
 	# an explicit SHA-pinned URL.  pip's resolver compares URL
 	# strings literally and refuses to merge those, exiting with
 	# ResolutionImpossible (a cape-build run).  --no-deps
-	# sidesteps the resolver entirely; we trust poetry.lock to have
+	# sidesteps the resolver entirely; we trust uv.lock to have
 	# already done the resolution.
 	debian/cape-core/opt/CAPEv2/bin/python -m pip install --disable-pip-version-check \
 	    --no-deps \
@@ -111,8 +105,8 @@ override_dh_virtualenv:
 	# is a high-signal marker — if it's missing the requirements step
 	# silently no-op'd and we'd otherwise ship an empty venv (the
 	# 2026-05-11 regression).
-	if ! debian/cape-core/opt/CAPEv2/bin/python -c 'import django, alembic, psycopg2, pyclamd' >/dev/null 2>&1; then \
-	    echo '::error::cape-core venv is missing expected runtime deps (django/alembic/psycopg2/pyclamd)'; \
+	if ! debian/cape-core/opt/CAPEv2/bin/python -c 'import django, alembic, psycopg, pyclamd, libvirt' >/dev/null 2>&1; then \
+	    echo '::error::cape-core venv is missing expected runtime deps (django/alembic/psycopg/pyclamd/libvirt)'; \
 	    exit 1; \
 	fi
 	# Strip the .gitignore that virtualenv (run by dh_virtualenv just
@@ -130,7 +124,7 @@ override_dh_virtualenv:
 	# lib/web/modules/utils packages — those ship at /opt/CAPEv2/{...}
 	# via cape-core.install, NOT inside the venv's site-packages (the
 	# venv was built from a stub pyproject.toml because cape's real
-	# one has package-mode=false). A .pth file at site-packages adds
+	# one disables application packaging). A .pth file at site-packages adds
 	# the path on every venv-python invocation.
 	site_packages=$$(ls -d debian/cape-core/opt/CAPEv2/lib/python*/site-packages 2>/dev/null | head -1); \
 	    if [ -n "$$site_packages" ]; then \
@@ -211,7 +205,7 @@ override_dh_install:
 	#                        lives at data/html/report.html
 	#   requirements.txt   — build-time artifact dh-virtualenv drops
 	#                        at /opt/CAPEv2/.  Operator references
-	#                        the version pins via Poetry; remove.
+	#                        the source uv.lock for version pins; remove.
 	if [ -d debian/cape-core/opt/CAPEv2 ]; then \
 	    find debian/cape-core/opt/CAPEv2 -maxdepth 1 \
 	        \( -name 'tests' -o -name 'docs' \

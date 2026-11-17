@@ -9,6 +9,8 @@ from allauth.socialaccount.adapter import DefaultSocialAccountAdapter
 from allauth.account.signals import email_confirmed, user_logged_in, user_signed_up
 from django import forms
 from django.conf import settings
+
+from lib.cuckoo.common.hooks import run_login_groups_hooks
 from django.contrib.auth.models import User
 from django.dispatch import receiver
 from django.shortcuts import render
@@ -206,9 +208,6 @@ def _claims(extra: dict) -> dict:
     top level) so the function is idempotent: calling it on already-flattened
     claims — or on a flat provider's data — returns them unchanged even if they
     happen to carry their own ``userinfo`` key.
-
-    (Replaces our fork's ``_claims``: the MT branch added the same OIDC-claims
-    flattening independently; we adopt upstream's helper to keep zero fork delta.)
     """
     if isinstance(extra, dict) and "id_token" in extra:
         ui = extra.get("userinfo")
@@ -222,7 +221,7 @@ def _extract_groups(extra: dict) -> set:
     extra = _claims(extra)
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
-    raw = _claims(extra).get(claim) or []
+    raw = extra.get(claim) or []
     if isinstance(raw, str):
         raw = [raw]
     elif not isinstance(raw, (list, tuple, set)):
@@ -260,8 +259,7 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     changed = False
     extra = _claims(extra)
 
-    claims = _claims(extra)
-    email = claims.get("email") or ""
+    email = extra.get("email") or ""
     if email and user.email != email:
         user.email = email
         changed = True
@@ -271,7 +269,7 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
     if admin_groups or super_groups:
         oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
         claim = oidc_cfg.get("groups_claim") or "groups"
-        if claim not in claims:
+        if claim not in extra:
             log.warning(
                 "OIDC groups claim %r absent from token for %s; skipping role reconciliation",
                 claim, user.username,
@@ -286,44 +284,6 @@ def _apply_idp_roles_and_email(user, extra: dict) -> bool:
                 changed = True
 
     return changed
-
-
-def reconcile_tenant(user, user_groups: set) -> None:
-    """Set UserProfile.tenant + is_tenant_admin from the user's IdP groups.
-
-    One-tenant-per-user (v1): exactly one membership match is expected.
-      >1 match -> fail closed (unset + warn; a user mapped to multiple
-                  tenant-groups is a v1 misconfiguration)
-      0 match  -> no tenant
-    The caller skips this entirely when the groups claim is ABSENT (misconfig
-    guard), mirroring role reconciliation; a present-but-empty claim is honoured.
-    """
-    try:
-        from users.models import Tenant, UserProfile
-    except ImportError:
-        # MT `users` app not deployed -> nothing to reconcile (single-tenant deployment).
-        # Catch ImportError ONLY: a runtime error importing a DEPLOYED users app (e.g.
-        # AppRegistryNotReady, a real bug in the module) must propagate, not be swallowed
-        # into a silent skip that leaves tenant membership stale (fail-closed).
-        return
-
-    matches = [t for t in Tenant.objects.filter(active=True) if user_groups & set(t.idp_groups or [])]
-    prof, _ = UserProfile.objects.get_or_create(user=user)
-    if len(matches) > 1:
-        log.warning(
-            "user %s matches multiple tenants %s; leaving tenant unset",
-            user.username, [t.slug for t in matches],
-        )
-        prof.tenant = None
-        prof.is_tenant_admin = False
-    elif len(matches) == 1:
-        t = matches[0]
-        prof.tenant = t
-        prof.is_tenant_admin = bool(user_groups & set(t.admin_idp_groups or []))
-    else:
-        prof.tenant = None
-        prof.is_tenant_admin = False
-    prof.save(update_fields=["tenant", "is_tenant_admin"])
 
 
 # ── Account adapters ──────────────────────────────────────────────────────────
@@ -354,9 +314,15 @@ if not settings.EMAIL_CONFIRMATION:
 
 @receiver(email_confirmed)
 def email_confirmed_(request, email_address, **kwargs):
-    user = User.objects.get(email=email_address.email)
-    user.is_active = not settings.MANUAL_APPROVE
-    user.save()
+    try:
+        user = email_address.user
+        if user:
+            user.is_active = not settings.MANUAL_APPROVE
+            user.save()
+        else:
+            log.warning("email_confirmed signal received but email_address.user is None for %s", email_address.email)
+    except Exception as e:
+        log.error("Error activating user after email confirmation for %s: %s", email_address.email, e)
 
 
 class MySocialAccountAdapter(DefaultSocialAccountAdapter):
@@ -468,9 +434,15 @@ def _reconcile_sso_user_on_login(sender, request, user, **kwargs):
     extra = getattr(sociallogin.account, "extra_data", None) or {}
     if _apply_idp_roles_and_email(user, extra):
         user.save()
-    # Tenant + tenant-admin reconciliation — same absent-claim guard as roles:
+    # Group membership reconciliation — same absent-claim guard as roles:
     # only touch tenant membership when the groups claim is actually present.
     oidc_cfg = getattr(settings, "OIDC_CFG", None) or {}
     claim = oidc_cfg.get("groups_claim") or "groups"
+    # Normalize first: the openid_connect provider nests claims under
+    # extra["userinfo"], so checking the raw wrapper would treat the groups claim
+    # as absent and skip tenant reconciliation entirely — SSO users would log in
+    # with no tenant/tenant-admin membership. _extract_groups already normalizes.
     if claim in _claims(extra):
-        reconcile_tenant(user, _extract_groups(extra))
+        # Group/tenant membership is a plugin concern (lib.tenancy maps IdP groups onto
+        # Django groups); a no-op when no plugin is registered.
+        run_login_groups_hooks(user, _extract_groups(extra))

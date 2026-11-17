@@ -1,0 +1,39 @@
+name: Update requirements.txt and uv.lock
+
+on:
+  push:
+    branches: [ master, staging ]
+    paths:
+      - "pyproject.toml"
+      - "poetry.lock"
+
+jobs:
+  update:
+    if: ${{ !github.event.act }} # skip during local actions testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Update uv.lock
+        run: uv lock
+
+      - name: Export requirements.txt
+        run: uv export --format requirements.txt --no-dev --no-emit-project --no-header --no-annotate --output-file requirements.txt
+
+      - name: Commit changes if any
+        # Skip this step if being run by nektos/act
+        if: ${{ !env.ACT }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "action@github.com"
+          if output=$(git status --porcelain) && [ ! -z "$output" ]; then
+            git pull -f
+            git commit -m "ci: Update requirements.txt and uv.lock" -a
+            git push
+          fi

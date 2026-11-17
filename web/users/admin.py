@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.models import User
 
-from .models import Tenant, UserProfile
+from .models import UserProfile
 
 
 # Django 3.2
@@ -48,10 +48,3 @@ class CustomUserAdmin(UserAdmin):
 
 admin.site.unregister(User)
 admin.site.register(User, CustomUserAdmin)
-
-
-@admin.register(Tenant)
-class TenantAdmin(admin.ModelAdmin):
-    list_display = ("slug", "name", "active", "created_at")
-    search_fields = ("slug", "name")
-    list_filter = ("active",)

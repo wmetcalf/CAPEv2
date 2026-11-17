@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import traceback
-import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from threading import Thread
 from urllib.parse import urlencode
@@ -21,7 +21,7 @@ from urllib.request import urlopen
 
 from lib.api.process import Process
 from lib.common.abstracts import Auxiliary
-from lib.common.constants import PATHS
+from lib.common.constants import OPT_PROCDUMP, PATHS
 from lib.common.exceptions import CuckooError, CuckooPackageError
 from lib.common.results import upload_to_host
 from lib.core.config import Config
@@ -64,8 +64,22 @@ def dump_files():
     )
 
 
-def monitor_new_processes(parent_pid, interval=0.25):
+_DISABLED_OPTION_VALUES = ("0", "false", "no", "off")
+
+
+def _is_procdump_enabled(options):
+    """Check whether child process memory dumping is enabled."""
+    if not isinstance(options, Mapping):
+        return True
+    for key in (OPT_PROCDUMP, "procmemdump"):
+        if key in options and str(options[key]).strip().lower() in _DISABLED_OPTION_VALUES:
+            return False
+    return True
+
+
+def monitor_new_processes(parent_pid, interval=0.25, options=None):
     """Continuously monitor for new child processes."""
+    do_procdump = _is_procdump_enabled(options)
     known_processes = set(get_all_child_processes(parent_pid))
     while True:
         current_processes = set(get_all_child_processes(parent_pid))
@@ -73,7 +87,8 @@ def monitor_new_processes(parent_pid, interval=0.25):
 
         for pid in new_processes:
             log.info("New child process detected: %s", str(pid))
-            dump_memory(pid)
+            if do_procdump:
+                dump_memory(pid)
             add_pids(pid)  # Add the new process to PROCESS_LIST
 
         known_processes.update(new_processes)
@@ -145,6 +160,8 @@ class Analyzer:
 
     def __init__(self):
         self.target = None
+        self.options = {}
+        self.config = None
 
     def prepare(self):
         """Prepare env for analysis."""
@@ -171,10 +188,7 @@ class Analyzer:
             self.target = os.path.join(tempfile.gettempdir(), self.config.file_name)
         # If it's a URL, well.. we store the URL.
         elif self.config.category == "archive":
-            zip_path = os.path.join(os.environ.get("TEMP", "/tmp"), self.config.file_name)
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(os.environ.get("TEMP", "/tmp"))
-            self.target = os.path.join(os.environ.get("TEMP", "/tmp"), self.config.options["filename"])
+            self.target = os.path.join(os.environ.get("TEMP", "/tmp"), self.config.file_name)
         else:
             self.target = self.config.target
 
@@ -250,11 +264,13 @@ class Analyzer:
         if not package_class:
             raise Exception("Could not find an appropriate analysis package")
         # Package initialization
-        kwargs = {"options": self.config.options, "timeout": self.config.timeout, "strace_ouput": PATHS["logs"]}
+        kwargs = {"options": self.config.options, "timeout": self.config.timeout, "strace_output": PATHS["logs"]}
 
         # Initialize the analysis package.
-        # pack = package_class(self.config.get_options())
-        pack = package_class(self.target, **kwargs)
+        if package_class.__name__ == "Archive":
+            pack = package_class(self.config.get_options())
+        else:
+            pack = package_class(self.target, **kwargs)
         # Initialize Auxiliary modules
         Auxiliary()
         prefix = f"{auxiliary.__name__}."
@@ -278,7 +294,10 @@ class Analyzer:
                 log.debug('Initialized auxiliary module "%s"', module.__name__)
                 aux_avail.append(aux)
                 log.debug('Trying to start auxiliary module "%s"...', module.__name__)
-                aux.start()
+                if isinstance(aux, Thread):
+                    Thread.start(aux)
+                else:
+                    aux.start()
                 log.debug('Started auxiliary module "%s"', module.__name__)
                 aux_enabled.append(aux)
             except (NotImplementedError, AttributeError):
@@ -289,8 +308,10 @@ class Analyzer:
         # Start analysis package. If for any reason, the execution of the
         # analysis package fails, we have to abort the analysis.
         try:
-            # pids = pack.start(self.target)
-            pids = pack.start()
+            try:
+                pids = pack.start(self.target)
+            except TypeError:
+                pids = pack.start()
         except NotImplementedError:
             raise CuckooError(f'The package "{package_class}" doesn\'t contain a run function')
         except CuckooPackageError as e:
@@ -317,7 +338,12 @@ class Analyzer:
             raise ValueError("No PID available to monitor.")
 
         # Start the monitoring thread before the analysis loop
-        monitor_thread = Thread(target=monitor_new_processes, args=(PID,), daemon=True)
+        monitor_thread = Thread(
+            target=monitor_new_processes,
+            args=(PID,),
+            kwargs={"options": self.options},
+            daemon=True,
+        )
         monitor_thread.start()
 
         # Check in the options if the user toggled the timeout enforce. If so,
@@ -327,11 +353,13 @@ class Analyzer:
             pid_check = False
 
         time_counter = 0
+        analysis_start = time.monotonic()
+        timeout_seconds = int(self.config.timeout)
         complete_folder = hashlib.md5(f"cape-{self.config.id}".encode()).hexdigest()
         complete_analysis_pattern = os.path.join(os.environ.get("TMP", "/tmp"), complete_folder)
         while True:
             time_counter += 1
-            if time_counter > int(self.config.timeout):
+            if time_counter > timeout_seconds or (time.monotonic() - analysis_start) >= timeout_seconds:
                 log.info("Analysis timeout hit, terminating analysis")
                 break
             if os.path.isdir(complete_analysis_pattern):

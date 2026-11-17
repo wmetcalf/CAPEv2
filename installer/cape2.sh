@@ -1,10 +1,85 @@
 #!/bin/bash
 # set -ex
 # By @doomedraven - https://twitter.com/D00m3dR4v3n
-# Copyright (C) 2011-2023 doomedraven.
+# Copyright (C) 2011-2026 doomedraven.
 # See the file 'LICENSE.md' for copying permission.
 
 # Huge thanks to: @NaxoneZ @kevoreilly @ENZOK @wmetcalf @ClaudioWayne
+
+function usage() {
+cat << EndOfHelp
+    You need to edit NETWORK_IFACE, IFACE_IP and PASSWD for correct install
+
+    * This ISN'T a silver bullet, we can't control all changes in all third part software, you are welcome to report updates
+
+    Usage: $0 <command> <iface_ip> [options] | tee $0.log
+        Example: $0 all 192.168.1.1 | tee $0.log
+    Commands - are case insensitive:
+        Base - Installs dependencies, CAPE, systemd, see code for full list
+        All - Installs everything - (don't use it if you don't know what will be installed ;))
+        Sandbox - Install CAPE
+        Update - Update CAPE
+        Dependencies - Install all dependencies with performance tricks
+        Systemd - Install systemd config for cape, we suggest to use systemd
+        Nginx <domain.com> - Install NGINX with realip plugin and other goodies, pass your domain as argument
+        LetsEncrypt <domain.com> - Install LetsEncrypt for your site, pass your domain as argument
+        Suricata - Install latest suricata with performance boost
+        PostgreSQL - Install latest PostgresSQL
+        PostgreSQL_Utility - Install pg_activity
+        Yara - Install latest yara
+        Yara-x - Install latest yara-x
+        Volatility3 - Install Volatility3 and windows symbols
+        Mongo - Install latest mongodb
+        LetsEncrypt - Install dependencies and retrieves certificate
+        Dist - will install CAPE distributed stuff
+        ClamAv - Install ClamAV and unofficial signatures
+        redsocks2 - install redsocks2
+        logrotate - install logrotate config to rotate daily or 10G logs
+        librenms - install and setup LibreNMS support
+        librenms_cron_config - print the cron entries for the LibreNMS bits
+        librenms_snmpd_config - print the snmpd config for use with LibreNMS
+        librenms_sneck_config - print the sneck config for use with LibreNMS
+        prometheus - Install Prometheus and Grafana
+        die - Install Detect It Easy
+        node_exporter - Install node_exporter to report data to Prometheus+Grafana, only on worker servers
+        jemalloc - Install jemalloc, required for CAPE to decrease memory usage
+            Details: https://zapier.com/engineering/celery-python-jemalloc/
+        crowdsecurity - Install CrowdSecurity for NGINX and webgui
+        introvirt - Install IntroVirt
+        docker - install docker
+        osslsigncode - Linux alternative to Windows signtool.exe
+        modsecurity - install Nginx ModSecurity plugin
+        Issues - show some known possible bugs/solutions
+    Options:
+        --use-uv - Use uv instead of poetry
+        --disable-mongodb-avx-check - Disable check of AVX CPU feature for MongoDB
+        --disable-libvirt - Disable libvirt related packages installation
+
+    Examples:
+        sudo bash cape2.sh all | tee cape2.log
+            Default install - poetry, /opt/CAPEv2
+        sudo CAPE_ROOT=/mnt/sandbox/CAPEv2 USE_UV=True bash cape2.sh all | tee cape2.log
+            * Custom install folder, use UV instead of poetry
+
+    Useful links - THEY CAN BE OUTDATED; RTFM!!!
+        * https://cuckoo.sh/docs/introduction/index.html
+        * https://medium.com/@seifreed/how-to-deploy-cuckoo-sandbox-431a6e65b848
+        * https://infosecspeakeasy.org/t/howto-build-a-cuckoo-sandbox/27
+    Cuckoo V2 customizations neat howto
+        * https://www.adlice.com/cuckoo-sandbox-customization-v2/
+EndOfHelp
+}
+
+# Check for help options or empty arguments early to avoid running host commands on loading
+if [ "$1" = "-h" ] || [ "$1" = "--help" ] || [ "$1" = "help" ] || [ "$1" = "-help" ]; then
+    usage
+    exit 0
+fi
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
 
 # Ensure non-interactive mode for apt commands globally to prevent prompts during automated installations
 export DEBIAN_FRONTEND=noninteractive
@@ -93,69 +168,6 @@ ARCH="$(dpkg --print-architecture)"
 
 function issues() {
     cat "No known problems yet"
-}
-
-function usage() {
-cat << EndOfHelp
-    You need to edit NETWORK_IFACE, IFACE_IP and PASSWD for correct install
-
-    * This ISN'T a silver bullet, we can't control all changes in all third part software, you are welcome to report updates
-
-    Usage: $0 <command> <iface_ip> [options] | tee $0.log
-        Example: $0 all 192.168.1.1 | tee $0.log
-    Commands - are case insensitive:
-        Base - Installs dependencies, CAPE, systemd, see code for full list
-        All - Installs everything - (don't use it if you don't know what will be installed ;))
-        Sandbox - Install CAPE
-        Dependencies - Install all dependencies with performance tricks
-        Systemd - Install systemd config for cape, we suggest to use systemd
-        Nginx <domain.com> - Install NGINX with realip plugin and other goodies, pass your domain as argument
-        LetsEncrypt <domain.com> - Install LetsEncrypt for your site, pass your domain as argument
-        Suricata - Install latest suricata with performance boost
-        PostgreSQL - Install latest PostgresSQL
-        PostgreSQL_Utility - Install pg_activity
-        Yara - Install latest yara
-        Yara-x - Install latest yara-x
-        Volatility3 - Install Volatility3 and windows symbols
-        Mongo - Install latest mongodb
-        LetsEncrypt - Install dependencies and retrieves certificate
-        Dist - will install CAPE distributed stuff
-        ClamAv - Install ClamAV and unofficial signatures
-        redsocks2 - install redsocks2
-        logrotate - install logrotate config to rotate daily or 10G logs
-        librenms - install and setup LibreNMS support
-        librenms_cron_config - print the cron entries for the LibreNMS bits
-        librenms_snmpd_config - print the snmpd config for use with LibreNMS
-        librenms_sneck_config - print the sneck config for use with LibreNMS
-        prometheus - Install Prometheus and Grafana
-        die - Install Detect It Easy
-        node_exporter - Install node_exporter to report data to Prometheus+Grafana, only on worker servers
-        jemalloc - Install jemalloc, required for CAPE to decrease memory usage
-            Details: https://zapier.com/engineering/celery-python-jemalloc/
-        crowdsecurity - Install CrowdSecurity for NGINX and webgui
-        introvirt - Install IntroVirt
-        docker - install docker
-        osslsigncode - Linux alternative to Windows signtool.exe
-        modsecurity - install Nginx ModSecurity plugin
-        Issues - show some known possible bugs/solutions
-    Options:
-        --use-uv - Use uv instead of poetry
-        --disable-mongodb-avx-check - Disable check of AVX CPU feature for MongoDB
-        --disable-libvirt - Disable libvirt related packages installation
-
-    Examples:
-        sudo bash cape2.sh all | tee cape2.log
-            Default install - poetry, /opt/CAPEv2
-        sudo CAPE_ROOT=/mnt/sandbox/CAPEv2 USE_UV=True bash cape2.sh all | tee cape2.log
-            * Custom install folder, use UV instead of poetry
-
-    Useful links - THEY CAN BE OUTDATED; RTFM!!!
-        * https://cuckoo.sh/docs/introduction/index.html
-        * https://medium.com/@seifreed/how-to-deploy-cuckoo-sandbox-431a6e65b848
-        * https://infosecspeakeasy.org/t/howto-build-a-cuckoo-sandbox/27
-    Cuckoo V2 customizations neat howto
-        * https://www.adlice.com/cuckoo-sandbox-customization-v2/
-EndOfHelp
 }
 
 function install_crowdsecurity() {
@@ -561,17 +573,17 @@ server {
     }
     # SSL configuration
     listen 443 ssl http2;
-    //listen [::]:443 ssl http2;
-    //listen 443 http3 reuseport;  # UDP listener for QUIC+HTTP/3
-    ssl        on;
-    //ssl_protocols       TLSv1.3; # QUIC requires TLS 1.3
+    #listen [::]:443 ssl http2;
+    listen 443 http3 reuseport;  # UDP listener for QUIC+HTTP/3
+    #ssl        on; # Obsolete in Nginx > 1.25.1
+    ssl_protocols       TLSv1.2 TLSv1.3; # QUIC requires TLS 1.3
     ssl_certificate         /etc/letsencrypt/live/$1/fullchain.pem;
     ssl_certificate_key     /etc/letsencrypt/live/$1/privkey.pem;
     ssl_client_certificate /etc/ssl/certs/cloudflare.crt;
     ssl_verify_client on;
 
-    //add_header Alt-Svc 'quic=":443"'; # Advertise that QUIC is available
-    //add_header QUIC-Status $quic;     # Sent when QUIC was used
+    add_header Alt-Svc 'h3=":443"; ma=86400'; # Advertise that QUIC is available
+    add_header QUIC-Status $quic;     # Sent when QUIC was used
 
     server_name $1 www.$1;
     location / {
@@ -927,8 +939,24 @@ function install_mongo(){
             fi
         fi
 
+        CODENAME=$(lsb_release -cs)
+        if [ "$MONGO_VERSION" = "4.4" ]; then
+            # MongoDB 4.4 only has repositories up to Ubuntu 20.04 (focal)
+            if [ "$CODENAME" != "focal" ] && [ "$CODENAME" != "bionic" ] && [ "$CODENAME" != "xenial" ]; then
+                CODENAME="focal"
+            fi
+
+            # MongoDB 4.4 depends on libssl1.1, which is not present in Ubuntu 22.04 (jammy) and 24.04 (noble)
+            if ! dpkg -l | grep -q "libssl1.1"; then
+                echo "[+] Installing libssl1.1 for MongoDB 4.4 compatibility"
+                wget -q http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb -O /tmp/libssl1.1.deb
+                sudo dpkg -i /tmp/libssl1.1.deb || true
+                rm -f /tmp/libssl1.1.deb
+            fi
+        fi
+
         sudo curl -fsSL "https://pgp.mongodb.com/server-${MONGO_VERSION}.asc" | sudo gpg --dearmor -o /etc/apt/keyrings/mongo.gpg --yes
-        echo "deb [signed-by=/etc/apt/keyrings/mongo.gpg arch=amd64] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/${MONGO_VERSION} multiverse" > /etc/apt/sources.list.d/mongodb.list
+        echo "deb [signed-by=/etc/apt/keyrings/mongo.gpg arch=amd64] https://repo.mongodb.org/apt/ubuntu ${CODENAME}/mongodb-org/${MONGO_VERSION} multiverse" > /etc/apt/sources.list.d/mongodb.list
 
         sudo apt-get update 2>/dev/null
         sudo apt-get install -y libpcre3-dev numactl cron
@@ -944,7 +972,7 @@ cat >> /lib/systemd/system/enable-transparent-huge-pages.service <<EOF
 Description=Enable Transparent Hugepages (THP)
 DefaultDependencies=no
 After=sysinit.target local-fs.target
-Before=mongod.service
+Before=mongod.service mongodb.service
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo always | tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null && echo defer+madvise | tee /sys/kernel/mm/transparent_hugepage/defrag > /dev/null && echo 0 | tee /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none > /dev/null && echo 1 | tee /proc/sys/vm/overcommit_memory > /dev/null'
@@ -963,6 +991,18 @@ EOF
             systemctl daemon-reload
         fi
 
+        # Determine optimal GLIBC_TUNABLES setting based on kernel version.
+        # On Linux kernel 6.19 and newer, glibc.pthread.rseq=0 causes tcmalloc/rseq conflicts leading to crashes or refusal to start.
+        # We set it to 1 on kernel versions >= 6.19, allowing glibc to register rseq and tcmalloc to fall back safely.
+        RSEQ_VAL=0
+        KERNEL_MAJOR=$(uname -r | cut -d. -f1)
+        KERNEL_MINOR=$(uname -r | cut -d. -f2)
+        if [[ "$KERNEL_MAJOR" =~ ^[0-9]+$ ]] && [[ "$KERNEL_MINOR" =~ ^[0-9]+$ ]]; then
+            if [ "$KERNEL_MAJOR" -gt 6 ] || { [ "$KERNEL_MAJOR" -eq 6 ] && [ "$KERNEL_MINOR" -ge 19 ]; }; then
+                RSEQ_VAL=1
+            fi
+        fi
+
         if [ ! -f /lib/systemd/system/mongodb.service ]; then
             crontab -l | { cat; echo "@reboot /bin/mkdir -p /data/configdb && /bin/mkdir -p /data/db && /bin/chown mongodb:mongodb /data -R"; } | crontab -
             cat >> /lib/systemd/system/mongodb.service << EOF
@@ -972,7 +1012,7 @@ Wants=network.target
 After=network.target
 [Service]
 PermissionsStartOnly=true
-Environment="GLIBC_TUNABLES=glibc.pthread.rseq=0"
+Environment="GLIBC_TUNABLES=glibc.pthread.rseq=${RSEQ_VAL}"
 #ExecStartPre=/bin/mkdir -p /data/{config,}db && /bin/chown mongodb:mongodb /data -R
 # https://www.tutorialspoint.com/mongodb/mongodb_replication.htm
 ExecStart=/usr/bin/numactl --interleave=all /usr/bin/mongod --setParameter "tcmallocReleaseRate=5.0"
@@ -990,6 +1030,14 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+        else
+            # Ensure GLIBC_TUNABLES is correctly set in existing service file
+            if grep -q 'GLIBC_TUNABLES' /lib/systemd/system/mongodb.service; then
+                sed -i "s|Environment=\"GLIBC_TUNABLES=glibc.pthread.rseq=.*\"|Environment=\"GLIBC_TUNABLES=glibc.pthread.rseq=${RSEQ_VAL}\"|g" /lib/systemd/system/mongodb.service
+            else
+                # Inject GLIBC_TUNABLES environment variable under [Service] section
+                sed -i "/\[Service\]/a Environment=\"GLIBC_TUNABLES=glibc.pthread.rseq=${RSEQ_VAL}\"" /lib/systemd/system/mongodb.service
+            fi
         fi
         sudo mkdir -p /data/{config,}db
         sudo chown mongodb:mongodb /data/ -R
@@ -1079,7 +1127,7 @@ function dependencies() {
     sudo apt-get install -y python3-pip build-essential libssl-dev libssl3 python3-dev cmake nfs-common crudini
     sudo apt-get install -y innoextract msitools iptables psmisc jq sqlite3 tmux net-tools checkinstall graphviz python3-pydot git numactl python3 python3-dev python3-pip libjpeg-dev zlib1g-dev
     sudo apt-get install -y zpaq upx-ucl wget zip unzip lzip rar unrar unace-nonfree cabextract geoip-database libgeoip-dev libjpeg-dev mono-utils ssdeep libfuzzy-dev exiftool
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y uthash-dev libconfig-dev libarchive-dev libtool autoconf automake privoxy software-properties-common wkhtmltopdf xvfb xfonts-100dpi tcpdump libcap2-bin wireshark-common
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y uthash-dev libconfig-dev libarchive-dev libtool autoconf automake privoxy software-properties-common wkhtmltopdf xvfb xfonts-100dpi tcpdump libcap2-bin wireshark-common tshark
     sudo apt-get install -y python3-pil subversion uwsgi uwsgi-plugin-python3 python3-pyelftools git curl
     sudo apt-get install -y openvpn wireguard
     # for bingraph
@@ -1098,19 +1146,20 @@ function dependencies() {
 
     sudo apt-get install -y locate && sudo updatedb # used by install_libvirt
 
-    # de4dot selfextraction
-    sudo apt-get install -y libgdiplus libdnlib2.1-cil libgif7 libmono-accessibility4.0-cil libmono-ldap4.0-cil libmono-posix4.0-cil libmono-sqlite4.0-cil libmono-system-componentmodel-dataannotations4.0-cil libmono-system-data4.0-cil libmono-system-design4.0-cil libmono-system-drawing4.0-cil libmono-system-enterpriseservices4.0-cil libmono-system-ldap4.0-cil libmono-system-runtime-serialization-formatters-soap4.0-cil libmono-system-runtime4.0-cil libmono-system-transactions4.0-cil libmono-system-web-applicationservices4.0-cil libmono-system-web-services4.0-cil libmono-system-web4.0-cil libmono-system-windows-forms4.0-cil libmono-webbrowser4.0-cil
-    de4dot_package_name="de4dot_3.1.41592.3405-2_all.deb"
-    # if not exist download package
-    if [ ! -f $de4dot_package_name ]; then
-        wget http://archive.ubuntu.com/ubuntu/pool/universe/d/de4dot/$de4dot_package_name
-    fi
-    if [ -f $de4dot_package_name ]; then
-        sudo dpkg -i $de4dot_package_name
-        sudo rm $de4dot_package_name
+    # de4dotEx selfextraction
+    de4dot_package_name="de4dotEx-3.12.0-x64.deb"
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then
+        if [ ! -f "$de4dot_package_name" ]; then
+            wget "https://github.com/GDATAAdvancedAnalytics/de4dotEx/releases/download/3.12.0/$de4dot_package_name"
+        fi
+        if [ -f "$de4dot_package_name" ]; then
+            sudo apt-get install -y "./$de4dot_package_name"
+            rm -f "$de4dot_package_name"
+        else
+            echo "[-] de4dotEx package not found"
+        fi
     else
-        echo "[-] de4dot package not found"
-        return
+        echo "[-] Skipping de4dotEx package: unsupported architecture $(dpkg --print-architecture)"
     fi
 
     # re2
@@ -1220,132 +1269,50 @@ EOF
 
 function install_clamav() {
     echo "[+] Installing clamav"
-    sudo apt-get install -y clamav clamav-daemon clamav-freshclam clamav-unofficial-sigs python3-pyclamd
+    sudo apt-get install -y clamav clamav-daemon clamav-freshclam python3-pyclamd
 
-    cat >> /usr/share/clamav-unofficial-sigs/conf.d/00-clamav-unofficial-sigs.conf << EOF
-# This file contains user configuration settings for the clamav-unofficial-sigs.sh
-# Script provide by Bill Landry (unofficialsigs@gmail.com).
-# Script updates can be found at: http://sourceforge.net/projects/unofficial-sigs
-# License: BSD (Berkeley Software Distribution)
-PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"
-export PATH
-clam_user="clamav"
-clam_group="clamav"
-setmode="yes"
-clam_dbs="/var/lib/clamav"
-clamd_pid="/var/run/clamd.pid"
-reload_dbs="no"
-reload_opt="clamdscan --reload"  # Default
-enable_random="yes"
-min_sleep_time="60"    # Default minimum is 60 seconds (1 minute).
-max_sleep_time="600"   # Default maximum is 600 seconds (10 minutes).
-# ========================
-# Sanesecurity Database(s)
-# ========================
-# http://www.sanesecurity.com/clamav/databases.htm
-ss_dbs="
-   blurl.ndb
-   junk.ndb
-   jurlbl.ndb
-   phish.ndb
-   rogue.hdb
-   sanesecurity.ftm
-   scam.ndb
-   sigwhitelist.ign2
-   spamattach.hdb
-   spamimg.hdb
-   winnow.attachments.hdb
-   winnow_bad_cw.hdb
-   winnow_extended_malware.hdb
-   winnow_malware.hdb
-   winnow_malware_links.ndb
-   doppelstern.hdb
-   bofhland_cracked_URL.ndb
-   bofhland_malware_attach.hdb
-   bofhland_malware_URL.ndb
-   bofhland_phishing_URL.ndb
-   crdfam.clamav.hdb
-   phishtank.ndb
-   porcupine.ndb
-   foxhole_filename.cdb
-   foxhole_all.cdb
-"
-# ========================
-# SecuriteInfo Database(s)
-# ========================
-si_dbs="
-   honeynet.hdb
-   securiteinfo.hdb
-   securiteinfobat.hdb
-   securiteinfodos.hdb
-   securiteinfoelf.hdb
-   securiteinfohtml.hdb
-   securiteinfooffice.hdb
-   securiteinfopdf.hdb
-   securiteinfosh.hdb
-"
-si_update_hours="4"   # Default is 4 hours (6 update checks daily).
-mbl_dbs="
-   mbl.ndb
-"
-mbl_update_hours="6"   # Default is 6 hours (4 downloads daily).
-rsync_connect_timeout="15"
-rsync_max_time="60"
-curl_connect_timeout="15"
-curl_max_time="90"
-work_dir="/usr/unofficial-dbs"   #Top level working directory
-# Sub-directory names:
-ss_dir="$work_dir/ss-dbs"        # Sanesecurity sub-directory
-si_dir="$work_dir/si-dbs"        # SecuriteInfo sub-directory
-mbl_dir="$work_dir/mbl-dbs"      # MalwarePatrol sub-directory
-config_dir="$work_dir/configs"   # Script configs sub-directory
-gpg_dir="$work_dir/gpg-key"      # Sanesecurity GPG Key sub-directory
-add_dir="$work_dir/add-dbs"      # User defined databases sub-directory
-# If you would like to make a backup copy of the current running database
-# file before updating, leave the following variable set to "yes" and a
-# backup copy of the file will be created in the production directory
-# with -bak appended to the file name.
-keep_db_backup="no"
-# If you want to silence the information reported by curl, rsync, gpg
-# or the general script comments, change the following variables to
-# "yes".  If all variables are set to "yes", the script will output
-# nothing except error conditions.
-curl_silence="no"      # Default is "no" to report curl statistics
-rsync_silence="no"     # Default is "no" to report rsync statistics
-gpg_silence="no"       # Default is "no" to report gpg signature status
-comment_silence="no"   # Default is "no" to report script comments
-# Log update information to '$log_file_path/$log_file_name'.
-enable_logging="yes"
-log_file_path="/var/log"
-log_file_name="clamav-unofficial-sigs.log"
-# If necessary to proxy database downloads, define the rsync and/or curl
-# proxy settings here.  For rsync, the proxy must support connections to
-# port 873.  Both curl and rsync proxy setting need to be defined in the
-# format of "hostname:port".  For curl, also note the -x and -U flags,
-# which must be set as "-x hostname:port" and "-U username:password".
-rsync_proxy=""
-curl_proxy=""
-# After you have completed the configuration of this file, set the
-# following variable to "yes".
-user_configuration_complete="no"
-################################################################################
-#                          END OF USER CONFIGURATION                           #
-################################################################################
-add_dbs="
-    https://raw.githubusercontent.com/wmetcalf/clam-punch/master/miscreantpunch099.ldb
-    https://raw.githubusercontent.com/wmetcalf/clam-punch/master/exexor99.ldb
-    https://raw.githubusercontent.com/twinwave-security/twinclams/master/twinclams.ldb
-    https://raw.githubusercontent.com/twinwave-security/twinclams/master/twinwave.ign2
-"
+    # Create configuration and working directories
+    sudo mkdir -p /etc/clamav-unofficial-sigs
+    sudo mkdir -p /var/lib/clamav-unofficial-sigs
+    sudo mkdir -p /var/log/clamav-unofficial-sigs
+    sudo chown -R clamav:clamav /var/lib/clamav-unofficial-sigs
+    sudo chown -R clamav:clamav /var/log/clamav-unofficial-sigs
+
+    # Download script and configuration templates from extremeshok's official repo
+    sudo wget https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/master/clamav-unofficial-sigs.sh -O /usr/local/sbin/clamav-unofficial-sigs.sh
+    sudo chmod 755 /usr/local/sbin/clamav-unofficial-sigs.sh
+    sudo ln -sf /usr/local/sbin/clamav-unofficial-sigs.sh /usr/local/sbin/clamav-unofficial-sigs
+
+    sudo wget https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/master/config/master.conf -O /etc/clamav-unofficial-sigs/master.conf
+    sudo wget https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/master/config/user.conf -O /etc/clamav-unofficial-sigs/user.conf
+    sudo wget https://raw.githubusercontent.com/extremeshok/clamav-unofficial-sigs/master/config/os/os.ubuntu.conf -O /etc/clamav-unofficial-sigs/os.conf
+
+    # Override configurations in user.conf
+    sudo tee -a /etc/clamav-unofficial-sigs/user.conf > /dev/null << EOF
+
+# CAPEv2 custom additions
+user_configuration_complete="yes"
+additional_dbs=(
+  "https://raw.githubusercontent.com/wmetcalf/clam-punch/master/miscreantpunch099.ldb"
+  "https://raw.githubusercontent.com/wmetcalf/clam-punch/master/exexor99.ldb"
+  "https://raw.githubusercontent.com/twinwave-security/twinclams/master/twinclams.ldb"
+  "https://raw.githubusercontent.com/twinwave-security/twinclams/master/twinwave.ign2"
+)
 EOF
-    chown root:root /usr/share/clamav-unofficial-sigs/conf.d/00-clamav-unofficial-sigs.conf
-    chmod 644 /usr/share/clamav-unofficial-sigs/conf.d/00-clamav-unofficial-sigs.conf
-    usermod -a -G ${USER} clamav
+
+    sudo usermod -a -G ${USER} clamav
     echo "$CAPE_ROOT/storage/** r," | sudo tee -a /etc/apparmor.d/local/usr.sbin.clamd
     sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.clamd
     sudo systemctl enable clamav-daemon
     sudo systemctl start clamav-daemon
-    sudo -u clamav /usr/sbin/clamav-unofficial-sigs
+
+    # Run setup/installation commands of the unofficial sigs script
+    sudo /usr/local/sbin/clamav-unofficial-sigs.sh --install-cron
+    sudo /usr/local/sbin/clamav-unofficial-sigs.sh --install-logrotate
+    sudo /usr/local/sbin/clamav-unofficial-sigs.sh --install-man
+
+    # Run the script to download the initial signatures as clamav user
+    sudo -u clamav /usr/local/sbin/clamav-unofficial-sigs.sh
 }
 
 function install_CAPE() {
@@ -1391,8 +1358,9 @@ function install_CAPE() {
     fi
 
     cd "$CAPE_ROOT/" || return
-    # copy *.conf.default and *.env to their destination so we have all properly updated fields
-    for filename in conf/default/*.conf.default conf/default/*.env; do
+    # copy *.conf.default and *.env.default to their destination so we have all properly updated fields
+    for filename in conf/default/*.conf.default conf/default/*.env.default; do
+        [ -e "$filename" ] || continue
         dest="conf/${filename#conf/default/}"
         cp -vf "./$filename" "./${dest%.default}"
     done
@@ -1454,6 +1422,12 @@ function install_systemd() {
     cp $CAPE_ROOT/systemd/cape-web.service /lib/systemd/system/cape-web.service
     cp $CAPE_ROOT/systemd/cape-rooter.service /lib/systemd/system/cape-rooter.service
     cp $CAPE_ROOT/systemd/suricata.service /lib/systemd/system/suricata.service
+
+    mkdir -p /etc/systemd/network
+    cp $CAPE_ROOT/systemd/00-ignore-vnet.network /etc/systemd/network/00-ignore-vnet.network
+    if systemctl is-active --quiet systemd-networkd; then
+        networkctl reload || true
+    fi
 
     if [ "$CAPE_ROOT" != "/opt/CAPEv2" ]; then
         sed -i "s|/opt/CAPEv2|$CAPE_ROOT|g" /lib/systemd/system/cape.service
@@ -1726,20 +1700,61 @@ function install_passivedns() {
     fi
 }
 
+function sync_installed_systemd_units() {
+    local systemd_dir="${SYSTEMD_UNIT_DIR:-/lib/systemd/system}"
+    local updated=0
+    for svc_src in "$CAPE_ROOT"/systemd/cape*.service; do
+        [ -f "$svc_src" ] || continue
+        local svc_name
+        svc_name=$(basename "$svc_src")
+        local svc_dest="$systemd_dir/$svc_name"
+        [ -f "$svc_dest" ] || continue
+
+        local svc_use_uv="$USE_UV"
+        local svc_uv_bin="/usr/local/bin/uv"
+        if [ "$svc_use_uv" = "true" ] || [ "$svc_use_uv" = "True" ]; then
+            svc_uv_bin="${PYTHON_MGR:-/usr/local/bin/uv}"
+        elif grep -Eq '^ExecStart=.*/uv([[:space:]]|$)' "$svc_dest" 2>/dev/null; then
+            svc_use_uv="true"
+        fi
+
+        sudo cp "$svc_src" "$svc_dest"
+        if [ "$CAPE_ROOT" != "/opt/CAPEv2" ]; then
+            sudo sed -i "s|/opt/CAPEv2|$CAPE_ROOT|g" "$svc_dest"
+        fi
+        if [ "$svc_use_uv" = "true" ] || [ "$svc_use_uv" = "True" ]; then
+            sudo sed -i "\|^ExecStartPre=.*/poetry .*|d" "$svc_dest" || true
+            sudo sed -i "s|/etc/poetry/bin/poetry|$svc_uv_bin|g" "$svc_dest"
+        fi
+        updated=1
+    done
+    if [ "$updated" -eq 1 ]; then
+        sudo systemctl daemon-reload
+    fi
+}
+
+function update() {
+    echo "[+] Updating CAPEv2"
+    sudo systemctl stop "cape*"
+    cd "$CAPE_ROOT" || return
+    sudo -u ${USER} git pull
+    sudo -u ${USER} bash -c "cd $CAPE_ROOT && export PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring; export CRYPTOGRAPHY_DONT_BUILD_RUST=1; $PYTHON_MGR $PYTHON_MGR_INSTALL_PYPROJECT"
+    if sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --check 2>&1 | grep -Fq "alembic upgrade head"; then
+        sudo -u ${USER} bash -c "cd $CAPE_ROOT/utils/db_migration && $PYTHON_MGR $PYTHON_MGR_CMD alembic upgrade head"
+    fi
+    if ! sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --check >/dev/null 2>&1; then
+        sudo -u ${USER} $PYTHON_MGR --directory "$CAPE_ROOT" $PYTHON_MGR_CMD python web/manage.py migrate --noinput
+    fi
+    sudo -u ${USER} find "$CAPE_ROOT" -name '*.pyc' -delete
+    sync_installed_systemd_units
+    systemctl list-unit-files "cape*" --state=enabled --no-legend | awk '{print $1}' | xargs -r sudo systemctl start
+}
+
 # Doesn't work ${$1,,}
 COMMAND=$(echo "$1"|tr "{A-Z}" "{a-z}")
 
-case $COMMAND in
-    '-h')
-        usage
-        exit 0;;
-esac
-
 if [ $# -ge 2 ] && [[ ! "$2" =~ ^-- ]]; then
     IFACE_IP=$2
-elif [ $# -eq 0 ]; then
-    echo "[-] check --help"
-    exit 1
 fi
 
 DISABLE_MONGO_AVX_CHECK=0
@@ -1889,6 +1904,8 @@ case "$COMMAND" in
     install_passivedns;;
 'libvirt')
     install_libvirt;;
+'update')
+    update;;
 *)
     usage;;
 esac

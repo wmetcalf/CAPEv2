@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import functools
 import logging
 import os
@@ -11,25 +12,27 @@ from lib.cuckoo.common.cleaners_utils import free_space_monitor
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.exceptions import (
-    CuckooCriticalError,
     CuckooGuestCriticalTimeout,
     CuckooGuestError,
     CuckooMachineError,
     CuckooOperationalError,
+    CuckooRooterError,
 )
 from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import convert_to_printable, create_folder, get_memdump_path
-from lib.cuckoo.core.database import Database, _Database
+from lib.cuckoo.core.data.db_common import _utcnow_naive
+from lib.cuckoo.core.database import Database, _Database, run_db_unit
 from lib.cuckoo.core.data.task import TASK_COMPLETED, TASK_PENDING, TASK_RUNNING, TASK_FAILED_ANALYSIS, Task
 from lib.cuckoo.core.data.machines import Machine
 from lib.cuckoo.core.data.guests import Guest
 from lib.cuckoo.core.guest import GuestManager
+from lib.cuckoo.core.log import extract_main_task_id, log_task_context
 from lib.cuckoo.core.machinery_manager import MachineryManager
 from lib.cuckoo.core.plugins import RunAuxiliary
 from lib.cuckoo.core.resultserver import ResultServer
-from lib.cuckoo.core.rooter import _load_socks5_operational, rooter, vpns
+from lib.cuckoo.core.rooter import ROOTER_UNAVAILABLE, _load_socks5_operational, _select_gateway, gateways, rooter, rooter_required, vpns
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +54,11 @@ def is_network_interface(intf: str):
     global network_interfaces
     network_interfaces = list(psutil.net_if_addrs().keys())
     return intf in network_interfaces
+
+
+def _nexthop_enabled(routing):
+    """True when the [nexthop] section exists and is enabled (review M4 hasattr guard)."""
+    return hasattr(routing, "nexthop") and routing.nexthop.enabled
 
 
 class CuckooDeadMachine(Exception):
@@ -90,6 +98,9 @@ class AnalysisLogger(logging.LoggerAdapter):
         task_id: Optional[int] = self.extra.get("task_id") if self.extra is not None else None
         if task_id is not None:
             msg = f"Task #{task_id}: {msg}"
+            extra = dict(kwargs.get("extra") or {})
+            extra.setdefault("task_id", task_id)
+            kwargs["extra"] = extra
         return msg, kwargs
 
 
@@ -115,6 +126,7 @@ class AnalysisManager(threading.Thread):
         super().__init__(name=f"task-{task.id}", daemon=True)
         self.db: _Database = Database()
         self.task = task
+        self.main_task_id = extract_main_task_id(self.task)
         self.log = AnalysisLogger(log, {"task_id": self.task.id})
         self.machine = machine
         self.machinery_manager = machinery_manager
@@ -134,6 +146,18 @@ class AnalysisManager(threading.Thread):
         self.reject_segments = None
         self.reject_hostports = None
         self.no_local_routing = None
+        # per-task [nexthop] binding (None unless this task is bound to a gateway profile)
+        self.nexthop_id = None
+        self.nexthop_interface = None
+        self.nexthop_rt_table = None
+        self.nexthop_priority = None
+        self.guest_manager: Optional[GuestManager] = None
+        self.guest_started_on: Optional[datetime.datetime] = None
+        self.stuck_vm_killed: bool = False
+
+    def _db_unit(self, fn: Callable[[], Any], desc: str) -> Any:
+        """Run fn() in its own transaction, retried once on a lost DB connection."""
+        return run_db_unit(self.db, fn, desc, logger=self.log)
 
     @main_thread_only
     def prepare_task_and_machine_to_start(self) -> None:
@@ -172,7 +196,8 @@ class AnalysisManager(threading.Thread):
 
     def check_file(self, sha256):
         """Checks the integrity of the file to be analyzed."""
-        sample = self.db.view_sample(self.task.sample_id)
+        with self.db.transaction():
+            sample = self.db.view_sample(self.task.sample_id)
 
         if sample and sha256 != sample.sha256:
             self.log.error("Target file has been modified after submission: '%s'", convert_to_printable(self.task.target))
@@ -311,8 +336,7 @@ class AnalysisManager(threading.Thread):
 
         is_dead = False
         try:
-            with self.db.session.begin():
-                self.machinery_manager.start_machine(self.machine)
+            self.machinery_manager.start_machine(self.machine)
 
             yield
 
@@ -324,15 +348,18 @@ class AnalysisManager(threading.Thread):
             # This machine has turned dead, so we'll throw an exception
             # which informs the AnalysisManager that it should analyze
             # this task again with another available machine.
-            self.log.exception(str(e))
+            self.log.error("%s", e)
 
             # Remove the guest from the database, so that we can assign a
             # new guest when the task is being analyzed with another machine.
-            with self.db.session.begin():
+            def _forget_dead_machine():
                 self.db.guest_remove(self.guest.id)
-                self.db.assign_machine_to_task(self.task, None)
+                # Re-read: after a retry the session that loaded self.task is gone.
+                self.db.assign_machine_to_task(self.db.view_task(self.task.id), None)
                 # ToDo do we really need to delete machine here?
                 self.machinery_manager.machinery.delete_machine(self.machine.name)
+
+            self._db_unit(_forget_dead_machine, f"dead machine cleanup for {self.machine.name}")
 
             # Remove the analysis directory that has been created so
             # far, as perform_analysis() is going to be doing that again.
@@ -342,24 +369,33 @@ class AnalysisManager(threading.Thread):
         finally:
             if not is_dead:
                 try:
-                    with self.db.session.begin():
-                        self.machinery_manager.stop_machine(self.machine)
+                    self.machinery_manager.stop_machine(self.machine)
                 except CuckooMachineError as e:
                     self.log.warning("Unable to stop machine %s: %s", self.machine.label, e)
+                except Exception as e:
+                    self.log.error("Unexpected error stopping machine %s: %s", self.machine.label, e)
 
                 try:
                     # Release the analysis machine, but only if the machine is not dead.
-                    with self.db.session.begin():
-                        self.machinery_manager.machinery.release(self.machine)
+                    # unlock_machine() merges, so the (possibly detached) self.machine is safe to reuse on retry.
+                    self._db_unit(
+                        lambda: self.machinery_manager.machinery.release(self.machine),
+                        f"release of machine {self.machine.label}",
+                    )
                 except CuckooMachineError as e:
                     self.log.error(
                         "Unable to release machine %s, reason %s. You might need to restore it manually",
                         self.machine.label,
                         e,
                     )
+                except Exception as e:
+                    self.log.error("Failed to release machine %s in database: %s", self.machine.label, e)
 
     def dump_machine_memory(self) -> None:
         if not self.cfg.cuckoo.memory_dump and not self.task.memory:
+            return
+        if getattr(self, "stopped_by_user", False):
+            self.log.info("Skipping machine memory dump for task #%s (stopped early by user)", self.task.id)
             return
 
         assert self.machinery_manager and self.machine
@@ -395,46 +431,64 @@ class AnalysisManager(threading.Thread):
 
     @contextlib.contextmanager
     def network_routing(self) -> Generator[None, None, None]:
-        self.route_network()
         try:
+            # route_network() is inside the try so a failure part-way through setup (e.g. a rooter
+            # timeout) still tears down whatever was already applied. The rooter handles commands
+            # sequentially, so a disable queued after a timed-out enable is executed after it.
+            self.route_network()
             yield
         finally:
-            # Drop the network routing rules if any.
-            self.unroute_network()
+            # Drop the network routing rules if any. Teardown errors are logged, not raised, so they
+            # neither mask an exception from the analysis nor fail an analysis that already completed.
+            try:
+                self.unroute_network()
+            except CuckooRooterError as e:
+                self.log.error("Failed to fully unroute network: %s", e)
+            except Exception:
+                self.log.exception("Unexpected error while unrouting network")
 
     @contextlib.contextmanager
     def run_auxiliary(self) -> Generator[None, None, None]:
         aux = RunAuxiliary(task=self.task, machine=self.machine)
 
-        with self.db.session.begin():
-            aux.start()
+        aux.start()
 
         try:
             yield
         finally:
-            with self.db.session.begin():
-                aux.stop()
+            aux.stop()
 
     def run_analysis_on_guest(self) -> None:
         # Generate the analysis configuration file.
         options = self.build_options()
 
         guest_manager = GuestManager(self.machine.name, self.machine.ip, self.machine.platform, self.task.id, self)
+        self.guest_manager = guest_manager
 
-        with self.db.session.begin():
+        def _prepare_guest_start():
             if Config("web").guacamole.enabled and hasattr(self.machinery_manager.machinery, "store_vnc_port"):
                 self.machinery_manager.machinery.store_vnc_port(self.machine.label, self.task.id)
-            options["clock"] = self.db.update_clock(self.task.id)
+            clock = self.db.update_clock(self.task.id)
             self.db.guest_set_status(self.task.id, "starting")
+            return clock
+
+        options["clock"] = self._db_unit(_prepare_guest_start, f"guest start preparation for task {self.task.id}")
         guest_manager.start_analysis(options)
+        self.guest_started_on = _utcnow_naive()
         try:
-            if guest_manager.get_status_from_db() == "starting":
+            current_status = guest_manager.get_status_from_db()
+            if current_status == "starting":
                 guest_manager.set_status_in_db("running")
                 guest_manager.wait_for_completion()
+                if guest_manager.get_status_from_db() == "stopping":
+                    self.stopped_by_user = True
+            elif current_status == "stopping":
+                self.stopped_by_user = True
             guest_manager.set_status_in_db("stopping")
         except Exception as e:
-            guest_manager.set_status_in_db("failed")
             self.log.exception("Unknown exception waiting for guest completion: %s", str(e))
+            with contextlib.suppress(Exception):
+                guest_manager.set_status_in_db("failed")
 
         return
 
@@ -448,16 +502,15 @@ class AnalysisManager(threading.Thread):
             self.log.debug("Failed to initialize the analysis folder")
             return False
 
-        with self.db.session.begin():
-            category_early_escape = self.category_checks()
-            if isinstance(category_early_escape, bool):
-                return category_early_escape
+        # File hashing/copying happens here: no transaction around it (check_file opens its own).
+        category_early_escape = self.category_checks()
+        if isinstance(category_early_escape, bool):
+            return category_early_escape
 
         # At this point, we're sure that this analysis requires a machine.
         assert self.machinery_manager and self.machine and self.guest
 
-        with self.db.session.begin():
-            self.machinery_manager.scale_pool(self.machine)
+        self.machinery_manager.scale_pool(self.machine)
 
         self.log.info("Starting analysis of %s '%s'", self.task.category.upper(), convert_to_printable(self.task.target))
 
@@ -469,8 +522,14 @@ class AnalysisManager(threading.Thread):
             else:
                 succeeded = True
             finally:
-                with self.db.session.begin():
+                def _stop_guest():
                     self.db.guest_stop(self.guest.id)
+                    self.db.delete_guac_sessions_for_task(self.task.id)
+
+                try:
+                    self._db_unit(_stop_guest, f"guest_stop for guest {self.guest.id}")
+                except Exception as e:
+                    self.log.error("Failed to stop guest %s in database: %s", self.guest.id, e)
 
         return succeeded
 
@@ -479,24 +538,42 @@ class AnalysisManager(threading.Thread):
         try:
             success = self.perform_analysis()
         except CuckooDeadMachine:
-            with self.db.session.begin():
+            try:
                 # Put the task back in pending so that the schedule can attempt to choose a new machine.
-                self.db.set_status(self.task.id, TASK_PENDING)
+                self._db_unit(lambda: self.db.set_status(self.task.id, TASK_PENDING), f"set TASK_PENDING for task {self.task.id}")
+            except Exception as e:
+                self.log.error("Failed to set task %s to pending: %s", self.task.id, e)
             raise
         except Exception as e:
-            self.log.exception("Unexpected exception during analysis: %s", e)
-            with self.db.session.begin():
+            if isinstance(e, CuckooRooterError):
+                # Expected operational failure (rooter timeout/error): the message is enough.
+                self.log.error("Rooter error during analysis: %s", e)
+            else:
+                self.log.exception("Unexpected exception during analysis: %s", e)
+
+            def _mark_failed():
                 self.db.set_status(self.task.id, TASK_FAILED_ANALYSIS)
-                if hasattr(self, "machine") and self.machine:
+                if self.machine:
                     self.db.unlock_machine(self.machine)
+
+            try:
+                self._db_unit(_mark_failed, f"set TASK_FAILED_ANALYSIS for task {self.task.id}")
+            except Exception as set_status_err:
+                self.log.error("Failed to set task %s to failed: %s", self.task.id, set_status_err)
             raise
         else:
-            with self.db.session.begin():
+            def _mark_completed():
                 self.db.set_status(self.task.id, TASK_COMPLETED)
-                self.log.info("Completed analysis %ssuccessfully.", "" if success else "un")
                 # Need to be release on unsucess
-                if not success and hasattr(self, "machine") and self.machine:
+                if not success and self.machine:
                     self.db.unlock_machine(self.machine)
+
+            try:
+                self._db_unit(_mark_completed, f"set TASK_COMPLETED for task {self.task.id}")
+            except Exception as e:
+                self.log.error("Failed to set task %s to completed in database: %s", self.task.id, e)
+            else:
+                self.log.info("Completed analysis %ssuccessfully.", "" if success else "un")
 
             self.update_latest_symlink()
 
@@ -522,19 +599,117 @@ class AnalysisManager(threading.Thread):
 
     def run(self):
         """Run manager thread."""
-        try:
-            self.launch_analysis()
-        except Exception:
-            self.log.exception("failure in AnalysisManager.run")
-        else:
-            self.log.info("analysis procedure completed")
-        finally:
-            if self.done_callback:
-                self.done_callback(self)
+        machine_label = self.machine.label if self.machine else None
+        with log_task_context(task_id=self.task.id, main_task_id=self.main_task_id, machine=machine_label):
+            try:
+                self.launch_analysis()
+            except (CuckooDeadMachine, CuckooMachineError) as e:
+                self.log.error("failure in AnalysisManager.run: %s", e)
+            except CuckooRooterError:
+                # Already logged by launch_analysis().
+                pass
+            except Exception:
+                self.log.exception("failure in AnalysisManager.run")
+            else:
+                self.log.info("analysis procedure completed")
+            finally:
+                if self.done_callback:
+                    self.done_callback(self)
+
+    def _rooter_optional_and_unavailable(self, response) -> bool:
+        """True when the rooter is not running and neither the task route nor routing.conf requires it."""
+        if not (response and response.get(ROOTER_UNAVAILABLE)):
+            return False
+        if str(self.route).lower() not in ("none", "false"):
+            return False
+        return not rooter_required()
 
     def _rooter_response_check(self):
         if self.rooter_response and self.rooter_response["exception"] is not None:
-            raise CuckooCriticalError(f"Error execution rooter command: {self.rooter_response['exception']}")
+            raise CuckooRooterError(f"Error execution rooter command: {self.rooter_response['exception']}")
+
+    def _resolve_nexthop(self, routing):
+        """Resolve self.route to a LIVE gateway profile and bind this task to it.
+
+        Returns True if it OWNS the route (bound a profile); False if the id is
+        unresolved/typo'd or the pool is empty/all-down, in which case it forces
+        self.route="drop" so the existing none/drop/false dispatch drops the VM
+        (review B1: never fall through to host default forwarding).
+
+        Always sets self.interface = None and self.rt_table = None so the generic
+        forward/srcroute block is skipped (review H2 option b) regardless of outcome.
+        """
+        self.interface = None  # nexthop owns enable/disable; skip the generic block
+        self.rt_table = None
+        # Clear any binding a PRIOR resolve left, so a failure path here (route -> "drop") cannot
+        # leave a stale self.nexthop_* that _dispatch_nexthop would still install -- fail-open on
+        # route_network re-entry / machine retry (Copilot).
+        self.nexthop_id = self.nexthop_interface = self.nexthop_rt_table = self.nexthop_priority = None
+        # Resolve the selector, FAILING CLOSED on a typo'd/unknown route (review B1 + gemini #14):
+        #  - an explicit gateway id, or a policy token (roundrobin/random), selects directly;
+        #  - ONLY the node's configured DEFAULT route falls back to default_policy;
+        #  - anything else (a typo'd/unconfigured id like "gw9"/"vpn9") DROPS rather than
+        #    silently egressing via some live gateway (that would be an isolation-boundary bypass).
+        # A reserved route (none/drop/false/internet/tor/inetsim) must NEVER resolve to a gateway
+        # even if it is the configured default — those are owned by earlier route_network branches;
+        # reaching here with one means drop, not gateway (gemini #15 security-critical).
+        if str(self.route).lower() in ("none", "drop", "false", "internet", "tor", "inetsim"):
+            self.route = "drop"
+            return False
+        if self.route in gateways or self.route in ("roundrobin", "random"):
+            sel = self.route
+        elif self.route == "nexthop" or self.route == routing.routing.route:
+            # the "nexthop" sentinel (explicit) OR the node's configured default route falls back
+            # to default_policy and picks from the live pool. "nexthop" is a reserved token (a
+            # [gwX] may not be named it), so this is not the gemini-#15 typo'd-route leak.
+            sel = routing.nexthop.default_policy
+        else:
+            self.route = "drop"
+            return False
+        profile = _select_gateway(sel)
+        if profile is None:
+            # empty/all-down pool => FAIL CLOSED (review B1)
+            self.route = "drop"
+            return False
+        self.nexthop_id = profile.name
+        self.nexthop_interface = str(profile.interface)
+        self.nexthop_rt_table = str(profile.rt_table)
+        # deterministic per-task priority: 10000 + last octet of the VM IP (review M6).
+        # Unique within one guest /24 (the shipped vm_net); across multiple /24s two VMs
+        # could share a priority number but keep distinct `from <vm_ip>` selectors, so no
+        # leak — teardown's by-priority band sweep still clears them all.
+        self.nexthop_priority = str(10000 + int(self.machine.ip.rsplit(".", 1)[1]))
+        return True
+
+    def _dispatch_nexthop(self):
+        """Issue the per-task nexthop bind (source rule + SNAT). No-op unless this
+        task is bound to a gateway profile. Every rooter arg is str() (review B3)."""
+        if not self.nexthop_id:
+            return
+        self.rooter_response = rooter(
+            "nexthop_enable",
+            str(self.machine.ip),
+            str(self.machine.interface),   # guest ingress bridge -- constrains forwarding (anti-spoof)
+            self.nexthop_interface,
+            self.nexthop_rt_table,
+            self.nexthop_priority,
+        )
+        self._rooter_response_check()
+
+    def _unroute_nexthop(self):
+        """Mirror-teardown the per-task bind with the PERSISTED self.nexthop_* tuple;
+        never re-run the selector (review M5). No-op unless bound to a gateway."""
+        if not self.nexthop_id:
+            return
+        self.rooter_response = rooter(
+            "nexthop_disable",
+            str(self.machine.ip),
+            str(self.machine.interface),   # mirror the ingress bridge enable used (persisted machine)
+            self.nexthop_interface,
+            self.nexthop_rt_table,
+            self.nexthop_priority,
+        )
+        self._rooter_response_check()
 
     def route_network(self):
         """Enable network routing if desired."""
@@ -545,14 +720,14 @@ class AnalysisManager(threading.Thread):
         if self.task.route:
             self.route = self.task.route
 
-        if self.route in ("none", "None", "drop", "false"):
+        if str(self.route).lower() in ("none", "drop", "false"):
             self.interface = None
             self.rt_table = None
         elif self.route == "inetsim":
             self.interface = routing.inetsim.interface
         elif self.route == "tor":
             self.interface = routing.tor.interface
-        elif self.route == "internet" and routing.routing.internet != "none":
+        elif self.route == "internet" and routing.routing.internet and str(routing.routing.internet).lower() not in ("none", "false"):
             self.interface = routing.routing.internet
             self.rt_table = routing.routing.rt_table
             self.no_local_routing = routing.routing.no_local_routing and not routing.routing.nat
@@ -565,9 +740,20 @@ class AnalysisManager(threading.Thread):
             self.rt_table = vpns[self.route].rt_table
         elif self.route in self.socks5s:
             self.interface = ""
-        elif self.route[:3] == "tun" and is_network_interface(self.route):
-            # tunnel interface starts with "tun" and interface exists on machine
+        elif isinstance(self.route, str) and self.route[:3] == "tun" and is_network_interface(self.route):
+            # tunnel interface starts with "tun" and interface exists on machine. Checked BEFORE
+            # the nexthop branch: _resolve_nexthop rewrites self.route="drop" for any route it does
+            # not own, which would otherwise clobber an explicit tunX route into a drop when
+            # [nexthop] is enabled (Copilot). Legacy explicit routes win over nexthop resolution.
             self.interface = self.route
+        elif _nexthop_enabled(routing):
+            # When [nexthop] is enabled it OWNS every route not claimed by a legacy branch above:
+            # it binds a gateway profile (setting self.nexthop_* and self.interface=None so the
+            # generic forward/srcroute block is skipped) or, for an unresolved/typo'd id, forces
+            # self.route="drop". Consuming the route here (rather than an `and`-guarded `pass`)
+            # means a nexthop-dropped task falls into the none/drop/false dispatch below and fails
+            # closed cleanly, instead of the misleading "Unknown ... ignoring routing" else (Copilot).
+            self._resolve_nexthop(routing)
         else:
             self.log.warning("Unknown network routing destination specified, ignoring routing for this analysis: %s", self.route)
             self.interface = None
@@ -575,15 +761,25 @@ class AnalysisManager(threading.Thread):
 
         # Check if the network interface is still available. If a VPN dies for
         # some reason, its tunX interface will no longer be available.
-        if self.interface and not rooter("nic_available", self.interface):
-            self.log.error(
-                "The network interface '%s' configured for this analysis is "
-                "not available at the moment, switching to route=none mode",
-                self.interface,
-            )
-            self.route = "none"
-            self.interface = None
-            self.rt_table = None
+        # rooter() returns a dict, so check for a rooter error first and then test "output".
+        if self.interface:
+            self.rooter_response = rooter("nic_available", self.interface)
+            if self.rooter_response and self.rooter_response.get("exception") is not None:
+                self.route = None
+                self.interface = None
+                self.rt_table = None
+                self.no_local_routing = False
+                self._rooter_response_check()
+            if not (self.rooter_response and self.rooter_response.get("output")):
+                self.log.error(
+                    "The network interface '%s' configured for this analysis is "
+                    "not available at the moment, switching to route=none mode",
+                    self.interface,
+                )
+                self.route = "none"
+                self.interface = None
+                self.rt_table = None
+                self.no_local_routing = False
 
         if self.route == "inetsim":
             self.rooter_response = rooter(
@@ -612,15 +808,23 @@ class AnalysisManager(threading.Thread):
                 str(self.socks5s[self.route]["dnsport"]),
                 str(self.socks5s[self.route]["port"]),
             )
+            self._rooter_response_check()
             self.rooter_response = rooter("libvirt_fwo_enable", self.machine.interface, self.machine.ip)
 
         elif str(self.route).lower() in ("none", "drop", "false"):
             self.rooter_response = rooter("drop_enable", self.machine.ip, str(self.machine.resultserver_port))
-        elif self.route[:3] == "tun" and is_network_interface(self.route):
+            if self._rooter_optional_and_unavailable(self.rooter_response):
+                # Default configuration: no rooter is running and none is required, so there are no drop rules to apply.
+                self.rooter_response = None
+        elif isinstance(self.route, str) and self.route[:3] == "tun" and is_network_interface(self.route):
             self.log.info("Network interface %s is tunnel", self.interface)
             self.rooter_response = rooter("interface_route_tun_enable", self.machine.ip, self.route, str(self.task.id))
 
         self._rooter_response_check()
+
+        # nexthop bind (self.interface is None for a gateway route, so the generic
+        # block below is skipped; this issues the per-task source rule + SNAT).
+        self._dispatch_nexthop()
 
         # check if the interface is up
         if HAVE_NETWORKIFACES and routing.routing.verify_interface and self.interface and self.interface not in network_interfaces:
@@ -631,12 +835,14 @@ class AnalysisManager(threading.Thread):
 
         if self.interface:
             self.rooter_response = rooter("libvirt_fwo_enable", self.machine.interface, self.machine.ip)
+            self._rooter_response_check()
             if self.no_local_routing:
                 input_interface = "dirty-line"
                 # Traffic from lan to machine
                 self.rooter_response = rooter(
                     "forward_enable", input_interface, self.machine.interface, "0.0.0.0/0", self.machine.ip
                 )
+                self._rooter_response_check()
             else:
                 input_interface = self.machine.interface
             # Traffic outbound from machine
@@ -658,6 +864,7 @@ class AnalysisManager(threading.Thread):
                     "tcp",
                     str(self.machine.resultserver_port),
                 )
+                self._rooter_response_check()
                 self.rooter_response = rooter(
                     "forward_enable", input_interface, self.machine.interface, self.cfg.resultserver.ip, self.machine.ip
                 )
@@ -671,33 +878,44 @@ class AnalysisManager(threading.Thread):
         self.log.info("Enabled route '%s'.", self.route)
 
         if self.no_local_routing:
-            rooter("add_dev_to_vrf", self.machine.interface)
+            self.rooter_response = rooter("add_dev_to_vrf", self.machine.interface)
+            self._rooter_response_check()
         elif self.rt_table:
             self.rooter_response = rooter("srcroute_enable", self.rt_table, self.machine.ip)
             self._rooter_response_check()
 
     def unroute_network(self):
+        """Disable network routing.
+
+        Best effort: every teardown command is sent even if an earlier one fails, so one rooter
+        timeout or error cannot leave the remaining rules for this VM in place for the next task.
+        All failures are collected and raised together as a single CuckooRooterError at the end.
+        """
         routing = Config("routing")
+        errors = []
+
+        def disable(command, *args):
+            self.rooter_response = rooter(command, *args)
+            if self._rooter_optional_and_unavailable(self.rooter_response):
+                # Nothing was applied without a rooter, so there is nothing to tear down.
+                return
+            if self.rooter_response and self.rooter_response.get("exception") is not None:
+                errors.append(f"{command}: {self.rooter_response['exception']}")
+
         if self.interface:
-            self.rooter_response = rooter("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
+            disable("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
             if self.no_local_routing:
                 input_interface = "dirty-line"
                 # Traffic from lan to machine
-                self.rooter_response = rooter(
-                    "forward_disable", input_interface, self.machine.interface, "0.0.0.0/0", self.machine.ip
-                )
+                disable("forward_disable", input_interface, self.machine.interface, "0.0.0.0/0", self.machine.ip)
             else:
                 input_interface = self.machine.interface
             # Traffic outbound from machine
-            self.rooter_response = rooter("forward_disable", input_interface, self.interface, self.machine.ip)
-            self._rooter_response_check()
+            disable("forward_disable", input_interface, self.interface, self.machine.ip)
             if self.reject_segments:
-                self.rooter_response = rooter(
-                    "forward_reject_disable", self.machine.interface, self.interface, self.machine.ip, self.reject_segments
-                )
-                self._rooter_response_check()
+                disable("forward_reject_disable", self.machine.interface, self.interface, self.machine.ip, self.reject_segments)
             if self.no_local_routing:
-                self.rooter_response = rooter(
+                disable(
                     "forward_disable",
                     input_interface,
                     self.interface,
@@ -706,24 +924,18 @@ class AnalysisManager(threading.Thread):
                     "tcp",
                     str(self.machine.resultserver_port),
                 )
-                self.rooter_response = rooter(
-                    "forward_disable", input_interface, self.machine.interface, self.cfg.resultserver.ip, self.machine.ip
-                )
+                disable("forward_disable", input_interface, self.machine.interface, self.cfg.resultserver.ip, self.machine.ip)
             if self.reject_hostports:
-                self.rooter_response = rooter(
-                    "hostports_reject_disable", self.machine.interface, self.machine.ip, self.reject_hostports
-                )
-                self._rooter_response_check()
+                disable("hostports_reject_disable", self.machine.interface, self.machine.ip, self.reject_hostports)
             self.log.info("Disabled route '%s'", self.route)
 
         if self.no_local_routing:
-            rooter("delete_dev_from_vrf", self.machine.interface)
+            disable("delete_dev_from_vrf", self.machine.interface)
         elif self.rt_table:
-            self.rooter_response = rooter("srcroute_disable", self.rt_table, self.machine.ip)
-            self._rooter_response_check()
+            disable("srcroute_disable", self.rt_table, self.machine.ip)
 
         if self.route == "inetsim":
-            self.rooter_response = rooter(
+            disable(
                 "inetsim_disable",
                 self.machine.ip,
                 routing.inetsim.server,
@@ -733,7 +945,7 @@ class AnalysisManager(threading.Thread):
             )
 
         elif self.route == "tor":
-            self.rooter_response = rooter(
+            disable(
                 "socks5_disable",
                 self.machine.ip,
                 str(self.machine.resultserver_port),
@@ -742,22 +954,30 @@ class AnalysisManager(threading.Thread):
             )
 
         elif self.route in self.socks5s:
-            self.rooter_response = rooter(
+            disable(
                 "socks5_disable",
                 self.machine.ip,
                 str(self.machine.resultserver_port),
                 str(self.socks5s[self.route]["dnsport"]),
                 str(self.socks5s[self.route]["port"]),
             )
-            self.rooter_response = rooter("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
+            disable("libvirt_fwo_disable", self.machine.interface, self.machine.ip)
 
-        elif str(self.route).lower() in ("none", "drop", "false"):
-            self.rooter_response = rooter("drop_disable", self.machine.ip, str(self.machine.resultserver_port))
-        elif self.route[:3] == "tun":
+        elif self.route is not None and str(self.route).lower() in ("none", "drop", "false"):
+            disable("drop_disable", self.machine.ip, str(self.machine.resultserver_port))
+        elif isinstance(self.route, str) and self.route[:3] == "tun":
             self.log.info("Disable tunnel interface: %s", self.interface)
-            self.rooter_response = rooter("interface_route_tun_disable", self.machine.ip, self.route, str(self.task.id))
+            disable("interface_route_tun_disable", self.machine.ip, self.route, str(self.task.id))
 
-        self._rooter_response_check()
+        # nexthop teardown with the PERSISTED tuple (the generic disable block above
+        # was skipped because self.interface is None). No-op unless bound (review M5).
+        try:
+            self._unroute_nexthop()
+        except CuckooRooterError as e:
+            errors.append(str(e))
+
+        if errors:
+            raise CuckooRooterError("Error execution rooter command(s): " + "; ".join(errors))
 
     def get_machine_specific_options(self, task_opts: str) -> str:
         """This function may be used to return an updated version of the

@@ -3,6 +3,7 @@
 # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
 # See the file 'docs/LICENSE' for copying permission.
 import argparse
+import functools
 import gc
 import json
 import logging
@@ -11,8 +12,12 @@ import platform
 import resource
 import signal
 import sys
-import time
 from contextlib import suppress
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 log = logging.getLogger()
 
@@ -27,29 +32,27 @@ if sys.version_info[:2] < (3, 8):
     sys.exit(1)
 
 try:
-    import pebble
+    import pebble  # noqa: F401  # fail fast with a clear message if the dep is missing (engines import it)
 except ImportError:
     log.critical("Missed pebble dependency. Run: poetry install")
     sys.exit(1)
 
 sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
-from concurrent.futures import TimeoutError
 
-from lib.cuckoo.common.cleaners_utils import free_space_monitor
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
+from lib.cuckoo.common.exceptions import CuckooDatabaseInitializationError
 from lib.cuckoo.common.path_utils import path_delete, path_exists, path_mkdir
 from lib.cuckoo.common.utils import get_options, option_dict_enabled
 from lib.cuckoo.core.database import Database, init_database
 from lib.cuckoo.core.data.task import (
-    TASK_COMPLETED,
     TASK_FAILED_PROCESSING,
     TASK_FAILED_REPORTING,
-    TASK_REPORTED,
-    Task
+    TASK_REPORTED
 )
+from lib.cuckoo.core.log import init_json_file_handler, set_log_task_context
 from lib.cuckoo.core.plugins import RunProcessing, RunReporting, RunSignatures
-from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, init_modules
+from lib.cuckoo.core.startup import ConsoleHandler, check_linux_dist, check_webgui_mongo, init_modules
 
 cfg = Config()
 logconf = Config("logging")
@@ -70,9 +73,74 @@ if repconf.elasticsearchdb.enabled and not repconf.elasticsearchdb.searchonly:
 
 check_linux_dist()
 
-pending_future_map = {}
-pending_task_id_map = {}
 original_proctitle = getproctitle()
+_IS_WORKER = False
+_AUTO_LOCK_FD = None
+
+
+def _close_auto_lock_in_child():
+    """Close inherited supervisor lock descriptor in forked children so a dying or
+    wedged worker never holds process_auto.lock after the supervisor exits."""
+    global _AUTO_LOCK_FD
+    fd = _AUTO_LOCK_FD
+    _AUTO_LOCK_FD = None
+    if fd is not None:
+        with suppress(OSError):
+            fd.close()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_auto_lock_in_child)
+
+
+def _acquire_autoprocess_lock(cuckoo_root: str = CUCKOO_ROOT):
+    """Acquire a non-blocking single-instance flock for continuous auto mode.
+
+    Prevents multiple concurrent ``utils/process.py`` auto supervisors from
+    exceeding ``CAPE_PARALLEL`` or double-processing the same ``TASK_COMPLETED``
+    rows, while leaving targeted ``utils/process.py <id> -r`` runs unrestricted.
+    """
+    global _AUTO_LOCK_FD
+    if fcntl is None:
+        return None
+
+    lock_dir = os.path.join(cuckoo_root, "log")
+    lock_path = os.path.join(lock_dir, "process_auto.lock")
+    raw_fd = None
+    lock_file = None
+    try:
+        if not path_exists(lock_dir):
+            path_mkdir(lock_dir)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        raw_fd = os.open(lock_path, flags, 0o600)
+        lock_file = os.fdopen(raw_fd, "r+")
+        raw_fd = None
+    except OSError as err:
+        if raw_fd is not None:
+            with suppress(OSError):
+                os.close(raw_fd)
+        log.warning("Unable to open autoprocess lockfile %s (%s); continuing unlocked", lock_path, err)
+        return None
+
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        log.error("Another cape-processor auto instance is already running (lock held on %s); exiting.", lock_path)
+        sys.exit(1)
+    except OSError as err:
+        lock_file.close()
+        log.warning("flock unavailable on %s (%s); continuing unlocked", lock_path, err)
+        return None
+
+    with suppress(OSError):
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"{os.getpid()}\n")
+        lock_file.flush()
+
+    _AUTO_LOCK_FD = lock_file
+    return lock_file
 
 
 # https://stackoverflow.com/questions/41105733/limit-ram-usage-to-python-program
@@ -113,6 +181,8 @@ def process(
     capeproc=False,
     memory_debugging=False,
     debug: bool = False,
+    visibility: str = None,
+    tenant_id: int = None,
 ):
     # This is the results container. It's what will be used by all the
     # reporting modules to make it consumable by humans and machines.
@@ -120,12 +190,14 @@ def process(
     # module available. Its structure can be observed through the JSON
     # dump in the analysis' reports folder. (If jsondump is enabled.)
 
-    task_dict = task.to_dict() or {}
+    task_dict = task.to_dict() if hasattr(task, "to_dict") else (dict(task) if isinstance(task, dict) else {})
     task_id = task_dict.get("id") or 0
     task_options = get_options(task_dict.get("options"))
     task_dict["_options_parsed"] = task_options
     # cluster mode
-    main_task_id = task_options.get("main_task_id", 0) if "main_task_id" in task_options else False
+    main_task_id = False
+    if attributes := task_dict.get("attributes"):
+        main_task_id = attributes.get("main_task_id", False)
 
     # ToDo new logger here
     per_analysis_handler = init_per_analysis_logging(tid=str(task_id), debug=debug)
@@ -140,8 +212,22 @@ def process(
         if memory_debugging:
             gc.collect()
             log.info("(2) GC object counts: %d, %d", len(gc.get_objects()), len(gc.garbage))
-        with db.session.begin():
-            RunProcessing(task=task_dict, results=results).run()
+        # No transaction around processing (it can take minutes): modules that read the
+        # SQL DB open their own short db.transaction().
+        RunProcessing(task=task_dict, results=results).run()
+        if isinstance(results.get("info"), dict):
+            if main_task_id:
+                results["info"].setdefault("local_task_id", task_id)
+            from lib.cuckoo.common.hooks import run_report_hooks
+
+            run_report_hooks(
+                results,
+                task=task_dict,
+                db=db,
+                visibility=visibility,
+                tenant_id=tenant_id,
+                stage="process",
+            )
         if memory_debugging:
             gc.collect()
             log.info("(3) GC object counts: %d, %d", len(gc.get_objects()), len(gc.garbage))
@@ -160,7 +246,7 @@ def process(
             else:
                 reprocess = report
 
-            error_count = RunReporting(task=task.to_dict(), results=results, reprocess=reprocess).run()
+            error_count = RunReporting(task=task_dict, results=results, reprocess=reprocess).run()
             status = TASK_REPORTED if error_count == 0 else TASK_FAILED_REPORTING
             with db.session.begin():
                 db.set_status(task_id, status)
@@ -194,23 +280,79 @@ def process(
         db.session.remove()
 
 
+def run_task(task, memory_debugging=False, debug=False):
+    """Run exactly one completed task to completion (processing -> report).
+    Extracted from autoprocess so every engine shares identical per-task setup."""
+    analysis_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task.id))
+    if not path_exists(analysis_path):
+        log.error("Analysis directory %s does not exist. Marking task %s as failed.", analysis_path, task.id)
+        with db.session.begin():
+            db.set_status(task.id, TASK_FAILED_PROCESSING)
+        return
+
+    sample_hash = ""
+    if task.category != "url":
+        with db.session.begin():
+            sample = db.view_sample(task.sample_id)
+            if sample:
+                sample_hash = sample.sha256
+    from lib.cuckoo.common.integrations import file_extra_info
+
+    file_extra_info.enable_shared_extractor_pool()
+    try:
+        try:
+            process(
+                task.target,
+                sample_hash,
+                report=True,
+                auto=True,
+                task=task,
+                memory_debugging=memory_debugging,
+                debug=debug,
+            )
+        except Exception:
+            raise
+        except BaseException as e:
+            import traceback
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            raise RuntimeError(f"{type(e).__module__}.{type(e).__name__}: {e}\n\n{tb}") from None
+    finally:
+        file_extra_info.shutdown_shared_extractor_pool()
+        set_formatter_fmt()
+        setproctitle(f"{original_proctitle} [worker: idle]" if _IS_WORKER else original_proctitle)
+
+
 def init_worker():
+    global _IS_WORKER
+    _IS_WORKER = True
+    setproctitle(f"{original_proctitle} [worker: idle]")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # See https://docs.sqlalchemy.org/en/14/core/pooling.html#using-connection-pools-with-multiprocessing-or-os-fork
-    db.engine.dispose(close=False)
+    with suppress(CuckooDatabaseInitializationError):
+        db.engine.dispose(close=False)
 
     # Avoid fork deadlock: use direct list ops instead of
     # handler.close()/removeHandler()/addHandler() which acquire locks.
-    # Inherited FDs are intentionally leaked: closing them via os.close()
-    # frees the fd number, but the old Python stream still references it;
-    # when GC finalizes that stream it may close a new handler's fd.
-    # Workers are short-lived (max_tasks) so the leak is harmless.
-    log.handlers.clear()
+    # Inherited FDs are intentionally leaked after fork.
+    log.handlers[:] = []
 
+    # Restore Console Handler (no lock-acquiring addHandler)
     ch = ConsoleHandler()
     ch.setFormatter(FORMATTER)
     log.handlers.append(ch)
 
+    # Eagerly compile the YARA ruleset once per worker so the first task
+    # this worker picks up doesn't pay the ~3s compile cost. The result
+    # is cached on the File class for the worker's lifetime; init_yara()
+    # is idempotent (no-op when already initialized) so this is safe to
+    # call here even if some downstream code path also calls it.
+    try:
+        from lib.cuckoo.common.objects import File
+        File.init_yara()
+    except Exception:
+        log.debug("worker init: yara pre-compile skipped", exc_info=True)
+
+    # Restore Syslog Handler if enabled (no lock-acquiring addHandler)
     if logconf.logger.syslog_process:
         try:
             slh = logging.handlers.SysLogHandler(address=logconf.logger.syslog_dev)
@@ -219,11 +361,20 @@ def init_worker():
         except Exception as e:
             log.warning("Failed to restore Syslog handler in worker: %s", e)
 
+    # Restore File Handler using WatchedFileHandler to support rotation (no lock-acquiring addHandler)
     try:
         path = os.path.join(CUCKOO_ROOT, "log", "process.log")
         fh = logging.handlers.WatchedFileHandler(path)
         fh.setFormatter(FORMATTER)
         log.handlers.append(fh)
+        init_json_file_handler(
+            log,
+            "process.log",
+            service_name="cape-processor",
+            logconf=logconf,
+            watch_only=True,
+            cuckoo_root=CUCKOO_ROOT,
+        )
     except PermissionError as e:
         log.warning("Failed to restore File handler in worker due to permissions: %s", e)
 
@@ -252,6 +403,7 @@ FORMATTER = logging.Formatter(get_formatter_fmt())
 
 def set_formatter_fmt(task_id=None, main_task_id=None):
     FORMATTER._style._fmt = get_formatter_fmt(task_id, main_task_id)
+    set_log_task_context(task_id=task_id, main_task_id=main_task_id)
 
 
 class ForceClosingTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
@@ -319,6 +471,14 @@ def init_logging(debug=False):
 
         fh.setFormatter(FORMATTER)
         log.addHandler(fh)
+        init_json_file_handler(
+            log,
+            "process.log",
+            service_name="cape-processor",
+            logconf=logconf,
+            handler_cls=ForceClosingTimedRotatingFileHandler,
+            cuckoo_root=CUCKOO_ROOT,
+        )
     except PermissionError:
         log.critical("PermissionError to create/access log. Probably executed with wrong user.")
         sys.exit(1)
@@ -366,148 +526,94 @@ def init_per_analysis_logging(tid=0, debug=False):
     return fhpa
 
 
-def processing_finished(future):
-    """
-    Callback function to handle the completion of a processing task.
-
-    This function is called when a future task is completed. It retrieves the task ID from the
-    pending_future_map, logs the result, and updates the task status in the database. If an
-    exception occurs during processing, it logs the error and sets the task status to failed.
-
-    Args:
-        future (concurrent.futures.Future): The future object representing the asynchronous task.
-
-    Raises:
-        TimeoutError: If the processing task times out.
-        pebble.ProcessExpired: If the processing task expires.
-        Exception: For any other exceptions that occur during processing.
-    """
-    task_id = pending_future_map.get(future)
-    with db.session.begin():
-        try:
-            _ = future.result()
-            log.info("Reports generation completed for Task #%d", task_id)
-        except TimeoutError as error:
-            log.error("[%d] Processing timeout: %s. Function: %s", task_id, error, error.args[1])
-            db.set_status(task_id, TASK_FAILED_PROCESSING)
-        except (pebble.ProcessExpired, Exception) as error:
-            log.exception("[%d] Exception when processing task: %s", task_id, error)
-            db.set_status(task_id, TASK_FAILED_PROCESSING)
-
-    pending_future_map.pop(future)
-    pending_task_id_map.pop(task_id)
-    set_formatter_fmt()
-    setproctitle(original_proctitle)
-
 
 def autoprocess(
-    parallel=1, failed_processing=False, maxtasksperchild=7, memory_debugging=False, processing_timeout=300, debug: bool = False, disable_memory_limit: bool = False
+    parallel=1,
+    failed_processing=False,
+    maxtasksperchild=7,
+    memory_debugging=False,
+    processing_timeout=300,
+    debug: bool = False,
+    disable_memory_limit: bool = False,
+    engine: str = "pebble",
 ):
     """
-    Automatically processes analysis data using a process pool.
+    Automatically processes analysis data using a process pool engine.
 
     Args:
         parallel (int): Number of parallel processes to use. Default is 1.
         failed_processing (bool): Whether to process failed tasks. Default is False.
-        maxtasksperchild (int): Maximum number of tasks per child process. Default is 7.
+        maxtasksperchild (int): Maximum number of tasks per child process (pebble engine only).
+            Default is 7. Pass 0 to disable worker recycling (avoids deadlock on some systems).
         memory_debugging (bool): Whether to enable memory debugging. Default is False.
         processing_timeout (int): Timeout for processing each task in seconds. Default is 300.
         debug (bool): Whether to enable debug mode. Default is False.
+        disable_memory_limit (bool): Skip setting process memory limits. Default is False.
+        engine (str): Processing engine to use: "pebble" (default) or "prefork".
 
     Raises:
         KeyboardInterrupt: If the process is interrupted by the user.
         MemoryError: If there is not enough free RAM to run processing.
         OSError: If an OS-related error occurs.
         Exception: If any other exception occurs during processing.
-
     """
-    maxcount = cfg.cuckoo.max_analysis_count
-    count = 0
-    # pool = multiprocessing.Pool(parallel, init_worker)
-    pool = False
+    from lib.cuckoo.core.processing_engine import get_engine
+    from lib.cuckoo.core.processing_engine.source import TaskSource
+
+    global _AUTO_LOCK_FD
+    if parallel < 1:
+        log.warning("Invalid parallel=%s; clamping to 1", parallel)
+        parallel = 1
+
+    lock_file = _acquire_autoprocess_lock(CUCKOO_ROOT)
     try:
-        if not disable_memory_limit:
-            memory_limit()
-        log.info("Processing analysis data")
-        with pebble.ProcessPool(max_workers=parallel, max_tasks=maxtasksperchild, initializer=init_worker) as pool:
-            # CAUTION - big ugly loop ahead.
-            while count < maxcount or not maxcount:
-                # If not enough free disk space is available, then we print an
-                # error message and wait another round (this check is ignored
-                # when the freespace configuration variable is set to zero).
-                if cfg.cuckoo.freespace_processing:
-                    # Resolve the full base path to the analysis folder, just in
-                    # case somebody decides to make a symbolic link out of it.
-                    dir_path = os.path.join(CUCKOO_ROOT, "storage", "analyses")
-                    free_space_monitor(dir_path, processing=True)
+        try:
+            if not disable_memory_limit:
+                memory_limit()
+            setproctitle(f"{original_proctitle} [supervisor parallel={parallel}]")
+            log.info("Processing analysis data (engine=%s, parallel=%d)", engine, parallel)
 
-                # If still full, don't add more (necessary despite pool).
-                if len(pending_task_id_map) >= parallel:
-                    time.sleep(5)
-                    continue
-                with db.session.begin():
-                    if failed_processing:
-                        tasks = db.list_tasks(status=TASK_FAILED_PROCESSING, limit=parallel, order_by=Task.completed_on.asc())
-                    else:
-                        tasks = db.list_tasks(status=TASK_COMPLETED, limit=parallel, order_by=Task.completed_on.asc())
-                    # Make sure the tasks are available as normal objects after the transaction ends, so that
-                    # sqlalchemy doesn't auto-initiate a new transaction the next time they are accessed.
-                    db.session.expunge_all()
-                added = False
-                # For loop to add only one, nice. (reason is that we shouldn't overshoot maxcount)
-                for task in tasks:
-                    # Not-so-efficient lock.
-                    if pending_task_id_map.get(task.id):
-                        continue
+            # Compile the YARA ruleset ONCE in the supervisor, before the engine forks any
+            # workers. Every forked child then inherits the compiled rules via copy-on-write
+            # fork (0s + shared read-only pages), and its init_worker() File.init_yara() call
+            # short-circuits on the idempotency guard. Without this, prefork — which forks a
+            # fresh child per task — would pay the ~3s compile on every single task. Safe to
+            # call here: compilation is single-threaded, so it does not break the prefork
+            # single-threaded-before-fork invariant.
+            from lib.cuckoo.common.objects import File
 
-                    log.info("Processing analysis data for Task #%d", task.id)
-                    sample_hash = ""
-                    if task.category != "url":
-                        with db.session.begin():
-                            sample = db.view_sample(task.sample_id)
-                            if sample:
-                                sample_hash = sample.sha256
+            File.init_yara()
 
-                    args = task.target, sample_hash
-                    kwargs = dict(report=True, auto=True, task=task, memory_debugging=memory_debugging, debug=debug)
-                    if memory_debugging:
-                        gc.collect()
-                        log.info("(before) GC object counts: %d, %d", len(gc.get_objects()), len(gc.garbage))
-                    # result = pool.apply_async(process, args, kwargs)
-                    future = pool.schedule(process, args, kwargs, timeout=processing_timeout)
-                    pending_future_map[future] = task.id
-                    pending_task_id_map[task.id] = future
-                    future.add_done_callback(processing_finished)
-                    if memory_debugging:
-                        gc.collect()
-                        log.info("(after) GC object counts: %d, %d", len(gc.get_objects()), len(gc.garbage))
-                    count += 1
-                    added = True
-                    break
-
-                if not added:
-                    # don't hog cpu
-                    time.sleep(5)
-    except KeyboardInterrupt:
-        # ToDo verify in finally
-        # pool.terminate()
-        raise
-    except (MemoryError, OSError) as e:
-        mem = get_memory() / 1024 / 1024
-        log.critical(
-            "Memory Exception: Remain: %.2f GB. Your system doesn't have enough FREE RAM to run processing! Error: %s",
-            mem,
-            e,
-        )
-        sys.exit(1)
-    except Exception:
-        import traceback
-
-        traceback.print_exc()
+            source = TaskSource(db, failed_processing=failed_processing)
+            eng = get_engine(
+                engine,
+                task_fn=functools.partial(run_task, memory_debugging=memory_debugging, debug=debug),
+                worker_init=init_worker,
+                source=source,
+                parallel=parallel,
+                timeout=processing_timeout,
+            )
+            eng.max_count = cfg.cuckoo.max_analysis_count
+            if engine == "pebble":
+                eng.max_tasks = maxtasksperchild
+            eng.run()
+        except KeyboardInterrupt:
+            raise
+        except (MemoryError, OSError) as e:
+            mem = get_memory() / 1024 / 1024
+            log.critical(
+                "Memory Exception: Remain: %.2f GB. Your system doesn't have enough FREE RAM to run processing! Error: %s",
+                mem,
+                e,
+            )
+            sys.exit(1)
     finally:
-        if pool:
-            pool.close()
-            pool.join()
+        setproctitle(original_proctitle)
+        if lock_file is not None:
+            if _AUTO_LOCK_FD is lock_file:
+                _AUTO_LOCK_FD = None
+            with suppress(OSError):
+                lock_file.close()
 
 
 def _load_report(task_id: int):
@@ -588,13 +694,82 @@ def parse_id(id_string: str):
     return blocks
 
 
-def main():
+def _parse_env_file(path: str) -> dict[str, str]:
+    """Parse a systemd-compatible KEY=VALUE environment file."""
+    values: dict[str, str] = {}
+    if not path_exists(path):
+        return values
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith(("export ", "export\t")):
+                    line = line[6:].lstrip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                else:
+                    for idx, ch in enumerate(val):
+                        if ch == "#" and idx > 0 and val[idx - 1].isspace():
+                            val = val[:idx].rstrip()
+                            break
+                values[key] = val
+    except OSError as err:
+        log.warning("Failed to read processor env file %s: %s", path, err)
+    return values
+
+
+def load_processor_env(cuckoo_root: str = CUCKOO_ROOT, environ: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve processor configuration from conf/cape-processor.env,
+    custom/conf/cape-processor.env, and process environment variables."""
+    env = dict(os.environ if environ is None else environ)
+    conf_env = _parse_env_file(os.path.join(cuckoo_root, "conf", "cape-processor.env"))
+    custom_env = _parse_env_file(os.path.join(cuckoo_root, "custom", "conf", "cape-processor.env"))
+    merged: dict[str, str] = {}
+    merged.update(conf_env)
+    if env.get("INVOCATION_ID") and "PYTEST_CURRENT_TEST" not in env:
+        # Under systemd, ensure custom/conf/cape-processor.env overrides unit
+        # Environment= defaults even if the installed unit file predates custom/conf.
+        merged.update(env)
+        merged.update(custom_env)
+    else:
+        # Outside systemd, explicit caller environment variables override .env files.
+        merged.update(custom_env)
+        merged.update(env)
+    return merged
+
+
+def _env_int(env: dict[str, str], key: str, default: int, minimum: int | None = None) -> int:
+    raw = env.get(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        log.warning("Invalid integer %s=%r; falling back to %d", key, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("Out-of-range %s=%d; clamping to %d", key, value, minimum)
+        return minimum
+    return value
+
+
+def build_arg_parser(cuckoo_root: str = CUCKOO_ROOT, environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
+    proc_env = load_processor_env(cuckoo_root=cuckoo_root, environ=environ)
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "id",
         type=parse_id,
         help="ID of the analysis to process (auto for continuous processing of unprocessed tasks). Can be 1 or 1-10 or 1,3,5,7",
-        default=os.getenv("CAPE_ID") or "auto",
+        default=proc_env.get("CAPE_ID") or "auto",
         nargs="?",
     )
     parser.add_argument("-c", "--caperesubmit", help="Allow CAPE resubmit processing.", action="store_true", required=False)
@@ -604,7 +779,7 @@ def main():
         help="Display debug messages",
         action="store_true",
         required=False,
-        default=str_to_bool(os.getenv("CAPE_DEBUG", "false")),
+        default=str_to_bool(proc_env.get("CAPE_DEBUG", "false")),
     )
     parser.add_argument("-r", "--report", help="Re-generate report", action="store_true", required=False)
     parser.add_argument(
@@ -613,7 +788,7 @@ def main():
         help="Number of parallel threads to use (auto mode only).",
         type=int,
         required=False,
-        default=int(os.getenv("CAPE_PARALLEL") or 1),
+        default=_env_int(proc_env, "CAPE_PARALLEL", 1, minimum=1),
     )
     parser.add_argument(
         "-fp",
@@ -621,7 +796,7 @@ def main():
         help="reprocess failed processing",
         action="store_true",
         required=False,
-        default=str_to_bool(os.getenv("CAPE_FAILED_PROCESSING", "false")),
+        default=str_to_bool(proc_env.get("CAPE_FAILED_PROCESSING", "false")),
     )
     parser.add_argument(
         "-mc",
@@ -630,7 +805,7 @@ def main():
         action="store",
         type=int,
         required=False,
-        default=int(os.getenv("CAPE_MAXTASKSPERCHILD") or 7),
+        default=_env_int(proc_env, "CAPE_MAXTASKSPERCHILD", 7, minimum=0),
     )
     parser.add_argument(
         "-md",
@@ -638,7 +813,7 @@ def main():
         help="Enable logging garbage collection related info",
         action="store_true",
         required=False,
-        default=str_to_bool(os.getenv("CAPE_MEMORY_DEBUGGING", "false")),
+        default=str_to_bool(proc_env.get("CAPE_MEMORY_DEBUGGING", "false")),
     )
     parser.add_argument(
         "-pt",
@@ -647,7 +822,7 @@ def main():
         action="store",
         type=int,
         required=False,
-        default=int(os.getenv("CAPE_PROCESSING_TIMEOUT") or 300),
+        default=_env_int(proc_env, "CAPE_PROCESSING_TIMEOUT", 300, minimum=1),
     )
     testing_args = parser.add_argument_group("Signature testing options")
     testing_args.add_argument(
@@ -679,12 +854,44 @@ def main():
         help="Disable memory limit.",
         action="store_true",
         required=False,
-        default=str_to_bool(os.getenv("CAPE_DISABLE_MEMORY_LIMIT", "false")),
+        default=str_to_bool(proc_env.get("CAPE_DISABLE_MEMORY_LIMIT", "false")),
     )
+    parser.add_argument(
+        "--engine",
+        choices=["pebble", "prefork"],
+        default=proc_env.get("CAPE_ENGINE") or "pebble",
+        help="Processing engine: pebble (default, A/B control) or prefork.",
+    )
+    if getattr(cfg, "multitenancy", {}).get("enabled", False):
+        raw_tenant_id = (proc_env.get("CAPE_TENANT_ID") or "").strip()
+        try:
+            default_tenant_id = int(raw_tenant_id) if raw_tenant_id else None
+        except ValueError:
+            log.warning("Invalid integer CAPE_TENANT_ID=%r; ignoring", raw_tenant_id)
+            default_tenant_id = None
+        parser.add_argument(
+            "--visibility",
+            choices=["public", "tenant", "private"],
+            default=proc_env.get("CAPE_VISIBILITY") or None,
+            help="Override task visibility (public, tenant, private) when processing/reporting.",
+        )
+        parser.add_argument(
+            "--tenant-id",
+            type=int,
+            default=default_tenant_id,
+            help="Override task tenant/group ID when processing/reporting.",
+        )
+    return parser
+
+
+def main():
+    parser = build_arg_parser(cuckoo_root=CUCKOO_ROOT)
     args = parser.parse_args()
 
     init_database()
     handlers = init_logging(debug=args.debug)
+    if args.id == "auto":
+        check_webgui_mongo(exit_on_connection_failure=False)
     init_modules()
     if args.id == "auto":
         autoprocess(
@@ -694,7 +901,8 @@ def main():
             memory_debugging=args.memory_debugging,
             processing_timeout=args.processing_timeout,
             debug=args.debug,
-            disable_memory_limit= args.disable_memory_limit,
+            disable_memory_limit=args.disable_memory_limit,
+            engine=args.engine,
         )
     else:
         for start, end in args.id:
@@ -752,6 +960,8 @@ def main():
                         capeproc=args.caperesubmit,
                         memory_debugging=args.memory_debugging,
                         debug=args.debug,
+                        visibility=getattr(args, "visibility", None),
+                        tenant_id=getattr(args, "tenant_id", None),
                     )
                 log.debug("Finished processing task")
                 set_formatter_fmt()

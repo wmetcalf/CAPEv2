@@ -9,7 +9,9 @@ import os
 import sys
 import tempfile
 import warnings
-from typing import Any, Dict, Tuple
+from contextlib import suppress
+from logging import handlers
+from typing import Any, Dict, Optional, Tuple
 
 # Mute Google Cloud's Python version support warning for Python 3.10
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.api_core")
@@ -19,21 +21,68 @@ sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), ".."))
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.gcp import download_from_gcs
-from lib.cuckoo.common.path_utils import path_exists
+from lib.cuckoo.common.path_utils import path_exists, path_mkdir
+from lib.cuckoo.common.utils import get_cape_external_dir, sanitize_filename
 from lib.cuckoo.core.database import Database, init_database
+from lib.cuckoo.core.log import (
+    ColoredFormatter,
+    init_json_file_handler,
+    log_task_context,
+    set_log_task_context,
+)
 from lib.cuckoo.core.startup import check_user_permissions
 from utils.submit import submit_file
 
 check_user_permissions(os.getenv("CAPE_AS_ROOT", False))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-log = logging.getLogger("gcp_pubsub_service")
+
+def init_logging(debug=False):
+    formatter = logging.Formatter("%(asctime)s [%(levelname)-7s] %(name)s: %(message)s")
+    log_obj = logging.getLogger("gcp_pubsub_service")
+    log_obj.propagate = False  # Avoid duplicates with root logger
+
+    for h in log_obj.handlers[:]:
+        if isinstance(h, logging.StreamHandler) and h.stream == sys.stderr:
+            log_obj.removeHandler(h)
+            h.close()
+
+    if not path_exists(os.path.join(CUCKOO_ROOT, "log")):
+        path_mkdir(os.path.join(CUCKOO_ROOT, "log"))
+
+    fh = handlers.TimedRotatingFileHandler(os.path.join(CUCKOO_ROOT, "log", "gcp_pubsub.log"), when="midnight", backupCount=10)
+    fh.setFormatter(formatter)
+    log_obj.addHandler(fh)
+    init_json_file_handler(
+        log_obj,
+        "gcp_pubsub.log",
+        service_name="cape-pubsub",
+        logconf=Config("logging"),
+        backup_count=10,
+    )
+
+    handler_stdout = logging.StreamHandler(sys.stdout)
+    handler_stdout.setFormatter(ColoredFormatter(fmt_with_thread=False, stream=sys.stdout))
+    log_obj.addHandler(handler_stdout)
+
+    if debug:
+        log_obj.setLevel(logging.DEBUG)
+    else:
+        log_obj.setLevel(logging.INFO)
+
+    return log_obj
+
+
+log = init_logging(os.getenv("DEBUG") == "True")
+
 
 class GCPServiceLogger(logging.LoggerAdapter):
     def process(self, msg: str, kwargs: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         correlation_id = self.extra.get("correlation_id")
         if correlation_id:
             msg = f"[{correlation_id}] {msg}"
+            extra = dict(kwargs.get("extra") or {})
+            extra.setdefault("correlation_id", correlation_id)
+            kwargs["extra"] = extra
         return msg, kwargs
 
 class GCPPubSubService:
@@ -100,13 +149,11 @@ class GCPPubSubService:
         self._init_clients()
 
         self.cuckoo_cfg = Config()
-        self.tmp_path = os.path.join(self.cuckoo_cfg.cuckoo.get("tmppath", "/tmp"), "cape-external")
-        if not path_exists(self.tmp_path):
-            try:
-                os.makedirs(self.tmp_path)
-            except Exception as e:
-                log.error("Failed to create temporary directory %s: %s", self.tmp_path, e)
-                sys.exit(1)
+        try:
+            self.tmp_path = get_cape_external_dir(tmppath=self.cuckoo_cfg.cuckoo.get("tmppath"))
+        except Exception as e:
+            log.error("Failed to create temporary directory: %s", e)
+            sys.exit(1)
 
     def _init_clients(self):
         """(Re)initialize Google Cloud clients."""
@@ -146,145 +193,265 @@ class GCPPubSubService:
         correlation_id = msg_id
         import time
         start_time = time.time()
-        try:
-            payload = json.loads(message.data.decode("utf-8"))
-            correlation_id = payload.get("uuid") or payload.get("transaction_id") or msg_id
-
-            # Create a localized logger with correlation_id
-            mlog = GCPServiceLogger(log, {"correlation_id": correlation_id})
-
-            sample_hash = payload.get("sample_hash")
-            gcs_uri = payload.get("gcs_uri")
-
-            if not sample_hash and gcs_uri:
-                # Extract hash from URI if missing
-                sample_hash = os.path.basename(gcs_uri)
-
-            if not sample_hash or not gcs_uri:
-                # If we only have hash, construct URI using samples_bucket
-                if sample_hash and self.samples_bucket:
-                    gcs_uri = f"gs://{self.samples_bucket}/{sample_hash}"
-                else:
-                    mlog.error("Missing sample_hash or gcs_uri in payload")
-                    message.nack()
-                    return
-            sandbox_options = payload.get("sandbox_options", "")
-            parent_id = payload.get("parent_id", "")
-            transaction_id = payload.get("transaction_id", "")
-            sample_name = payload.get("name", "sample")
-            source = payload.get("source", "")
-
-            mlog.info("Received message for sample: %s (name: %s, source: %s)", sample_hash, sample_name, source)
-
-            category = None
-            if "category=static" in sandbox_options:
-                category = "static"
-
-            sandbox_options = sandbox_options or ""
-            if sandbox_options:
-                sandbox_options += f",name={sample_name}"
-            else:
-                sandbox_options += f"name={sample_name}"
-
-            # Format custom fields with truncation to fit 255 chars
-            custom_parts = []
-            if parent_id:
-                custom_parts.append(f"parent_id:{parent_id}")
-            if transaction_id:
-                custom_parts.append(f"transaction_id:{transaction_id}")
-            if source:
-                custom_parts.append(f"source:{source}")
-            if sample_name:
-                custom_parts.append(f"name:{sample_name}")
-
-            custom = ",".join(custom_parts)
-            if len(custom) > 255:
-                custom = custom[:252] + "..."
-
-            # Check if sample exists locally
-            sample_hash = os.path.basename(sample_hash)
-            local_path = os.path.join(CUCKOO_ROOT, "storage", "binaries", sample_hash)
-
-            if not path_exists(local_path):
-                mlog.info("Sample %s not found locally, fetching from GCS: %s", sample_hash, gcs_uri)
-                fd, temp_path = tempfile.mkstemp(prefix=sample_name, dir=self.tmp_path)
-                os.close(fd)
-                dl_start = time.time()
-
-                # Retry download once with fresh client if TransportError/SSL issues occur
-                success = False
-                for attempt in range(2):
-                    try:
-                        if download_from_gcs(gcs_uri, temp_path, logger=mlog, client=self.storage_client):
-                            success = True
-                            break
-                    except Exception as e:
-                        if attempt == 0:
-                            mlog.warning("Transient error during download, recreating client and retrying: %s", e)
-                            self._init_clients()
-                        else:
-                            mlog.error("Persistent error during download: %s", e)
-
-                if success:
-                    mlog.info("Download finished in %.2f seconds", time.time() - dl_start)
-                    local_path = temp_path
-                else:
-                    mlog.error("Failed to download sample from GCS: %s", gcs_uri)
-                    message.nack()
-                    return
-
-            # Submit to CAPE
+        with log_task_context(correlation_id=correlation_id):
             try:
-                submit_start = time.time()
-                task_ids, extra_details = submit_file(
-                    db=self.db,
-                    file_path=local_path,
-                    options=sandbox_options,
-                    custom=custom,
-                    category=category,
-                    filename=sample_name,
+                payload = json.loads(message.data.decode("utf-8"))
+                correlation_id = (
+                    payload.get("correlation_id")
+                    or payload.get("uuid")
+                    or payload.get("transaction_id")
+                    or msg_id
                 )
-                if task_ids:
-                    mlog.info("Successfully submitted task(s) %s for sample %s in %.2f seconds", task_ids, sample_hash, time.time() - submit_start)
-                    message.ack()
-                elif extra_details.get("errors"):
-                    # Check if it was a duplicate, empty file, or junk
-                    error_str = str(extra_details["errors"])
-                    if "Duplicate" in error_str or "junk_filter" in error_str or "Empty file" in error_str:
-                        mlog.info("Sample %s skipped: %s", sample_hash, error_str)
-                        message.ack()
+                set_log_task_context(correlation_id=correlation_id)
+
+                # Create a localized logger with correlation_id
+                mlog = GCPServiceLogger(log, {"correlation_id": correlation_id})
+
+                sample_hash = payload.get("sample_hash")
+                gcs_uri = payload.get("gcs_uri")
+
+                if not sample_hash and gcs_uri:
+                    # Extract hash from URI if missing
+                    sample_hash = os.path.basename(gcs_uri)
+
+                if not sample_hash or not gcs_uri:
+                    # If we only have hash, construct URI using samples_bucket
+                    if sample_hash and self.samples_bucket:
+                        gcs_uri = f"gs://{self.samples_bucket}/{sample_hash}"
                     else:
-                        mlog.error("Failed to add task to database for sample %s: %s", sample_hash, extra_details["errors"])
+                        mlog.error("Missing sample_hash or gcs_uri in payload")
                         message.nack()
+                        return
+                sandbox_options = payload.get("sandbox_options", "")
+                parent_id = payload.get("parent_id", "")
+                transaction_id = payload.get("transaction_id", "")
+                sample_name = payload.get("name", "sample")
+                source = payload.get("source", "")
+
+                mlog.info("Received message for sample: %s (name: %s, source: %s)", sample_hash, sample_name, source)
+
+                category = None
+                if "category=static" in sandbox_options:
+                    category = "static"
+
+                sandbox_options = sandbox_options or ""
+                if sandbox_options:
+                    sandbox_options += f",name={sample_name}"
                 else:
-                    # No tasks but no errors means it was filtered (junk)
-                    mlog.info("Sample %s processed but no tasks created (filtered).", sample_hash)
-                    message.ack()
+                    sandbox_options += f"name={sample_name}"
+
+                # Format custom fields with truncation to fit 255 chars
+                custom_parts = []
+                if parent_id:
+                    custom_parts.append(f"parent_id:{parent_id}")
+                if transaction_id:
+                    custom_parts.append(f"transaction_id:{transaction_id}")
+                if source:
+                    custom_parts.append(f"source:{source}")
+                if sample_name:
+                    custom_parts.append(f"name:{sample_name}")
+
+                custom = ",".join(custom_parts)
+                if len(custom) > 255:
+                    custom = custom[:252] + "..."
+
+                # Check if sample exists locally
+                sample_hash = os.path.basename(sample_hash)
+                local_path = os.path.join(CUCKOO_ROOT, "storage", "binaries", sample_hash)
+                temp_path: Optional[str] = None
+
+                try:
+                    if not path_exists(local_path):
+                        mlog.info("Sample %s not found locally, fetching from GCS: %s", sample_hash, gcs_uri)
+                        safe_prefix = sanitize_filename(os.path.basename(str(sample_name or "sample")))[:64] or "sample"
+                        if safe_prefix in (".", ".."):
+                            safe_prefix = "sample"
+                        fd, temp_path = tempfile.mkstemp(prefix=f"{safe_prefix}_", dir=self.tmp_path)
+                        os.close(fd)
+                        dl_start = time.time()
+
+                        # Retry download once with fresh client if TransportError/SSL issues occur
+                        success = False
+                        for attempt in range(2):
+                            if download_from_gcs(gcs_uri, temp_path, logger=mlog, client=self.storage_client):
+                                success = True
+                                break
+                            else:
+                                if attempt == 0:
+                                    mlog.warning("Transient error during download, recreating client and retrying")
+                                    self._init_clients()
+                                else:
+                                    mlog.error("Persistent error during download after retries")
+
+                        if success:
+                            mlog.info("Download finished in %.2f seconds", time.time() - dl_start)
+                            local_path = temp_path
+                        else:
+                            mlog.error("Failed to download sample from GCS: %s", gcs_uri)
+                            message.nack()
+                            return
+
+                    # Build task_attributes for universal attributes support
+                    task_attributes: Dict[str, Any] = {}
+                    if correlation_id:
+                        task_attributes["correlation_id"] = correlation_id
+                    if parent_id:
+                        task_attributes["parent_id"] = parent_id
+                    if transaction_id:
+                        task_attributes["transaction_id"] = transaction_id
+                    if source:
+                        task_attributes["source"] = source
+                    if payload.get("main_task_id") is not None:
+                        try:
+                            task_attributes["main_task_id"] = int(payload["main_task_id"])
+                        except (TypeError, ValueError):
+                            pass
+                    if isinstance(payload.get("task_acl"), dict):
+                        task_attributes["task_acl"] = payload["task_acl"]
+                    extra_attrs = payload.get("attributes")
+                    if isinstance(extra_attrs, dict):
+                        for k, v in extra_attrs.items():
+                            task_attributes.setdefault(k, v)
+
+                    # Submit to CAPE
+                    try:
+                        submit_start = time.time()
+                        task_ids, extra_details = submit_file(
+                            db=self.db,
+                            file_path=local_path,
+                            options=sandbox_options,
+                            custom=custom,
+                            category=category,
+                            filename=sample_name,
+                            attributes=task_attributes or None,
+                        )
+                        if task_ids:
+                            mlog.info(
+                                "Successfully submitted task(s) %s for sample %s in %.2f seconds",
+                                task_ids,
+                                sample_hash,
+                                time.time() - submit_start,
+                            )
+                            message.ack()
+                        elif extra_details.get("errors"):
+                            # Check if it was a duplicate, empty file, or junk
+                            error_str = str(extra_details["errors"])
+                            if "Duplicate" in error_str or "junk_filter" in error_str or "Empty file" in error_str:
+                                mlog.info("Sample %s skipped: %s", sample_hash, error_str)
+                                message.ack()
+                            else:
+                                mlog.error("Failed to add task to database for sample %s: %s", sample_hash, extra_details["errors"])
+                                message.nack()
+                        else:
+                            # No tasks but no errors means it was filtered (junk)
+                            mlog.info("Sample %s processed but no tasks created (filtered).", sample_hash)
+                            message.ack()
+                    except Exception as e:
+                        import traceback
+
+                        mlog.error("Failed to add task to database: %s\n%s", e, traceback.format_exc())
+                        message.nack()
+                    finally:
+                        # submit_file() copies the payload into cuckoo-tmp/upload_*/,
+                        # while CAPE's AnalysisManager copies into storage/binaries when analysis starts.
+                        self.db.session.remove()
+                        # Force GC to close any dangling FDs from sflock or File objects
+                        import gc
+
+                        gc.collect()
+                finally:
+                    # Only unlink temp files created during GCS download; preserve storage/binaries/<hash>.
+                    if temp_path and os.path.exists(temp_path):
+                        with suppress(OSError):
+                            os.unlink(temp_path)
+
             except Exception as e:
-                import traceback
-                mlog.error("Failed to add task to database: %s\n%s", e, traceback.format_exc())
+                log.error("[%s] Error processing message: %s", correlation_id, e)
                 message.nack()
-            finally:
-                # We do NOT delete local_path or cuckoo-sflock here.
-                # CAPE's AnalysisManager will copy them to storage/binaries when analysis starts.
-                # Background cleaner handles /tmp disk space.
-
                 self.db.session.remove()
-                # Force GC to close any dangling FDs from sflock or File objects
-                import gc
-                gc.collect()
+            finally:
+                with self.ids_lock:
+                    self.processing_ids.discard(msg_id)
+                log.info("[%s] Total processing time: %.2f seconds", correlation_id, time.time() - start_time)
 
+    def _diagnostic_loop(self):
+        """Periodically log status and queue depth (if monitoring is available)."""
+        import time
+        from lib.cuckoo.common.gcp import gcp_cfg
+
+        monitoring_client = None
+        try:
+            from google.cloud import monitoring_v3
+            auth_by = gcp_cfg.gcp.get("auth_by", "vm")
+            service_account_path = gcp_cfg.gcp.get("service_account_path")
+
+            if auth_by == "json" and service_account_path:
+                if not os.path.isabs(service_account_path):
+                    from lib.cuckoo.common.constants import CUCKOO_ROOT
+                    service_account_path = os.path.join(CUCKOO_ROOT, service_account_path)
+                if os.path.exists(service_account_path):
+                    monitoring_client = monitoring_v3.MetricServiceClient.from_service_account_json(service_account_path)
+            else:
+                monitoring_client = monitoring_v3.MetricServiceClient()
+        except ImportError:
+            log.debug("google-cloud-monitoring not installed. Install via `pip install google-cloud-monitoring` for precise queue counts.")
         except Exception as e:
-            log.error("[%s] Error processing message: %s", correlation_id, e)
-            message.nack()
-            self.db.session.remove()
-        finally:
+            log.debug("Failed to initialize monitoring client: %s", e)
+
+        # Wait briefly before first check
+        time.sleep(5)
+
+        while True:
+            queue_size_str = "unknown (install google-cloud-monitoring)"
+            if monitoring_client:
+                try:
+                    from google.cloud.monitoring_v3 import types
+                    project_name = f"projects/{self.project_id}"
+                    now = time.time()
+                    interval = types.TimeInterval(
+                        {
+                            "end_time": {"seconds": int(now)},
+                            "start_time": {"seconds": int(now - 600)},
+                        }
+                    )
+
+                    results = monitoring_client.list_time_series(
+                        request={
+                            "name": project_name,
+                            "filter": f'metric.type = "pubsub.googleapis.com/subscription/num_undelivered_messages" AND resource.labels.subscription_id = "{self.subscription_id}"',
+                            "interval": interval,
+                        }
+                    )
+
+                    latest_val = None
+                    for result in results:
+                        for point in result.points:
+                            latest_val = point.value.int64_value
+                            break
+                        if latest_val is not None:
+                            break
+
+                    if latest_val is not None:
+                        queue_size_str = str(latest_val)
+                    else:
+                        queue_size_str = "0"
+                except Exception as e:
+                    log.debug("Error fetching queue size metric: %s", e)
+                    queue_size_str = "error (permission or API issue)"
+
             with self.ids_lock:
-                self.processing_ids.discard(msg_id)
-            log.info("[%s] Total processing time: %.2f seconds", correlation_id, time.time() - start_time)
+                active = len(self.processing_ids)
+
+            log.info("[HEARTBEAT] Subscriber is healthy. Actively processing: %d Tasks. Undelivered queue size: %s.", active, queue_size_str)
+            time.sleep(300)
 
     def start(self):
         log.info("Starting GCP Pub/Sub subscriber on %s", self.subscription_path)
+
+        # Start a background diagnostic thread so the app doesn't seem 'hung' when idle
+        import threading
+        diag_thread = threading.Thread(target=self._diagnostic_loop, daemon=True)
+        diag_thread.start()
 
         from lib.cuckoo.common.gcp import gcp_cfg
         max_messages = 5

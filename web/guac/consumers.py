@@ -7,6 +7,7 @@ from xml.etree import ElementTree as ET
 
 from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
+from django.conf import settings
 from guacamole.client import GuacamoleClient
 
 from lib.cuckoo.common.config import Config
@@ -32,15 +33,13 @@ ACTIVE_GUAC_TASK_STATUSES = ("pending", "running")
 
 
 def _get_vnc_port(vm_label, dsn=machinery_dsn):
-    """Look up VNC port for a VM from libvirt. Must be called from sync context.
-    `dsn` is the local hypervisor for single-node, or a worker's libvirt-over-SSH
-    in central mode (the VM lives on the worker hosting the job)."""
+    """Look up VNC port for a VM from libvirt. Must be called from sync context."""
     if not LIBVIRT_AVAILABLE:
         return None
 
     conn = None
     try:
-        conn = libvirt.open(dsn)
+        conn = libvirt.open(dsn or machinery_dsn)
         if not conn:
             return None
         dom = conn.lookupByName(vm_label)
@@ -88,6 +87,56 @@ def _check_vm_running(vm_label):
             except Exception:
                 pass
     return False
+
+
+def _view_task_with_guest(db, task_id):
+    try:
+        return db.view_task(task_id, details=True)
+    except TypeError:
+        return db.view_task(task_id)
+
+
+def _is_task_active_for_vm(task, vm_label: str) -> bool:
+    if not task or task.status not in ACTIVE_GUAC_TASK_STATUSES:
+        return False
+    guest = getattr(task, "guest", None)
+    if guest is not None:
+        guest_vm = getattr(guest, "label", None) or getattr(guest, "name", None)
+        if guest_vm and guest_vm != vm_label:
+            return False
+    return True
+
+
+def _can_manage_guac_task(viewer, task_id: int, task) -> bool:
+    if viewer.see_all:
+        return True
+    from lib.tenancy.middleware import default_task_scope_resolver
+    from lib.tenancy.policy import PRIVATE, ResourceScope, can_toggle
+
+    try:
+        scope = default_task_scope_resolver(int(task_id))
+    except Exception:
+        scope = None
+    if scope is None and task is not None:
+        scope = ResourceScope(
+            owner_id=getattr(task, "user_id", None),
+            tenant_id=getattr(task, "tenant_id", None),
+            visibility=getattr(task, "visibility", None) or PRIVATE,
+        )
+    if scope is None:
+        return False
+    return can_toggle(viewer, scope)
+
+
+def _unlock_if_locked(vm_label: str) -> None:
+    db = Database()
+    try:
+        with db.transaction():
+            machine = db.view_machine_by_label(vm_label)
+            if machine and machine.locked:
+                db.unlock_machine(machine)
+    finally:
+        db.session.remove()
 
 
 class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
@@ -138,6 +187,13 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         """Validate session token, look up VNC server-side, connect to guacd."""
         try:
+            if getattr(settings, "WEB_AUTHENTICATION", False):
+                user = self.scope.get("user")
+                if not getattr(user, "is_authenticated", False):
+                    logger.warning("WebSocket rejected: unauthenticated user")
+                    await self.close()
+                    return
+
             # 1. Read and validate the session cookie
             cookies = self.scope.get("cookies", {})
             token_str = cookies.get("guac_session")
@@ -169,43 +225,38 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
             vm_label = self.vm_label
 
             vnc_port = None
-            worker_ip = None  # central mode: set to the worker's IP when the task's VM is remote
+            worker_ip = None
+            ws_user = self.scope.get("user")
+            from lib.tenancy.middleware import default_viewer_resolver
+
+            viewer = await sync_to_async(default_viewer_resolver)(ws_user)
             if self.guac_task_id > 0:
-                # 3. Verify task can still host an interactive session
-                task = await sync_to_async(db.view_task)(self.guac_task_id)
-                if not task or task.status not in ACTIVE_GUAC_TASK_STATUSES:
+                # 3. Verify task can still host an interactive session on this VM
+                task = await sync_to_async(_view_task_with_guest)(db, self.guac_task_id)
+                if not _is_task_active_for_vm(task, vm_label):
                     logger.warning(
-                        "WebSocket rejected: task %s is not active for guac", self.guac_task_id
+                        "WebSocket rejected: task %s is not active on VM %s", self.guac_task_id, vm_label
                     )
                     await self._delete_guac_session()
                     await self.close()
                     return
 
-                # 3b. Defense-in-depth: if the socket carries an authenticated user,
-                # confirm they may view this task. The token is mint-gated (guac
-                # index / submission status now require can_view_task), but a leaked
-                # or shared cookie must not tunnel into another tenant's live VM.
-                ws_user = self.scope.get("user")
-                if ws_user is not None and getattr(ws_user, "is_authenticated", False):
-                    from users.tenancy import can_view_task
+                if not await sync_to_async(_can_manage_guac_task)(viewer, self.guac_task_id, task):
+                    logger.warning(
+                        "WebSocket rejected: user not entitled to task %s", self.guac_task_id
+                    )
+                    await self._delete_guac_session()
+                    await self.close()
+                    return
 
-                    if not await sync_to_async(can_view_task)(ws_user, task):
-                        logger.warning(
-                            "WebSocket rejected: user not entitled to task %s", self.guac_task_id
-                        )
-                        await self._delete_guac_session()
-                        await self.close()
-                        return
-
-                # 4. Central mode: a broker-dispatched job's VM lives on a worker, so
-                # resolve that worker's libvirt DSN + IP and look up the VNC port from ITS
-                # libvirt; the tunnel then targets the worker's guacd. None => single-node.
-                from lib.cuckoo.common.central_guac import libvirt_dsn_for_task
+                # 4. Look up VNC port server-side from libvirt
+                from lib.tenancy.storage.guac import libvirt_dsn_for_task, worker_vnc_port_for_task
 
                 vnc_dsn, worker_ip = await sync_to_async(libvirt_dsn_for_task)(self.guac_task_id, machinery_dsn)
-
-                # 4b. Look up VNC port server-side from libvirt (local or worker)
-                vnc_port = await sync_to_async(_get_vnc_port)(vm_label, vnc_dsn)
+                if worker_ip:
+                    vnc_port = await sync_to_async(worker_vnc_port_for_task)(self.guac_task_id)
+                else:
+                    vnc_port = await sync_to_async(_get_vnc_port)(vm_label, vnc_dsn)
                 if not vnc_port:
                     logger.warning(
                         "WebSocket rejected: no VNC port for VM %s", vm_label
@@ -214,6 +265,12 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                     return
             else:
                 # Direct VNC connection
+                if not viewer.see_all:
+                    logger.warning("WebSocket rejected: direct VNC requires an administrator")
+                    await self._delete_guac_session()
+                    await self.close()
+                    return
+
                 guest_ip = session_data.get("guest_ip")
                 if not guest_ip:
                     # Autodiscover port given just the VM name
@@ -234,8 +291,7 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                         await self.close()
                         return
 
-            # 5. Parse config. Central mode: target the WORKER's guacd (which
-            # reaches the VM's VNC on its own localhost); single-node uses configured guacd.
+            # 5. Parse config
             guacd_hostname = worker_ip or web_cfg.guacamole.guacd_host or "localhost"
             guacd_port = int(web_cfg.guacamole.guacd_port) or 4822
             guacd_recording_path = web_cfg.guacamole.guacd_recording_path or ""
@@ -267,9 +323,6 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                         "disable-theming": "true",
                     }
                 else:
-                    # Central: the task's VM is on a worker, whose guacd (guacd_hostname=
-                    # worker_ip) reaches the VM's VNC on its OWN localhost; single-node uses
-                    # the configured vnc_host.
                     guest_host = "localhost" if worker_ip else (web_cfg.guacamole.vnc_host or "localhost")
                     guest_port = vnc_port
                     ignore_cert = "false"
@@ -282,7 +335,7 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                         "cursor": vnc_cursor,
                     }
             else:
-                # Direct VNC connection (no task -> no worker; target the guest IP directly)
+                # Direct VNC connection
                 guest_protocol = "vnc"
                 guest_ip = session_data.get("guest_ip")
                 guest_host = guest_ip or web_cfg.guacamole.vnc_host or "localhost"
@@ -374,11 +427,12 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
                 if not self.guac_task_id:
                     break
                 db = Database()
-                task = await sync_to_async(db.view_task)(self.guac_task_id)
-                if not task or task.status not in ACTIVE_GUAC_TASK_STATUSES:
+                task = await sync_to_async(_view_task_with_guest)(db, self.guac_task_id)
+                if not _is_task_active_for_vm(task, self.vm_label):
                     logger.info(
-                        "Task %s no longer running, disconnecting guac session",
+                        "Task %s no longer active on VM %s, disconnecting guac session",
                         self.guac_task_id,
+                        self.vm_label,
                     )
                     await self._delete_guac_session()
                     await self._close_websocket()
@@ -400,18 +454,7 @@ class GuacamoleWebSocketConsumer(AsyncWebsocketConsumer):
 
                 if not is_running:
                     logger.info("VM %s is no longer running, unlocking and disconnecting", self.vm_label)
-                    # Consolidate fetch+unlock+commit into ONE sync call: separate
-                    # sync_to_async calls run on arbitrary pool threads, so the machine
-                    # would be fetched in one thread-local SQLAlchemy session and mutated
-                    # in another -> detached-instance error / lost commit (gemini review, PR #12).
-                    def _unlock_vm(label):
-                        db = Database()
-                        machine = db.view_machine_by_label(label)
-                        if machine and machine.locked:
-                            db.unlock_machine(machine)
-                            db.session.commit()
-
-                    await sync_to_async(_unlock_vm)(self.vm_label)
+                    await sync_to_async(_unlock_if_locked)(self.vm_label)
                     await self._close_websocket()
                     break
         except asyncio.CancelledError:

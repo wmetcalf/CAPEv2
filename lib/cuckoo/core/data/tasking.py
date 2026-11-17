@@ -1,9 +1,11 @@
 from .db_common import _utcnow_naive
+import json
 import logging
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta, timezone
 
 from lib.cuckoo.common.config import Config
+from lib.cuckoo.common.hooks import apply_sql_task_filter
 from lib.cuckoo.common.integrations.parse_pe import PortableExecutable
 from lib.cuckoo.common.objects import PCAP, URL, File, Static
 from lib.cuckoo.common.exceptions import CuckooDependencyError
@@ -26,22 +28,16 @@ from sflock.ident import identify as sflock_identify
 try:
     from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy import (
-        and_,
         delete,
         func,
         not_,
-        or_,
         select,
         update,
     )
-    from sqlalchemy.orm import joinedload, subqueryload
+    from sqlalchemy.orm import joinedload, selectinload
 except ImportError:  # pragma: no cover
     raise CuckooDependencyError("Unable to import sqlalchemy (install with `poetry install`)")
 
-try:
-    from dev_utils.mongodb import mongo_update_one
-except Exception:  # mongo optional
-    mongo_update_one = None
 
 log = logging.getLogger(__name__)
 conf = Config("cuckoo")
@@ -54,6 +50,8 @@ DYNAMIC_ARCH_DETERMINATION = web_conf.general.dynamic_arch_determination
 sandbox_packages = (
     "access",
     "archive",
+    "autoit",
+    "batch",
     "nsis",
     "cpl",
     "reg",
@@ -128,8 +126,7 @@ class TasksMixIn:
         cape=False,
         tags_tasks=False,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
+        attributes=None,
     ):
         """Add a task to database.
         @param obj: object to add (File or URL).
@@ -156,119 +153,128 @@ class TasksMixIn:
         """
         # Convert empty strings and None values to a valid int
 
-        if isinstance(obj, (File, PCAP, Static)):
-            fileobj = File(obj.file_path)
-            file_type = fileobj.get_type()
-            file_md5 = fileobj.get_md5()
-            file_sha256 = fileobj.get_sha256()
-            # check if hash is known already
-            # ToDo consider migrate to _get_or_create?
-            sample = self.session.scalar(select(Sample).where(Sample.sha256 == file_sha256))
-            if not sample:
-                try:
-                    with self.session.begin_nested():
-                        sample = Sample(
-                            md5=file_md5,
-                            crc32=fileobj.get_crc32(),
-                            sha1=fileobj.get_sha1(),
-                            sha256=file_sha256,
-                            sha512=fileobj.get_sha512(),
-                            file_size=fileobj.get_size(),
-                            file_type=file_type,
-                            ssdeep=fileobj.get_ssdeep(),
-                            source_url=source_url,
-                        )
-                        self.session.add(sample)
-                except Exception as e:
-                    # The sample might have been inserted by another concurrent process
-                    sample = self.session.scalar(select(Sample).where(Sample.sha256 == file_sha256))
-                    if not sample:
-                        log.exception(e)
+        with self.session.begin():
+            if isinstance(obj, (File, PCAP, Static)):
+                fileobj = File(obj.file_path)
+                file_type = fileobj.get_type()
+                file_md5 = fileobj.get_md5()
+                file_sha256 = fileobj.get_sha256()
+                # check if hash is known already
+                # ToDo consider migrate to _get_or_create?
+                sample = self.session.scalar(select(Sample).where(Sample.sha256 == file_sha256))
+                if not sample:
+                    try:
+                        with self.session.begin_nested():
+                            sample = Sample(
+                                md5=file_md5,
+                                crc32=fileobj.get_crc32(),
+                                sha1=fileobj.get_sha1(),
+                                sha256=file_sha256,
+                                sha512=fileobj.get_sha512(),
+                                file_size=fileobj.get_size(),
+                                file_type=file_type,
+                                ssdeep=fileobj.get_ssdeep(),
+                                source_url=source_url,
+                            )
+                            self.session.add(sample)
+                            self.session.flush()
+                    except Exception as e:
+                        # The sample might have been inserted by another concurrent process
+                        sample = self.session.scalar(select(Sample).where(Sample.sha256 == file_sha256))
+                        if not sample:
+                            log.exception(e)
 
-            if DYNAMIC_ARCH_DETERMINATION:
-                # Assign architecture to task to fetch correct VM type
+                if DYNAMIC_ARCH_DETERMINATION:
+                    # Assign architecture to task to fetch correct VM type
 
-                # This isn't 100% fool proof
+                    # This isn't 100% fool proof
+                    _tags = tags.split(",") if isinstance(tags, str) else []
+                    arch_tag = fileobj.predict_arch()
+                    if package.endswith("_x64"):
+                        _tags.append("x64")
+                    elif arch_tag:
+                        _tags.append(arch_tag)
+                    tags = ",".join(set(_tags))
+                task = Task(obj.file_path)
+                task.sample_id = sample.id
+
+                if isinstance(obj, (PCAP, Static)):
+                    # since no VM will operate on this PCAP
+                    task.started_on = _utcnow_naive()
+
+            elif isinstance(obj, URL):
+                task = Task(obj.url)
                 _tags = tags.split(",") if isinstance(tags, str) else []
-                arch_tag = fileobj.predict_arch()
-                if package.endswith("_x64"):
-                    _tags.append("x64")
-                elif arch_tag:
-                    _tags.append(arch_tag)
+                _tags.append("x64")
+                _tags.append("x86")
                 tags = ",".join(set(_tags))
-            task = Task(obj.file_path)
-            task.sample_id = sample.id
 
-            if isinstance(obj, (PCAP, Static)):
-                # since no VM will operate on this PCAP
-                task.started_on = _utcnow_naive()
+            else:
+                return None
 
-        elif isinstance(obj, URL):
-            task = Task(obj.url)
-            _tags = tags.split(",") if isinstance(tags, str) else []
-            _tags.append("x64")
-            _tags.append("x86")
-            tags = ",".join(set(_tags))
+            if tlp:
+                tlp = tlp.lower()
 
-        else:
-            return None
+            task.category = obj.__class__.__name__.lower()
+            task.timeout = timeout
+            task.package = package
+            task.options = options
+            task.priority = priority
+            task.custom = custom
+            task.machine = machine
+            task.platform = platform
+            task.memory = bool(memory)
+            task.enforce_timeout = enforce_timeout
+            task.tlp = tlp
+            task.route = route
+            task.cape = cape
+            task.tags_tasks = tags_tasks
 
-        if tlp:
-            tlp = tlp.lower()
+            if isinstance(attributes, str) and attributes:
+                try:
+                    attributes = json.loads(attributes)
+                except Exception:
+                    log.warning("Invalid JSON in task attributes: %s", attributes)
+                    attributes = None
+            if isinstance(attributes, dict):
+                for k, v in attributes.items():
+                    task.set_attribute(k, v)
 
-        task.category = obj.__class__.__name__.lower()
-        task.timeout = timeout
-        task.package = package
-        task.options = options
-        task.priority = priority
-        task.custom = custom
-        task.machine = machine
-        task.platform = platform
-        task.memory = bool(memory)
-        task.enforce_timeout = enforce_timeout
-        task.tlp = tlp
-        task.route = route
-        task.cape = cape
-        task.tags_tasks = tags_tasks
-
-        # Use a nested transaction so that we can return an ID.
-        with self.session.begin_nested():
+            # Obtain an ID without committing the caller's transaction.
             self.session.add(task)
             self.session.flush()
 
-        # Deal with tags format (i.e., foo,bar,baz)
-        if tags:
-            for tag in tags.split(","):
-                tag_name = tag.strip()
-                if tag_name and tag_name not in [tag.name for tag in task.tags]:
-                    task.tags.append(self._get_or_create(Tag, name=tag_name))
+            # Deal with tags format (i.e., foo,bar,baz)
+            if tags:
+                for tag in tags.split(","):
+                    tag_name = tag.strip()
+                    if tag_name and tag_name not in [tag.name for tag in task.tags]:
+                        task.tags.append(self._get_or_create(Tag, name=tag_name))
 
-        if clock:
-            if isinstance(clock, str):
-                try:
-                    task.clock = datetime.strptime(clock, "%m-%d-%Y %H:%M:%S")
-                except ValueError:
-                    log.warning("The date you specified has an invalid format, using current timestamp")
-                    task.clock = datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None)
+            if clock:
+                if isinstance(clock, str):
+                    try:
+                        task.clock = datetime.strptime(clock, "%m-%d-%Y %H:%M:%S")
+                    except ValueError:
+                        log.warning("The date you specified has an invalid format, using current timestamp")
+                        task.clock = datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None)
 
+                else:
+                    task.clock = clock
             else:
-                task.clock = clock
-        else:
-            task.clock = datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None)
+                task.clock = datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None)
 
-        task.user_id = user_id
-        task.tenant_id = tenant_id
-        task.visibility = visibility or "private"
+            task.user_id = user_id
 
-        if parent_sample:
-            association = SampleAssociation(
-                parent=parent_sample,
-                child=sample,
-                task=task,
-            )
-            self.session.add(association)
+            if parent_sample:
+                association = SampleAssociation(
+                    parent=parent_sample,
+                    child=sample,
+                    task=task,
+                )
+                self.session.add(association)
 
-        return task.id
+            return task.id
 
     def add_path(
         self,
@@ -291,9 +297,8 @@ class TasksMixIn:
         cape=False,
         tags_tasks=False,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
         parent_sample = None,
+        attributes=None,
     ):
         """Add a task to database from file path.
         @param file_path: sample path.
@@ -348,33 +353,62 @@ class TasksMixIn:
             route=route,
             cape=cape,
             tags_tasks=tags_tasks,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id,
             parent_sample=parent_sample,
+            attributes=attributes,
         )
 
-    def _identify_aux_func(self, file: bytes, package: str, check_shellcode: bool = True) -> tuple:
-        # before demux we need to check as msix has zip mime and we don't want it to be extracted:
-        tmp_package = False
-        if not package:
-            f = SflockFile.from_path(file)
-            try:
-                tmp_package = sflock_identify(f, check_shellcode=check_shellcode)
-            except Exception as e:
-                log.error("Failed to sflock_ident due to %s", str(e))
-                tmp_package = "generic"
+    def identify_submission_package(
+        self,
+        file: bytes,
+        package: str = "",
+        check_shellcode: bool = True,
+    ) -> tuple:
+        """Resolve package handling and whether generic demux should run."""
+        requested_package = package
+        identified_package = False
 
-        if tmp_package and tmp_package in sandbox_packages:
-            # This probably should be way much bigger list of formats
-            if tmp_package in ("iso", "udf", "vhd"):
+        if not requested_package:
+            sf_file = SflockFile.from_path(file)
+            try:
+                identified_package = sflock_identify(
+                    sf_file,
+                    check_shellcode=check_shellcode,
+                )
+            except Exception as e:
+                log.error("Failed to identify submission with SFlock: %s", e)
+                identified_package = "generic"
+
+        if identified_package and identified_package in sandbox_packages:
+            if identified_package in ("iso", "udf", "vhd"):
                 package = "archive"
-            elif tmp_package in ("zip", "rar"):
+            elif identified_package in ("zip", "rar"):
                 package = ""
-            elif tmp_package in ("html",):
+            elif identified_package == "html":
                 package = web_conf.url_analysis.package
             else:
-                package = tmp_package
+                package = identified_package
 
-        return package, tmp_package
+        generic_demux = (
+            not requested_package
+            and not package
+            and identified_package not in (False, None, "", "generic")
+        )
+
+        return package, identified_package, generic_demux
+
+    def _identify_aux_func(
+        self,
+        file: bytes,
+        package: str,
+        check_shellcode: bool = True,
+    ) -> tuple:
+        package, identified_package, _ = self.identify_submission_package(
+            file,
+            package,
+            check_shellcode=check_shellcode,
+        )
+        return package, identified_package
 
     def demux_sample_and_add_to_db(
         self,
@@ -398,9 +432,8 @@ class TasksMixIn:
         route=None,
         cape=False,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
         category=None,
+        attributes=None,
     ):
         """
         Handles ZIP file submissions, submitting each extracted file to the database
@@ -461,9 +494,10 @@ class TasksMixIn:
                 file_path=file_path,
                 priority=priority,
                 tlp=tlp,
-                user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                user_id=user_id,
                 options=options,
                 package=package,
+                attributes=attributes,
             )
             return task_ids, details
 
@@ -497,32 +531,29 @@ class TasksMixIn:
             # ToDo we lose package here and send APKs to windows
             if platform in ("linux", "darwin") and LINUX_STATIC:
                 task_ids += self.add_static(
-                    file_path=file_path,
+                    file_path=file,
                     priority=priority,
                     tlp=tlp,
-                    user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                    user_id=user_id,
                     options=options,
                     package=package,
+                    platform=platform,
                     parent_sample=parent_sample,
+                    attributes=attributes,
                 )
                 continue
             if static:
                 # On huge loads this just become a bottleneck
                 config = False
                 if web_conf.general.check_config_exists:
-                    # Scope the dedup lookup to the submitter's entitled analyses
-                    # so it can't return another tenant's task id / config-exists
-                    # inference for a known hash. No-op for MT-disabled / shared.
-                    from lib.cuckoo.common.tenancy import Viewer as _Viewer
-
-                    config = static_config_lookup(file, viewer=_Viewer(user_id=user_id or None, tenant_id=tenant_id))
+                    config = static_config_lookup(file)
                     if config:
                         task_ids.append(config["id"])
                     else:
                         config = static_extraction(file)
                 if config or only_extraction:
                     task_ids += self.add_static(
-                        file_path=file, priority=priority, tlp=tlp, user_id=user_id, tenant_id=tenant_id, visibility=visibility, options=options, parent_sample=parent_sample,
+                        file_path=file, priority=priority, tlp=tlp, user_id=user_id, options=options, platform=platform, parent_sample=parent_sample, attributes=attributes,
                     )
 
             if not config and not only_extraction:
@@ -553,30 +584,40 @@ class TasksMixIn:
                     else:
                         options = "dist_extract=1"
 
-                task_id = self.add_path(
-                    file_path=file.decode(),
-                    timeout=timeout,
-                    priority=priority,
-                    options=options,
-                    package=package,
-                    machine=machine,
-                    platform=platform,
-                    memory=memory,
-                    custom=custom,
-                    enforce_timeout=enforce_timeout,
-                    tags=tags,
-                    clock=clock,
-                    tlp=tlp,
-                    source_url=source_url,
-                    route=route,
-                    tags_tasks=tags_tasks,
-                    cape=cape,
-                    user_id=user_id, tenant_id=tenant_id, visibility=visibility,
-                    parent_sample=parent_sample,
-                )
+                if machine == "all":
+                    task_machines = [
+                        vm.label
+                        for vm in self.list_machines(platform=platform)
+                    ]
+                else:
+                    task_machines = [machine]
+
+                for task_machine in task_machines:
+                    task_id = self.add_path(
+                        file_path=file.decode(),
+                        timeout=timeout,
+                        priority=priority,
+                        options=options,
+                        package=package,
+                        machine=task_machine,
+                        platform=platform,
+                        memory=memory,
+                        custom=custom,
+                        enforce_timeout=enforce_timeout,
+                        tags=tags,
+                        clock=clock,
+                        tlp=tlp,
+                        source_url=source_url,
+                        route=route,
+                        tags_tasks=tags_tasks,
+                        cape=cape,
+                        user_id=user_id,
+                        parent_sample=parent_sample,
+                        attributes=attributes,
+                    )
+                    if task_id:
+                        task_ids.append(task_id)
                 package = None
-            if task_id:
-                task_ids.append(task_id)
 
         if config and isinstance(config, dict):
             details = {"config": config.get("cape_config", {})}
@@ -601,8 +642,7 @@ class TasksMixIn:
         clock=None,
         tlp=None,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
+        attributes=None,
     ):
         return self.add(
             PCAP(file_path.decode()),
@@ -618,7 +658,8 @@ class TasksMixIn:
             enforce_timeout=enforce_timeout,
             clock=clock,
             tlp=tlp,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id,
+            attributes=attributes,
         )
 
     def add_static(
@@ -638,18 +679,17 @@ class TasksMixIn:
         tlp=None,
         static=True,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
         parent_sample=None,
+        attributes=None,
     ):
-        extracted_files, demux_error_msgs = demux_sample(file_path, package, options)
+        extracted_files, demux_error_msgs = demux_sample(file_path, package, options, platform=platform)
 
         # check if len is 1 and the same file, if diff register file, and set parent
         if not isinstance(file_path, bytes):
             file_path = file_path.encode()
 
         # ToDo callback maybe or inside of the self.add
-        if extracted_files and ((file_path, platform) not in extracted_files and (file_path, "") not in extracted_files):
+        if extracted_files and not any(file_path == path for path, _ in extracted_files):
             if not parent_sample:
                 parent_sample = self.register_sample(File(file_path))
             if conf.cuckoo.delete_archive:
@@ -677,7 +717,8 @@ class TasksMixIn:
                 tlp=tlp,
                 static=static,
                 parent_sample=parent_sample,
-                user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+                user_id=user_id,
+                attributes=attributes,
             )
             if task_id:
                 task_ids.append(task_id)
@@ -703,8 +744,7 @@ class TasksMixIn:
         cape=False,
         tags_tasks=False,
         user_id=0,
-        tenant_id=None,
-        visibility="private",
+        attributes=None,
     ):
         """Add a task to database from url.
         @param url: url.
@@ -751,22 +791,28 @@ class TasksMixIn:
             route=route,
             cape=cape,
             tags_tasks=tags_tasks,
-            user_id=user_id, tenant_id=tenant_id, visibility=visibility,
+            user_id=user_id,
+            attributes=attributes,
         )
 
     def set_vnc_port(self, task_id: int, port: int):
-        stmt = select(Task).where(Task.id == task_id)
-        task = self.session.scalar(stmt)
+        with self.session.begin():
+            try:
+                task_id = int(task_id)
+            except (TypeError, ValueError):
+                return
+            stmt = select(Task).where(Task.id == task_id)
+            task = self.session.scalar(stmt)
 
-        if task is None:
-            log.debug("Database error setting VPN port: For task %s", task_id)
-            return
+            if task is None:
+                log.debug("Database error setting VPN port: For task %s", task_id)
+                return
 
-        # This logic remains the same
-        if task.options:
-            task.options += f",vnc_port={port}"
-        else:
-            task.options = f"vnc_port={port}"
+            # This logic remains the same
+            if task.options:
+                task.options += f",vnc_port={port}"
+            else:
+                task.options = f"vnc_port={port}"
 
     def _task_arch_tags_helper(self, task: Task):
         # Are there available machines that match up with a task?
@@ -776,33 +822,35 @@ class TasksMixIn:
         return task_archs, task_tags
 
     def update_clock(self, task_id):
-        row = self.session.get(Task, task_id)
+        with self.session.begin():
+            row = self.session.get(Task, task_id)
 
-        if not row:
-            return
-        # datetime.fromtimestamp(0, tz=timezone.utc)
-        if row.clock == datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None):
-            if row.category == "file":
-                # datetime.now(timezone.utc)
-                row.clock = _utcnow_naive() + timedelta(days=self.cfg.cuckoo.daydelta)
-            else:
-                # datetime.now(timezone.utc)
-                row.clock = _utcnow_naive()
-        return row.clock
+            if not row:
+                return
+            # datetime.fromtimestamp(0, tz=timezone.utc)
+            if row.clock == datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None):
+                if row.category == "file":
+                    # datetime.now(timezone.utc)
+                    row.clock = _utcnow_naive() + timedelta(days=self.cfg.cuckoo.daydelta)
+                else:
+                    # datetime.now(timezone.utc)
+                    row.clock = _utcnow_naive()
+            return row.clock
 
     def set_task_status(self, task: Task, status) -> Task:
-        if status != TASK_DISTRIBUTED_COMPLETED:
-            task.status = status
+        with self.session.begin():
+            if status != TASK_DISTRIBUTED_COMPLETED:
+                task.status = status
 
-        if status in (TASK_RUNNING, TASK_DISTRIBUTED):
-            task.started_on = _utcnow_naive()
-        elif status in (TASK_COMPLETED, TASK_DISTRIBUTED_COMPLETED):
-            task.completed_on = _utcnow_naive()
-        elif status == TASK_REPORTED:
-            task.reporting_finished_on = _utcnow_naive()
+            if status in (TASK_RUNNING, TASK_DISTRIBUTED):
+                task.started_on = _utcnow_naive()
+            elif status in (TASK_COMPLETED, TASK_DISTRIBUTED_COMPLETED):
+                task.completed_on = _utcnow_naive()
+            elif status == TASK_REPORTED:
+                task.reporting_finished_on = _utcnow_naive()
 
-        self.session.add(task)
-        return task
+            self.session.add(task)
+            return task
 
     def set_status(self, task_id: int, status) -> Optional[Task]:
         """Set task status.
@@ -810,63 +858,40 @@ class TasksMixIn:
         @param status: status string
         @return: operation status
         """
-        log.info("setstat task %s status %s", task_id, status)
-        task = self.session.get(Task, task_id)
+        with self.session.begin():
+            log.debug("setstat task %s status %s", task_id, status)
+            task = self.session.get(Task, task_id)
 
-        if not task:
-            return None
+            if not task:
+                return None
 
-        return self.set_task_status(task, status)
-
-    def set_task_visibility(self, task_id: int, visibility: str) -> Optional[Task]:
-        """Set a task's visibility (public/tenant/private).
-        @param task_id: task identifier
-        @param visibility: one of public|tenant|private
-        @return: the Task, or None if not found
-        @raise ValueError: if visibility is not a known level — defense in depth
-            so no caller (web, broker, or future) can persist a bogus value even
-            if it skips the view-layer check.
-        """
-        from lib.cuckoo.common.tenancy import VISIBILITIES
-
-        if visibility not in VISIBILITIES:
-            raise ValueError(f"invalid visibility: {visibility!r}")
-        task = self.session.get(Task, task_id)
-        if not task:
-            return None
-        task.visibility = visibility
-        self.session.commit()
-        if mongo_update_one is not None:
-            try:
-                mongo_update_one("analysis", {"info.id": task_id}, {"$set": {"info.visibility": visibility}})
-            except Exception:
-                log.warning("failed to sync visibility to mongo for task %s", task_id)
-        return task
+            return self.set_task_status(task, status)
 
     def fetch_task(self, categories: list = None):
         """Fetches a task waiting to be processed and locks it for running.
         @return: None or task
         """
-        stmt = (
-            select(Task)
-            .where(Task.status == TASK_PENDING)
-            .where(not_(Task.options.contains("node=")))
-            .order_by(Task.priority.desc(), Task.added_on)
-        )
+        with self.session.begin():
+            stmt = (
+                select(Task)
+                .where(Task.status == TASK_PENDING)
+                .where(not_(Task.options.contains("node=")))
+                .order_by(Task.priority.desc(), Task.added_on)
+            )
 
-        if categories:
-            stmt = stmt.where(Task.category.in_(categories))
+            if categories:
+                stmt = stmt.where(Task.category.in_(categories))
 
-        # 2. Execute the statement and get the first result object
-        row = self.session.scalars(stmt).first()
+            # 2. Execute the statement and get the first result object
+            row = self.session.scalars(stmt).first()
 
-        if not row:
-            return None
+            if not row:
+                return None
 
-        # This business logic remains the same
-        self.set_status(task_id=row.id, status=TASK_RUNNING)
+            # This business logic remains the same
+            self.set_status(task_id=row.id, status=TASK_RUNNING)
 
-        return row
+            return row
 
     def add_error(self, message, task_id):
         """Add an error related to a task."""
@@ -883,128 +908,112 @@ class TasksMixIn:
         @param task_id: ID of the task to reschedule.
         @return: ID of the newly created task.
         """
-        task = self.view_task(task_id)
+        with self.session.begin():
+            task = self.view_task(task_id)
 
-        if not task:
-            return None
-
-        if task.category == "file":
-            add = self.add_path
-        elif task.category == "url":
-            add = self.add_url
-        elif task.category == "pcap":
-            add = self.add_pcap
-        elif task.category == "static":
-            add = self.add_static
-
-        # Change status to recovered.
-        self.session.get(Task, task_id).status = TASK_RECOVERED
-
-        # Normalize tags.
-        if task.tags:
-            tags = ",".join(tag.name for tag in task.tags)
-        else:
-            tags = task.tags
-
-        def _ensure_valid_target(task):
-            if task.category == "url":
-                # URL tasks always have valid targets, return it as-is.
-                return task.target
-
-            # All other task types have a "target" pointing to a temp location,
-            # so get a stable path "target" based on the sample hash.
-            paths = self.sample_path_by_hash(task.sample.sha256, task_id)
-            paths = [file_path for file_path in paths if path_exists(file_path)]
-            if not paths:
+            if not task:
                 return None
 
-            if task.category == "pcap":
-                # PCAP task paths are represented as bytes
-                return paths[0].encode()
-            return paths[0]
+            if task.category == "file":
+                add = self.add_path
+            elif task.category == "url":
+                add = self.add_url
+            elif task.category == "pcap":
+                add = self.add_pcap
+            elif task.category == "static":
+                add = self.add_static
 
-        task_target = _ensure_valid_target(task)
-        if not task_target:
-            log.warning("Unable to find valid target for task: %s", task_id)
-            return
+            # Change status to recovered.
+            self.session.get(Task, task_id).status = TASK_RECOVERED
 
-        new_task_id = None
-        if task.category in ("file", "url"):
-            new_task_id = add(
-                task_target,
-                task.timeout,
-                task.package,
-                task.options,
-                task.priority,
-                task.custom,
-                task.machine,
-                task.platform,
-                tags,
-                task.memory,
-                task.enforce_timeout,
-                task.clock,
-                tlp=task.tlp,
-                route=task.route,
-                user_id=task.user_id,
-                tenant_id=task.tenant_id,
-                visibility=task.visibility,
-            )
-        elif task.category in ("pcap", "static"):
-            new_task_id = add(
-                task_target,
-                task.timeout,
-                task.package,
-                task.options,
-                task.priority,
-                task.custom,
-                task.machine,
-                task.platform,
-                tags,
-                task.memory,
-                task.enforce_timeout,
-                task.clock,
-                tlp=task.tlp,
-                user_id=task.user_id,
-                tenant_id=task.tenant_id,
-                visibility=task.visibility,
-            )
+            # Normalize tags.
+            if task.tags:
+                tags = ",".join(tag.name for tag in task.tags)
+            else:
+                tags = task.tags
 
-        self.session.get(Task, task_id).custom = f"Recovery_{new_task_id}"
+            def _ensure_valid_target(task):
+                if task.category == "url":
+                    # URL tasks always have valid targets, return it as-is.
+                    return task.target
 
-        return new_task_id
+                # All other task types have a "target" pointing to a temp location,
+                # so get a stable path "target" based on the sample hash.
+                paths = self.sample_path_by_hash(task.sample.sha256, task_id)
+                paths = [file_path for file_path in paths if path_exists(file_path)]
+                if not paths:
+                    return None
 
-    def count_matching_tasks(self, category=None, status=None, not_status=None, visible_to=None):
+                if task.category == "pcap":
+                    # PCAP task paths are represented as bytes
+                    return paths[0].encode()
+                return paths[0]
+
+            task_target = _ensure_valid_target(task)
+            if not task_target:
+                log.warning("Unable to find valid target for task: %s", task_id)
+                return
+
+            new_task_id = None
+            if task.category in ("file", "url"):
+                new_task_id = add(
+                    task_target,
+                    task.timeout,
+                    task.package,
+                    task.options,
+                    task.priority,
+                    task.custom,
+                    task.machine,
+                    task.platform,
+                    tags,
+                    task.memory,
+                    task.enforce_timeout,
+                    task.clock,
+                    tlp=task.tlp,
+                    route=task.route,
+                )
+            elif task.category in ("pcap", "static"):
+                new_task_id = add(
+                    task_target,
+                    task.timeout,
+                    task.package,
+                    task.options,
+                    task.priority,
+                    task.custom,
+                    task.machine,
+                    task.platform,
+                    tags,
+                    task.memory,
+                    task.enforce_timeout,
+                    task.clock,
+                    tlp=task.tlp,
+                )
+
+            self.session.get(Task, task_id).custom = f"Recovery_{new_task_id}"
+
+            return new_task_id
+
+    def count_matching_tasks(self, category=None, status=None, not_status=None):
         """Retrieve list of task.
         @param category: filter by category
         @param status: filter by task status
         @param not_status: exclude this task status from filter
-        @param visible_to: a tenancy Viewer; when set (and not a break-glass
-            admin), restrict the count to tasks the viewer may read — mirrors
-            list_tasks / can_read so pagination counts don't leak the volume of
-            other tenants' submissions.
         @return: number of tasks.
         """
-        stmt = select(func.count(Task.id))
+        with self.session.begin():
+            stmt = select(func.count(Task.id))
 
-        if status:
-            stmt = stmt.where(Task.status == status)
-        if not_status:
-            stmt = stmt.where(Task.status != not_status)
-        if category:
-            stmt = stmt.where(Task.category == category)
-        if visible_to is not None and not visible_to.is_local_admin:
-            # Same visibility predicate as list_tasks (lib.cuckoo.common.tenancy.can_read).
-            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+            if status:
+                stmt = stmt.where(Task.status == status)
+            if not_status:
+                stmt = stmt.where(Task.status != not_status)
+            if category:
+                stmt = stmt.where(Task.category == category)
 
-            conds = [Task.visibility == PUBLIC]
-            if visible_to.user_id is not None:
-                conds.append(Task.user_id == visible_to.user_id)  # owner
-            if visible_to.tenant_id is not None:
-                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
-            stmt = stmt.where(or_(*conds))
+            stmt = apply_sql_task_filter(stmt)
 
-        # 2. Execute the statement and return the single integer result.
-        return self.session.scalar(stmt)
+            # 2. Execute the statement and return the single integer result.
+            return self.session.scalar(stmt)
 
     def list_tasks(
         self,
@@ -1027,7 +1036,6 @@ class TasksMixIn:
         task_ids=False,
         include_hashes=False,
         user_id=None,
-        visible_to=None,
         for_update=False,
     ) -> List[Task]:
         """Retrieve list of task.
@@ -1053,79 +1061,75 @@ class TasksMixIn:
         @param for_update: If True, use "SELECT FOR UPDATE" in order to create a row-level lock on the selected tasks.
         @return: list of tasks.
         """
-        tasks: List[Task] = []
-        stmt = select(Task).options(joinedload(Task.guest), subqueryload(Task.errors), subqueryload(Task.tags))
-        if include_hashes:
-            stmt = stmt.options(joinedload(Task.sample))
-        if status:
-            if "|" in status:
-                stmt = stmt.where(Task.status.in_(status.split("|")))
+        with self.session.begin():
+            tasks: List[Task] = []
+            stmt = select(Task).options(joinedload(Task.guest), selectinload(Task.errors), selectinload(Task.tags))
+            if include_hashes:
+                stmt = stmt.options(joinedload(Task.sample))
+            if status:
+                if "|" in status:
+                    stmt = stmt.where(Task.status.in_(status.split("|")))
+                else:
+                    stmt = stmt.where(Task.status == status)
+            if not_status:
+                stmt = stmt.where(Task.status != not_status)
+            if category:
+                stmt = stmt.where(Task.category.in_([category] if isinstance(category, str) else category))
+            if sample_id is not None:
+                stmt = stmt.where(Task.sample_id == sample_id)
+            if id_before is not None:
+                stmt = stmt.where(Task.id < id_before)
+            if id_after is not None:
+                stmt = stmt.where(Task.id > id_after)
+            if completed_after:
+                stmt = stmt.where(Task.completed_on > completed_after)
+            if added_before:
+                stmt = stmt.where(Task.added_on < added_before)
+            if options_like:
+                stmt = stmt.where(Task.options.like(f"%{options_like.replace('*', '%')}%"))
+            if options_not_like:
+                stmt = stmt.where(Task.options.notlike(f"%{options_not_like.replace('*', '%')}%"))
+            if tags_tasks_like:
+                stmt = stmt.where(Task.tags_tasks.like(f"%{tags_tasks_like}%"))
+            if tags_tasks_not_like:
+                stmt = stmt.where(func.coalesce(Task.tags_tasks, "").notlike(f"%{tags_tasks_not_like}%"))
+            if task_ids:
+                stmt = stmt.where(Task.id.in_(task_ids))
+            if user_id is not None:
+                stmt = stmt.where(Task.user_id == user_id)
+
+            stmt = apply_sql_task_filter(stmt)
+
+            # 3. Chaining for ordering, pagination, and locking remains the same
+            if order_by is not None and isinstance(order_by, tuple):
+                stmt = stmt.order_by(*order_by)
+            elif order_by is not None:
+                stmt = stmt.order_by(order_by)
             else:
-                stmt = stmt.where(Task.status == status)
-        if not_status:
-            stmt = stmt.where(Task.status != not_status)
-        if category:
-            stmt = stmt.where(Task.category.in_([category] if isinstance(category, str) else category))
-        if sample_id is not None:
-            stmt = stmt.where(Task.sample_id == sample_id)
-        if id_before is not None:
-            stmt = stmt.where(Task.id < id_before)
-        if id_after is not None:
-            stmt = stmt.where(Task.id > id_after)
-        if completed_after:
-            stmt = stmt.where(Task.completed_on > completed_after)
-        if added_before:
-            stmt = stmt.where(Task.added_on < added_before)
-        if options_like:
-            stmt = stmt.where(Task.options.like(f"%{options_like.replace('*', '%')}%"))
-        if options_not_like:
-            stmt = stmt.where(Task.options.notlike(f"%{options_not_like.replace('*', '%')}%"))
-        if tags_tasks_like:
-            stmt = stmt.where(Task.tags_tasks.like(f"%{tags_tasks_like}%"))
-        if tags_tasks_not_like:
-            stmt = stmt.where(func.coalesce(Task.tags_tasks, "").notlike(f"%{tags_tasks_not_like}%"))
-        if task_ids:
-            stmt = stmt.where(Task.id.in_(task_ids))
-        if user_id is not None:
-            stmt = stmt.where(Task.user_id == user_id)
-        if visible_to is not None and not visible_to.is_local_admin:
-            # Visibility filter — mirrors lib.cuckoo.common.tenancy.can_read.
-            # Break-glass (is_local_admin) skips the filter entirely (sees all).
-            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
+                stmt = stmt.order_by(Task.added_on.desc())
 
-            conds = [Task.visibility == PUBLIC]
-            if visible_to.user_id is not None:
-                conds.append(Task.user_id == visible_to.user_id)  # owner
-            if visible_to.tenant_id is not None:
-                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
-            stmt = stmt.where(or_(*conds))
+            stmt = stmt.limit(limit).offset(offset)
+            if for_update:
+                stmt = stmt.with_for_update(of=Task)
 
-        # 3. Chaining for ordering, pagination, and locking remains the same
-        if order_by is not None and isinstance(order_by, tuple):
-            stmt = stmt.order_by(*order_by)
-        elif order_by is not None:
-            stmt = stmt.order_by(order_by)
-        else:
-            stmt = stmt.order_by(Task.added_on.desc())
-
-        stmt = stmt.limit(limit).offset(offset)
-        if for_update:
-            stmt = stmt.with_for_update(of=Task)
-
-        tasks = self.session.scalars(stmt).all()
-        return tasks
+            tasks = self.session.scalars(stmt).all()
+            return tasks
 
     def delete_task(self, task_id):
         """Delete information on a task.
         @param task_id: ID of the task to query.
         @return: operation status.
         """
-        task = self.session.get(Task, task_id)
-        if task is None:
+        try:
+            with self.session.begin():
+                task = self.session.get(Task, task_id)
+                if task is None:
+                    return False
+                self.session.delete(task)
+            return True
+        except SQLAlchemyError as e:
+            log.error("Error deleting task %s: %s", task_id, str(e))
             return False
-        self.session.delete(task)
-        # ToDo missed commits everywhere, check if autocommit is possible
-        return True
 
     def delete_tasks(
         self,
@@ -1214,18 +1218,13 @@ class TasksMixIn:
             log.warning("No filters provided for delete_tasks. No tasks will be deleted.")
             return True
 
-        # ToDo Transaction Handling
-        # The transaction logic (commit/rollback) is kept the same for a direct port,
-        # but the more idiomatic SQLAlchemy 2.0 approach would be to wrap the execution
-        # in a with self.session.begin(): block, which handles transactions automatically.
         try:
-            result = self.session.execute(delete_stmt)
-            log.info("Deleted %d tasks matching the criteria.", result.rowcount)
-            self.session.commit()
+            with self.session.begin():
+                result = self.session.execute(delete_stmt)
+                log.info("Deleted %d tasks matching the criteria.", result.rowcount)
             return True
         except SQLAlchemyError as e:
             log.error("Error deleting tasks: %s", str(e))
-            self.session.rollback()
             return False
 
     # ToDo replace with delete_tasks
@@ -1248,102 +1247,68 @@ class TasksMixIn:
         if result.rowcount > 0:
             log.info("Deleted %d timed-out PENDING tasks.", result.rowcount)
 
-    def _scope_where(self, scope, viewer):
-        """Return a list of SQLAlchemy conditions selecting tasks in `scope` for `viewer`,
-        mirroring lib.cuckoo.common.tenancy.scope_match. Empty list => no extra filter."""
-        from lib.cuckoo.common.tenancy import PUBLIC, TENANT, MINE, GLOBAL
-
-        if scope == GLOBAL or scope is None:
-            return []
-        if scope == PUBLIC:
-            return [Task.visibility == PUBLIC]
-        if scope == TENANT:
-            if viewer is None or viewer.tenant_id is None:
-                return [Task.id == -1]
-            return [and_(Task.tenant_id == viewer.tenant_id, Task.visibility == TENANT)]
-        if scope == MINE:
-            if viewer is None or viewer.user_id is None:
-                return [Task.id == -1]
-            return [Task.user_id == viewer.user_id]
-        raise ValueError(f"unknown scope {scope!r}")
-
-    def minmax_tasks(self, scope=None, viewer=None) -> Tuple[int, int]:
+    def minmax_tasks(self) -> Tuple[int, int]:
         """Finds the minimum start time and maximum completion time for all tasks."""
         # A single query is more efficient than two separate ones.
-        stmt = select(func.min(Task.started_on), func.max(Task.completed_on))
-        for cond in self._scope_where(scope, viewer):
-            stmt = stmt.where(cond)
-        min_val, max_val = self.session.execute(stmt).one()
+        with self.session.begin():
+            stmt = apply_sql_task_filter(select(func.min(Task.started_on), func.max(Task.completed_on)))
+            min_val, max_val = self.session.execute(stmt).one()
 
-        if min_val and max_val:
-            # .timestamp() is the modern way to get a unix timestamp.
-            return int(min_val.replace(tzinfo=timezone.utc).timestamp()), int(max_val.replace(tzinfo=timezone.utc).timestamp())
+            if min_val and max_val:
+                # .timestamp() is the modern way to get a unix timestamp.
+                return int(min_val.replace(tzinfo=timezone.utc).timestamp()), int(max_val.replace(tzinfo=timezone.utc).timestamp())
 
-        return 0, 0
+            return 0, 0
 
     def get_tlp_tasks(self) -> List[int]:
         """Retrieves a list of task IDs that have TLP enabled."""
         # Selecting just the ID is more efficient than fetching full objects.
-        stmt = select(Task.id).where(Task.tlp == "true")
-        # .scalars() directly yields the values from the single selected column.
-        return self.session.scalars(stmt).all()
+        with self.session.begin():
+            stmt = select(Task.id).where(Task.tlp == "true")
+            # .scalars() directly yields the values from the single selected column.
+            return self.session.scalars(stmt).all()
 
 
 
-    def get_tasks_status_count(self, scope=None, viewer=None, visible_to=None) -> Dict[str, int]:
-        """Counts tasks, grouped by status.
+    def get_tasks_status_count(self) -> Dict[str, int]:
+        """Counts tasks, grouped by status."""
+        with self.session.begin():
+            stmt = apply_sql_task_filter(select(Task.status, func.count(Task.status)).group_by(Task.status))
+            # .execute() returns rows, which can be directly converted to a dict.
+            return dict(self.session.execute(stmt).all())
 
-        When `visible_to` is set (and the viewer is not a break-glass admin),
-        applies the SAME can_read union filter as count_matching_tasks so the
-        status counts reflect only tasks the caller may see — preventing global
-        submission-volume leaks in multi-tenant deployments.  When both `scope`
-        and `visible_to` are given, `visible_to` takes precedence.
-        When MT is disabled / break-glass (is_local_admin=True), no extra filter
-        is applied (public-install behavior unchanged)."""
-        stmt = select(Task.status, func.count(Task.status)).group_by(Task.status)
-        if visible_to is not None and not visible_to.is_local_admin:
-            # Same visibility predicate as list_tasks / count_matching_tasks.
-            from lib.cuckoo.common.tenancy import PUBLIC, TENANT
-
-            conds = [Task.visibility == PUBLIC]
-            if visible_to.user_id is not None:
-                conds.append(Task.user_id == visible_to.user_id)  # owner
-            if visible_to.tenant_id is not None:
-                conds.append(and_(Task.visibility == TENANT, Task.tenant_id == visible_to.tenant_id))
-            stmt = stmt.where(or_(*conds))
-        else:
-            for cond in self._scope_where(scope, viewer):
-                stmt = stmt.where(cond)
-        # .execute() returns rows, which can be directly converted to a dict.
-        return dict(self.session.execute(stmt).all())
-
-    def count_tasks(self, status: str = None, mid: int = None, scope=None, viewer=None) -> int:
+    def count_tasks(self, status: str = None, mid: int = None) -> int:
         """Counts tasks in the database, with optional filters."""
         # Build a `SELECT COUNT(...)` query from the start for efficiency.
-        stmt = select(func.count(Task.id))
-        if mid:
-            stmt = stmt.where(Task.machine_id == mid)
-        if status:
-            stmt = stmt.where(Task.status == status)
-        for cond in self._scope_where(scope, viewer):
-            stmt = stmt.where(cond)
+        with self.session.begin():
+            stmt = select(func.count(Task.id))
+            if mid:
+                stmt = stmt.where(Task.machine_id == mid)
+            if status:
+                stmt = stmt.where(Task.status == status)
+            stmt = apply_sql_task_filter(stmt)
 
-        # .scalar() executes the query and returns the single integer result.
-        return self.session.scalar(stmt)
+            # .scalar() executes the query and returns the single integer result.
+            return self.session.scalar(stmt)
 
     def view_task(self, task_id, details=False) -> Optional[Task]:
         """Retrieve information on a task.
         @param task_id: ID of the task to query.
         @return: details on the task.
         """
-        query = select(Task).where(Task.id == task_id)
-        if details:
-            query = query.options(
-                joinedload(Task.guest), subqueryload(Task.errors), subqueryload(Task.tags), joinedload(Task.sample)
-            )
-        else:
-            query = query.options(subqueryload(Task.tags), joinedload(Task.sample))
-        return self.session.scalar(query)
+        with self.session.begin():
+            try:
+                task_id = int(task_id)
+            except (TypeError, ValueError):
+                return None
+            query = select(Task).where(Task.id == task_id)
+            if details:
+                query = query.options(
+                    joinedload(Task.guest), selectinload(Task.errors), selectinload(Task.tags), joinedload(Task.sample)
+                )
+            else:
+                query = query.options(selectinload(Task.tags), joinedload(Task.sample))
+            return self.session.scalar(query)
 
     # This function is used by the runstatistics community module.
     def add_statistics_to_task(self, task_id, details):  # pragma: no cover
@@ -1353,19 +1318,20 @@ class TasksMixIn:
         @return true of false.
         """
         # ToDo do we really need this? does it need commit?
-        task = self.session.get(Task, task_id)
-        if task:
-            task.dropped_files = details["dropped_files"]
-            task.running_processes = details["running_processes"]
-            task.api_calls = details["api_calls"]
-            task.domains = details["domains"]
-            task.signatures_total = details["signatures_total"]
-            task.signatures_alert = details["signatures_alert"]
-            task.files_written = details["files_written"]
-            task.registry_keys_modified = details["registry_keys_modified"]
-            task.crash_issues = details["crash_issues"]
-            task.anti_issues = details["anti_issues"]
-        return True
+        with self.session.begin():
+            task = self.session.get(Task, task_id)
+            if task:
+                task.dropped_files = details["dropped_files"]
+                task.running_processes = details["running_processes"]
+                task.api_calls = details["api_calls"]
+                task.domains = details["domains"]
+                task.signatures_total = details["signatures_total"]
+                task.signatures_alert = details["signatures_alert"]
+                task.files_written = details["files_written"]
+                task.registry_keys_modified = details["registry_keys_modified"]
+                task.crash_issues = details["crash_issues"]
+                task.anti_issues = details["anti_issues"]
+            return True
 
 
     def ban_user_tasks(self, user_id: int):
@@ -1375,11 +1341,8 @@ class TasksMixIn:
         """
 
         update_stmt = update(Task).where(Task.user_id == user_id, Task.status == TASK_PENDING).values(status=TASK_BANNED)
-
-        # 2. Execute the statement.
-        # The transaction should be handled by the calling code,
-        # ToDo e.g., with a `with session.begin():` block.
-        self.session.execute(update_stmt)
+        with self.session.begin():
+            self.session.execute(update_stmt)
 
     def tasks_reprocess(self, task_id: int):
         """common func for api and views"""
@@ -1411,8 +1374,13 @@ class TasksMixIn:
 
     def view_errors(self, task_id: int) -> List[Error]:
         """Gets all errors related to a task."""
-        stmt = select(Error).where(Error.task_id == task_id)
-        return self.session.scalars(stmt).all()
+        with self.session.begin():
+            try:
+                task_id = int(task_id)
+            except (TypeError, ValueError):
+                return []
+            stmt = select(Error).where(Error.task_id == task_id)
+            return self.session.scalars(stmt).all()
 
     # Submission hooks to manipulate arguments of tasks execution
     def recon(

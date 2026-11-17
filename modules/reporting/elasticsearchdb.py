@@ -84,25 +84,22 @@ class ElasticSearchDB(Report):
         report["info"]["ended"] = (
             datetime.strptime(info["ended"], "%Y-%m-%d %H:%M:%S") if isinstance(info["ended"], str) else info["ended"]
         )
-        report["info"]["machine"]["started_on"] = (
-            datetime.strptime(info["machine"]["started_on"], "%Y-%m-%d %H:%M:%S")
-            if isinstance(info["machine"]["started_on"], str)
-            else info["machine"]["started_on"]
-        )
-        report["info"]["machine"]["shutdown_on"] = (
-            datetime.strptime(info["machine"]["shutdown_on"], "%Y-%m-%d %H:%M:%S")
-            if isinstance(info["machine"]["shutdown_on"], str)
-            else info["machine"]["shutdown_on"]
-        )
+        # machine peut être absent (analyse statique) ou None
+        if isinstance(info.get("machine"), dict):
+            for k in ("started_on", "shutdown_on"):
+                if isinstance(info["machine"].get(k), str):
+                    report["info"]["machine"][k] = datetime.strptime(info["machine"][k], "%Y-%m-%d %H:%M:%S")
 
-        for dropped in report["dropped"]:
-            if "pe" in dropped:
-                dropped["pe"]["timestamp"] = datetime.strptime(dropped["pe"]["timestamp"], "%Y-%m-%d %H:%M:%S")
+        for dropped in report.get("dropped") or []:
+            if isinstance(dropped, dict) and isinstance(dropped.get("pe"), dict):
+                pe = dropped["pe"]
+                if isinstance(pe.get("timestamp"), str):
+                    pe["timestamp"] = datetime.strptime(pe["timestamp"], "%Y-%m-%d %H:%M:%S")
 
     # Fix signatures from string to list in order to have a common mapping
     def fix_signature_results(self, report):
-        for s in report["signatures"]:
-            for f in s["data"]:
+        for s in report.get("signatures") or []:
+            for f in s.get("data") or []:
                 for k, val in f.items():
                     if isinstance(val, (str, bool)):
                         f[k] = {"name": str(val)}
@@ -111,15 +108,17 @@ class ElasticSearchDB(Report):
                             val[index] = {"name": file}
 
     def fix_suricata_http_status(self, report):
-        if "http" in report["suricata"]:
-            for http in report["suricata"]["http"]:
-                if http["status"] == "None":
+        suricata = report.get("suricata")
+        if isinstance(suricata, dict):
+            for http in suricata.get("http") or []:
+                if isinstance(http, dict) and http.get("status") == "None":
                     http["status"] = None
 
     def fix_cape_payloads(self, report):
-        if "CAPE" in report:
-            for p in report["CAPE"]["payloads"]:
-                if p["tlsh"] is False:
+        cape = report.get("CAPE")
+        if isinstance(cape, dict):
+            for p in cape.get("payloads") or []:
+                if isinstance(p, dict) and p.get("tlsh") is False:
                     p["tlsh"] = None
 
     def convert_procdump_strings_to_str(self, report):
@@ -138,8 +137,13 @@ class ElasticSearchDB(Report):
 
     def date_hook(self, json_dict):
         for key, value in json_dict.items():
-            with suppress(Exception):
-                json_dict[key] = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            # A leading digit, a '-' and a ':' are all necessary for "%Y-%m-%d %H:%M:%S"
+            # to parse, so nothing that used to be converted stops being converted. The
+            # unguarded version built an exception for every value in the report tree,
+            # including every int and list.
+            if type(value) is str and value[:1].isdigit() and "-" in value and ":" in value:
+                with suppress(Exception):
+                    json_dict[key] = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
         return json_dict
 
     def run(self, results):
@@ -162,13 +166,39 @@ class ElasticSearchDB(Report):
         # the original dictionary and possibly compromise the following
         # reporting modules.
         report = get_json_document(results, self.analysis_path)
+        if not report or "info" not in report:
+            log.error("Failed to get JSON document or 'info' key is missing for Task")
+            return
+
+        local_task_id = int(report["info"].get("id", 0) or 0)
+        attributes = (self.task or {}).get("attributes") or {}
+        if main_task_id := attributes.get("main_task_id"):
+            with suppress(ValueError, TypeError):
+                report["info"]["id"] = int(main_task_id)
+                if local_task_id:
+                    report["info"].setdefault("local_task_id", local_task_id)
+
+        if not int(report["info"].get("id", 0) or 0):
+            log.error("Task ID is missing in report['info']")
+            return
+
+        from lib.cuckoo.common.hooks import run_report_hooks
+
+        run_report_hooks(report, task=self.task, stage="elasticsearchdb")
+
         self.fix_fields(report)
-        report = json.loads(json.dumps(report, default=str), object_hook=self.date_hook)
+
+        # insert_calls moves the api calls out into the separate calls index. The json
+        # round-trip below used to run before it, so the entire behaviour log - by far
+        # the largest structure in the report, commonly millions of entries - was
+        # serialised and re-parsed only to be discarded on the next line.
         new_processes = insert_calls(report, elastic_db=elastic_handler)
 
         # Store the results in the report.
-        report["behavior"] = dict(report["behavior"])
+        report["behavior"] = dict(report.get("behavior") or {})
         report["behavior"]["processes"] = new_processes
+
+        report = json.loads(json.dumps(report, default=str), object_hook=self.date_hook)
 
         delete_analysis_and_related_calls(report["info"]["id"])
         self.format_dates(report)
@@ -181,3 +211,5 @@ class ElasticSearchDB(Report):
         except Exception as e:
             log.error(e)
             return
+
+        run_report_hooks(report, task=self.task, stage="post_elasticsearchdb")

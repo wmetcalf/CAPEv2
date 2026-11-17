@@ -11,8 +11,6 @@ from lib.cuckoo.core.database import init_database
 CUCKOO_PATH = os.path.join(Path.cwd(), "..")
 sys.path.append(CUCKOO_PATH)
 
-from lib.cuckoo.common.config import Config
-
 # Build paths inside the project like this: BASE_DIR / "subdir".
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -41,9 +39,15 @@ except ImportError:
 # SECURITY WARNING: don"t run with debug turned on in production!
 DEBUG = True
 
-LOGGING_CONFIG = None
+# guac/views.py gates every view with @conditional_login_required(login_required,
+# settings.WEB_AUTHENTICATION). guac-web loads THIS module (web/asgi.py sets
+# DJANGO_SETTINGS_MODULE=web.guac_settings), NOT web.settings, so it must define
+# WEB_AUTHENTICATION too — derived from web.conf exactly as web.settings does. Without it,
+# `import guac.urls` raises AttributeError and EVERY /guac/ request 500s ("Connection
+# error"), breaking the interactive live-VM Guacamole tunnel.
+WEB_AUTHENTICATION = _CapeConfig("web").web_auth.get("enabled", False)
 
-WEB_AUTHENTICATION = getattr(Config("web"), "web_auth", {}).get("enabled", False)
+LOGGING_CONFIG = None
 
 ALLOWED_HOSTS = [
     "*",
@@ -61,7 +65,12 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "web.middleware.DBTransactionMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    # AuthenticationMiddleware populates request.user from the session. guac/views.py's index
+    # gates the live-VM tunnel on request.user (when WEB_AUTHENTICATION is on). Without this
+    # middleware request.user does not exist and every /guac/ request 500s ('ASGIRequest' object
+    # has no attribute 'user'); it must sit AFTER SessionMiddleware (it reads the session).
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -84,29 +93,23 @@ TEMPLATES = [
     },
 ]
 
-# Database settings.
-#
-# Comment "we don't need it" is upstream-stale: the guac-web ASGI app
-# still needs siteauth — AuthMiddlewareStack in asgi.py reads
-# django_session on every WebSocket connect to attach scope["user"],
-# and guac/views.index (the iframe page) checks WEB_AUTHENTICATION
-# (django.contrib.auth) before rendering.
-#
-# Path is absolute because guac-web runs with cwd=/opt/CAPEv2/web (set
-# by gunicorn WorkingDirectory in the systemd unit), and a relative
-# "siteauth.sqlite" would resolve to /opt/CAPEv2/web/siteauth.sqlite —
-# an empty stub file shipped by cape-core that has no tables.  The
-# real, migrated siteauth lives at /var/lib/cape/django/siteauth.sqlite
-# (see settings.py for the matching path + the rationale: cape services
-# must write to a location outside /opt/CAPEv2/ since dh-virtualenv
-# leaves that tree read-only at runtime).
-#
-# Without this absolute path, every guac WebSocket connect crashes
-# AuthMiddleware with `django.db.utils.OperationalError: no such table:
-# django_session`, the asgi handler closes the WS with code 1000, and
-# the browser-side Guacamole client gets a closing handshake before
-# the first protocol frame.  Caught on sb deploy 2026-05-22.
-DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "/var/lib/cape/django/siteauth.sqlite"}}
+# Database settings. Default to the local sqlite (single-node / no deploy overlay).
+DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "siteauth.sqlite"}}
+
+# Share the central auth/session store with the main web. guac-web is a SEPARATE ASGI process,
+# so to resolve request.user to the SAME authenticated User the browser is logged in as on the
+# main web (:8000) it must (a) read the session from the same DB the main web writes to, and (b)
+# permit the same auth backend the session was created with (e.g. allauth for OIDC) — otherwise
+# django.contrib.auth.get_user returns AnonymousUser and login_required / the MT can_manage_task
+# gate reject every attach. local_settings.py is where the deploy injects the central DB
+# (postgres/RDS) + allauth backends; web.settings adopts it the same way. SECRET_KEY is already
+# shared (both import web/web/secret_key.py) so the session auth-hash validates. Absent
+# local_settings (dev / single-node), keep the sqlite default -> AnonymousUser, matching
+# upstream's WEB_AUTHENTICATION=off behavior.
+try:
+    from .local_settings import DATABASES, AUTHENTICATION_BACKENDS  # noqa: F401, F811
+except Exception:
+    pass
 
 ASGI_APPLICATION = "web.asgi.application"
 
@@ -127,10 +130,14 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 
-# Additional locations of static files
-# STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")]
-
 STATIC_ROOT = os.path.join(BASE_DIR, "static")
+
+# NOTE: Do NOT uncomment STATICFILES_DIRS pointing at BASE_DIR / "static" -- it is
+# the same path as STATIC_ROOT above, and Django's staticfiles.E002 check rejects a
+# STATICFILES_DIRS entry equal to STATIC_ROOT (source dirs must not overlap the
+# collectstatic destination). If guac-web ever needs extra source dirs, use a
+# DIFFERENT directory, e.g. STATICFILES_DIRS = [os.path.join(BASE_DIR, "static_src")].
+# STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")]  # <-- would trip staticfiles.E002
 
 STATICFILES_FINDERS = (
     "django.contrib.staticfiles.finders.FileSystemFinder",
@@ -201,12 +208,20 @@ logging.config.dictConfig(
 
 _db = init_database(exists_ok=True)
 
-# Create guac_sessions table if EITHER guac feature is on: the task-based guac
-# (guacamole.enabled) AND the direct-VNC console (vnc_console_enabled) both use
-# guac_sessions. Gating solely on vnc_console_enabled (default off) breaks task-based
-# guac on a fresh deploy — its sessions can't be persisted (gemini review, PR #12).
+# Create guac_sessions table if guacamole is enabled
 _guac_cfg = _CapeConfig("web").guacamole
 if _guac_cfg.get("enabled", False) or _guac_cfg.get("vnc_console_enabled", False):
     from lib.cuckoo.core.data.guac_session import GuacSession  # noqa: F401
     from lib.cuckoo.core.data.db_common import Base
     Base.metadata.create_all(_db.engine)
+
+# guac-web is a separate ASGI process with its own settings: apply the same tenancy layer
+# (task-scoped console access, admin-only direct VNC) as the main web app.
+from lib.cuckoo.common.hooks import bootstrap_tenancy  # noqa: E402
+
+# guac-web does not load the main web's auth backends (OIDC sessions resolve to AnonymousUser
+# in AuthenticationMiddleware); let the tenancy middleware resolve users the way the guac views do.
+TENANCY_REQUEST_USER_RESOLVER = "guac.channels_auth.resolve_request_user"
+
+bootstrap_tenancy(_CapeConfig("cuckoo"), settings_globals=globals())
+
