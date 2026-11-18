@@ -3,9 +3,12 @@
 Idempotently removes inline tasks.tenant_id and tasks.visibility columns on deployments
 that previously applied 3a1b_tenant_visibility before multi-tenancy moved out of core.
 
-Before dropping them, any task that carries tenancy information (a tenant_id, or a
-visibility other than private) is copied into the task_acl side table, unless that task
-already has a task_acl row. Deployments that never had the inline columns are untouched.
+Before dropping them, every task that carries tenancy information (a tenant_id, or a
+visibility other than private) is copied verbatim into the `tasks_legacy_tenancy` side
+table. Core does not interpret those values: the old tenant ids belong to a Tenant table
+that no longer exists, so mapping them is left to whichever tenancy plugin is installed
+(`lib.tenancy` consumes and drops the table in `utils/tenancy_reconcile.py`).
+Deployments that never had the inline columns are untouched and get no side table.
 
 Revision ID: 4c2d_drop_inline_tenancy
 Revises: 4a6c2b_machine_attributes
@@ -19,32 +22,33 @@ down_revision = "4a6c2b_machine_attributes"
 branch_labels = None
 depends_on = None
 
+LEGACY_TABLE = "tasks_legacy_tenancy"
 
-def _carry_inline_tenancy_to_task_acl(bind, columns):
-    """Copy inline tenancy into task_acl so dropping the columns loses nothing."""
+
+def _stash_inline_tenancy(bind, insp, columns):
+    """Copy inline tenancy into LEGACY_TABLE so dropping the columns loses nothing."""
     if "visibility" not in columns and "tenant_id" not in columns:
         return
-    from lib.tenancy.acl import ensure_acl_schema
-
-    ensure_acl_schema(bind)
+    if LEGACY_TABLE not in insp.get_table_names():
+        op.create_table(
+            LEGACY_TABLE,
+            sa.Column("task_id", sa.Integer(), primary_key=True, autoincrement=False),
+            sa.Column("tenant_id", sa.Integer(), nullable=True),
+            sa.Column("visibility", sa.String(16), nullable=True),
+        )
     tenant = "t.tenant_id" if "tenant_id" in columns else "NULL"
-    # Only private is the no-row default; anything unrecognized is carried as private (fail-closed).
-    visibility = (
-        "CASE WHEN t.visibility IN ('public', 'tenant') THEN t.visibility ELSE 'private' END"
-        if "visibility" in columns
-        else "'private'"
-    )
+    visibility = "t.visibility" if "visibility" in columns else "NULL"
     carries = []
     if "tenant_id" in columns:
         carries.append("t.tenant_id IS NOT NULL")
     if "visibility" in columns:
-        carries.append("t.visibility IN ('public', 'tenant')")
+        carries.append("(t.visibility IS NOT NULL AND t.visibility <> 'private')")
     bind.execute(
         sa.text(
-            "INSERT INTO task_acl (task_id, user_id, tenant_id, visibility, visibility_seq) "
-            f"SELECT t.id, t.user_id, {tenant}, {visibility}, 1 FROM tasks t "
+            f"INSERT INTO {LEGACY_TABLE} (task_id, tenant_id, visibility) "
+            f"SELECT t.id, {tenant}, {visibility} FROM tasks t "
             f"WHERE ({' OR '.join(carries)}) "
-            "AND NOT EXISTS (SELECT 1 FROM task_acl a WHERE a.task_id = t.id)"
+            f"AND NOT EXISTS (SELECT 1 FROM {LEGACY_TABLE} l WHERE l.task_id = t.id)"
         )
     )
 
@@ -52,11 +56,11 @@ def _carry_inline_tenancy_to_task_acl(bind, columns):
 def upgrade():
     bind = op.get_bind()
     insp = sa.inspect(bind)
-    _carry_inline_tenancy_to_task_acl(bind, {col["name"] for col in insp.get_columns("tasks")})
+    columns = {col["name"] for col in insp.get_columns("tasks")}
+    _stash_inline_tenancy(bind, insp, columns)
     indexes = {ix["name"] for ix in insp.get_indexes("tasks")}
     if "ix_tasks_tenant_id" in indexes:
         op.drop_index("ix_tasks_tenant_id", table_name="tasks")
-    columns = {col["name"] for col in insp.get_columns("tasks")}
     if "visibility" in columns:
         op.drop_column("tasks", "visibility")
     if "tenant_id" in columns:

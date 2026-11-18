@@ -2105,11 +2105,11 @@ def test_cleanup_legacy_inline_schema_carries_public_tasks_and_drops_is_tenant_a
 
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: False)
     dry = backfill.cleanup_legacy_inline_schema(engine, dry_run=True)
-    assert dry == {"public_tasks_carried": 1, "dropped_is_tenant_admin": 1}
+    assert dry == {"public_tasks_carried": 1, "legacy_tasks_carried": 0, "dropped_is_tenant_admin": 1}
     assert "task_acl" not in sa.inspect(engine).get_table_names()
 
     stats = backfill.cleanup_legacy_inline_schema(engine, dry_run=False)
-    assert stats == {"public_tasks_carried": 1, "dropped_is_tenant_admin": 1}
+    assert stats == {"public_tasks_carried": 1, "legacy_tasks_carried": 0, "dropped_is_tenant_admin": 1}
     assert "is_tenant_admin" not in {c["name"] for c in sa.inspect(engine).get_columns("users_userprofile")}
 
     with Session(engine) as session:
@@ -2134,7 +2134,7 @@ def test_cleanup_legacy_inline_schema_skips_public_carry_when_multitenancy_was_n
 
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: False)
     stats = backfill.cleanup_legacy_inline_schema(engine, dry_run=False)
-    assert stats == {"public_tasks_carried": 0, "dropped_is_tenant_admin": 0}
+    assert stats == {"public_tasks_carried": 0, "legacy_tasks_carried": 0, "dropped_is_tenant_admin": 0}
     assert "task_acl" not in sa.inspect(engine).get_table_names()
 
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
