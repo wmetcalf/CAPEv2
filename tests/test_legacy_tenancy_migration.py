@@ -66,7 +66,8 @@ def test_upgrade_stashes_inline_tenancy_verbatim_before_dropping(migration):
     _upgrade(engine, migration)
     assert {"tenant_id", "visibility"}.isdisjoint(_task_columns(engine))
     # Core copies, it does not interpret: legacy tenant ids are a plugin's business.
-    assert _stashed(engine) == [(1, 3, "public"), (2, 3, "tenant"), (3, 3, "private"), (5, None, "public"), (7, 9, "weird")]
+    assert _stashed(engine) == [
+        (1, 3, "public"), (2, 3, "tenant"), (3, 3, "private"), (4, None, "private"), (5, None, "public"), (7, 9, "weird")]
     assert "task_acl" not in sa.inspect(engine).get_table_names()
 
 
@@ -78,12 +79,12 @@ def test_upgrade_without_inline_columns_creates_no_side_table(migration):
     assert "tasks_legacy_tenancy" not in sa.inspect(engine).get_table_names()
 
 
-def test_upgrade_with_only_visibility_stashes_non_private(migration):
+def test_upgrade_with_only_visibility_stashes_every_visibility(migration):
     engine = _legacy_engine(columns=("visibility",))
     with engine.begin() as conn:
         conn.execute(sa.text("INSERT INTO tasks VALUES (1, 7, 'public'), (2, 7, 'private')"))
     _upgrade(engine, migration)
-    assert _stashed(engine) == [(1, None, "public")]
+    assert _stashed(engine) == [(1, None, "public"), (2, None, "private")]
     assert "visibility" not in _task_columns(engine)
 
 
@@ -126,7 +127,7 @@ def test_cleanup_carries_stash_remapped_and_fail_closed(monkeypatch):
         s.add(TaskAcl(task_id=7, user_id=4, tenant_id=None, visibility="private", visibility_seq=3))
         s.commit()
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
-    # Legacy tenant 1 became group/tenant 11, legacy 2 was inactive, legacy 9 is unknown.
+    # Legacy tenant 1 became group/tenant 11, legacy 2 was inactive, legacy 9 is unknown (--drop-legacy-tenants).
     stats = backfill.cleanup_legacy_inline_schema(engine, tenant_map={1: 11, 2: None})
     assert stats["legacy_tasks_carried"] == 6
     assert _acl(engine) == [
@@ -158,6 +159,7 @@ def test_cleanup_keeps_is_tenant_admin_until_web_import_ran(monkeypatch):
     engine = sa.create_engine("sqlite://")
     with engine.begin() as conn:
         conn.execute(sa.text("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY)"))
+        conn.execute(sa.text("INSERT INTO users_tenant VALUES (1)"))
         conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
         conn.execute(sa.text("CREATE TABLE django_migrations (id INTEGER PRIMARY KEY, app VARCHAR, name VARCHAR)"))
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
@@ -170,6 +172,42 @@ def test_cleanup_keeps_is_tenant_admin_until_web_import_ran(monkeypatch):
     assert "is_tenant_admin" not in {c["name"] for c in sa.inspect(engine).get_columns("users_userprofile")}
 
 
+@pytest.mark.parametrize("case", ["no_rows", "tenancy_off", "dropped"])
+def test_cleanup_drops_is_tenant_admin_when_no_import_will_read_it(monkeypatch, case):
+    import lib.tenancy.backfill as backfill
+
+    # users.0004 created users_tenant on every install; keeping the NOT NULL column forever
+    # would break every user creation on a shared database.
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY)"))
+        if case != "no_rows":
+            conn.execute(sa.text("INSERT INTO users_tenant VALUES (1)"))
+        conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
+    monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: case != "tenancy_off")
+    stats = backfill.cleanup_legacy_inline_schema(engine, drop_legacy_tenants=case == "dropped")
+    assert stats["dropped_is_tenant_admin"] == 1
+
+
+def test_cleanup_keeps_stashed_public_rows_it_does_not_carry(monkeypatch):
+    import lib.tenancy.backfill as backfill
+
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE tasks (id INTEGER PRIMARY KEY, user_id INTEGER)"))
+        conn.execute(sa.text("CREATE TABLE tasks_legacy_tenancy (task_id INTEGER PRIMARY KEY, tenant_id INTEGER, visibility VARCHAR(16))"))
+        conn.execute(sa.text("INSERT INTO tasks VALUES (1, 2), (2, 2)"))
+        conn.execute(sa.text("INSERT INTO tasks_legacy_tenancy VALUES (1, NULL, 'public'), (2, NULL, 'private'), (3, NULL, 'public')"))
+    monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: False)
+    backfill.cleanup_legacy_inline_schema(engine)
+    assert _acl(engine) == [(2, 2, None, "private", 1)]
+    assert _stashed(engine) == [(1, None, "public")]  # kept for a run with tenancy on; task 3 is gone
+    monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
+    backfill.cleanup_legacy_inline_schema(engine)
+    assert _acl(engine) == [(1, 2, None, "public", 1), (2, 2, None, "private", 1)]
+    assert "tasks_legacy_tenancy" not in sa.inspect(engine).get_table_names()
+
+
 def _reconcile_env(monkeypatch, tmp_path, docs):
     import lib.cuckoo.common.config as config_mod
     import lib.cuckoo.core.database as database_mod
@@ -177,7 +215,7 @@ def _reconcile_env(monkeypatch, tmp_path, docs):
 
     path = tmp_path / "legacy.db"
     engine = _stash_engine(path)
-    monkeypatch.setattr(database_mod, "init_database", lambda: None)
+    monkeypatch.setattr(database_mod, "init_database", lambda **kw: None)
     monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
     monkeypatch.setattr(acl_mod, "_acl_schema_ready", set())
     monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
@@ -206,6 +244,50 @@ def test_reconcile_refuses_stash_without_web_tenant_map(monkeypatch, tmp_path, c
         engine.dispose()
 
 
+def test_reconcile_refuses_stashed_tenant_the_map_does_not_cover(monkeypatch, tmp_path, capsys):
+    import lib.tenancy.backfill as backfill
+
+    # cape_tenancy 0002 skipped its import (cape_tenancy already configured): an empty map must
+    # not silently make every tenant-shared task owner-only.
+    engine, writes = _reconcile_env(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(backfill, "load_legacy_tenant_map", lambda: {})
+    try:
+        assert backfill.main(["--force"]) == 2
+        assert "[1, 2, 9]" in capsys.readouterr().err
+        assert "tasks_legacy_tenancy" in sa.inspect(engine).get_table_names()
+        assert writes == []
+    finally:
+        engine.dispose()
+
+
+def test_reconcile_survives_map_load_initializing_the_database(monkeypatch, tmp_path, capsys):
+    import lib.cuckoo.core.database as database_mod
+    import lib.tenancy.backfill as backfill
+    from lib.tenancy.acl import ensure_acl_schema
+
+    engine, writes = _reconcile_env(monkeypatch, tmp_path, [])
+    ensure_acl_schema(engine)  # task_acl exists, so the preflight itself never initializes
+    state = {"db": None}
+
+    def init_database(exists_ok=False):  # the real singleton contract
+        if state["db"] is not None and not exists_ok:
+            raise RuntimeError("The database has already been initialized!")
+        state["db"] = state["db"] or object()
+
+    def load_map():  # importing web/web/settings.py initializes the database
+        init_database(exists_ok=True)
+        return {1: 11, 2: None, 9: None}
+
+    monkeypatch.setattr(database_mod, "init_database", init_database)
+    monkeypatch.setattr(backfill, "load_legacy_tenant_map", load_map)
+    monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
+    try:
+        assert backfill.main(["--force"]) == 0, capsys.readouterr().err
+        assert "tasks_legacy_tenancy" not in sa.inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+
 def test_reconcile_maps_stash_and_restamps_legacy_public_without_adopt_flag(monkeypatch, tmp_path, capsys):
     import lib.tenancy.backfill as backfill
 
@@ -215,7 +297,7 @@ def test_reconcile_maps_stash_and_restamps_legacy_public_without_adopt_flag(monk
         {"_id": "b", "info": {"id": 2, "visibility": "tenant", "tenant_id": 1}},
     ]
     engine, writes = _reconcile_env(monkeypatch, tmp_path, docs)
-    monkeypatch.setattr(backfill, "load_legacy_tenant_map", lambda: {1: 11})
+    monkeypatch.setattr(backfill, "load_legacy_tenant_map", lambda: {1: 11, 2: None, 9: None})
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
     try:
         assert backfill.main(["--force"]) == 0, capsys.readouterr().err
@@ -251,7 +333,7 @@ alice, carol, bob, dave, erin = (User.objects.create_user(username=n) for n in (
 staff.user_set.add(dave)
 with connection.cursor() as c:
     c.execute("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY, slug VARCHAR(48), name VARCHAR(128), idp_groups TEXT, admin_idp_groups TEXT, active BOOL, created_at DATETIME)")
-    c.execute("INSERT INTO users_tenant VALUES (1, 'acme', 'Acme', '[\"sso-acme\"]', '[]', 1, '2026-01-01'), (2, 'globex', 'Globex', '[]', '[]', 1, '2026-01-01'), (3, 'gone', 'Gone', '[]', '[]', 0, '2026-01-01')")
+    c.execute("INSERT INTO users_tenant VALUES (1, 'acme', 'Acme', '[\"sso-acme\"]', '[\"sso-acme-admin\"]', 1, '2026-01-01'), (2, 'globex', 'Globex', '[]', '[]', 1, '2026-01-01'), (3, 'gone', 'Gone', '[]', '[]', 0, '2026-01-01')")
     c.execute("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, user_id INTEGER, tenant_id INTEGER, is_tenant_admin BOOL)")
     c.execute("INSERT INTO users_userprofile VALUES (1, %s, 1, 0), (2, %s, 1, 1), (3, %s, 2, 0), (4, %s, NULL, 0), (5, %s, 3, 1), (6, 999, 1, 0)" % (alice.pk, carol.pk, bob.pk, dave.pk, erin.pk))
 call_command("migrate", "cape_tenancy", verbosity=0)
@@ -262,7 +344,8 @@ from lib.tenancy.resources import resolve_user_entitlements, reconcile_idp_group
 
 m = {r.legacy_tenant_id: r.tenant_id for r in LegacyTenantMap.objects.all()}
 assert set(m) == {1, 2, 3} and m[3] is None, m
-assert 1 not in m.values() and m[1] != m[2], m
+# Above every existing Group id and every legacy tenant id: no legacy report stamp can match.
+assert min(v for v in m.values() if v) > 3 and m[1] != m[2], m
 acme = Group.objects.get(name="tenant-acme")
 assert m[1] == acme.id and Tenant.objects.get(pk=acme.id).slug == "acme"
 assert not Group.objects.filter(name="tenant-gone").exists()
@@ -278,10 +361,21 @@ assert res(erin)[0] is None  # inactive tenant: nothing restored
 assert resolve_user_entitlements(User.objects.get(pk=alice.pk)).can_use_machine("anything") is True
 assert GroupSandboxPolicy.objects.get(group=acme).idp_groups == ["sso-acme"]
 
+from lib.tenancy.hooks import _reconcile_login_groups
+
 # SSO revocation still works: a login without the IdP group drops the member group.
-a = User.objects.get(pk=alice.pk)
-reconcile_idp_groups_to_django_groups(a, ["other"])
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"other"})
 assert res(alice)[0] is None, res(alice)
+# An admin IdP group alone grants nothing (legacy: admin only together with a member match)...
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme-admin"})
+assert res(alice)[:2] == (None, False), res(alice)
+# ...with the member group it grants tenant admin, and losing the member group revokes it.
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme", "sso-acme-admin"})
+assert res(alice)[:2] == (m[1], True), res(alice)
+_reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme"})
+assert res(carol)[:2] == (m[1], False), res(carol)
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme-admin"})
+assert res(alice)[:2] == (None, False), res(alice)
 
 # Re-running finds cape_tenancy populated and does nothing more.
 n_groups = Group.objects.count()

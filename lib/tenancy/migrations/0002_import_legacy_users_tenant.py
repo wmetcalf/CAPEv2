@@ -9,8 +9,14 @@ whatever Group has id 1. Instead, each active legacy tenant becomes:
   with the same id as that Group (the Group reserves the id, so nothing else resolves to it);
 * when it had admins, an admin Group `tenant-<slug>-admins` pointing at the same `Tenant`, with
   `is_tenant_admin_group` set;
-* group sandbox policies with the legacy `idp_groups` / `admin_idp_groups`, so SSO login keeps
-  syncing membership (a revoked IdP group removes the user) instead of freezing it in rows.
+* the member policy carries the legacy `idp_groups`, so SSO login keeps syncing membership (a
+  revoked IdP group removes the user) instead of freezing it in rows; the Tenant keeps
+  `admin_idp_groups`, which login applies to the admin Group only together with a member match
+  (`reconcile_tenant_admin_groups`), as the legacy code did.
+
+New Groups get ids above every existing Group id and every legacy tenant id, so until
+`utils/tenancy_reconcile.py` restamps them, no report still carrying a legacy tenant id can
+match a new tenant.
 
 Policies grant every machine, tag and route: the legacy tenancy had no resource limits.
 Inactive legacy tenants get no Group. `LegacyTenantMap` records where each legacy id went;
@@ -57,6 +63,10 @@ def _free_group_name(Group, alias, base):
         name = base[: 150 - len(suffix)] + suffix
         n += 1
     return name
+
+
+def _new_group(Group, alias, base, next_id):
+    return Group.objects.using(alias).create(id=next_id, name=_free_group_name(Group, alias, base))
 
 
 def _policy(Policy, alias, group, tenant, *, admin, idp_groups):
@@ -108,7 +118,12 @@ def import_legacy_tenancy(apps, schema_editor):
         return
     if any(m.objects.using(alias).exists() for m in (Tenant, Policy, Membership, LegacyTenantMap)):
         # Not a first upgrade: cape_tenancy is already configured, and importing now would add
-        # a second tenant to users the operator already placed.
+        # a second tenant to users the operator already placed. utils/tenancy_reconcile.py then
+        # finds no mapping for the stashed tenant ids and refuses rather than guessing.
+        print(
+            "\ncape_tenancy: users_tenant has legacy tenants but cape_tenancy is already configured; "
+            "not importing them (see utils/tenancy_reconcile.py --drop-legacy-tenants)"
+        )
         return
 
     existing_users = set(User.objects.using(alias).values_list("pk", flat=True))
@@ -117,13 +132,16 @@ def import_legacy_tenancy(apps, schema_editor):
         if row["user_id"] in existing_users:
             members.setdefault(row["tenant_id"], []).append((row["user_id"], bool(row["is_tenant_admin"])))
 
+    max_group = Group.objects.using(alias).aggregate(m=models.Max("id"))["m"] or 0
+    next_id = max(max_group, max(row["id"] for row in legacy_tenants)) + 1
     created = False
     for row in legacy_tenants:
         if not row["active"]:
             LegacyTenantMap.objects.using(alias).create(legacy_tenant_id=row["id"], tenant=None)
             continue
         slug = row["slug"]
-        group = Group.objects.using(alias).create(name=_free_group_name(Group, alias, f"tenant-{slug}"))
+        group = _new_group(Group, alias, f"tenant-{slug}", next_id)
+        next_id += 1
         tenant = Tenant(
             id=group.id,
             slug=slug,
@@ -140,8 +158,10 @@ def import_legacy_tenancy(apps, schema_editor):
         admin_ids = [uid for uid, is_admin in tenant_members if is_admin]
         admin_group = None
         if admin_ids or tenant.admin_idp_groups:
-            admin_group = Group.objects.using(alias).create(name=_free_group_name(Group, alias, f"tenant-{slug}-admins"))
-            _policy(Policy, alias, admin_group, tenant, admin=True, idp_groups=tenant.admin_idp_groups)
+            admin_group = _new_group(Group, alias, f"tenant-{slug}-admins", next_id)
+            next_id += 1
+            # Not IdP-managed by itself: an admin IdP group grants admin only with a member match.
+            _policy(Policy, alias, admin_group, tenant, admin=True, idp_groups=[])
 
         for user in User.objects.using(alias).filter(pk__in=[uid for uid, _ in tenant_members]):
             user.groups.add(group)
@@ -150,9 +170,9 @@ def import_legacy_tenancy(apps, schema_editor):
         LegacyTenantMap.objects.using(alias).create(legacy_tenant_id=row["id"], tenant=tenant)
 
     if created:
-        # Tenant ids were set explicitly (to their Group's id): move the sequence past them.
+        # Group and Tenant ids were set explicitly: move both sequences past them.
         with connection.cursor() as cursor:
-            for sql in connection.ops.sequence_reset_sql(no_style(), [Tenant]):
+            for sql in connection.ops.sequence_reset_sql(no_style(), [Group, Tenant]):
                 cursor.execute(sql)
 
 

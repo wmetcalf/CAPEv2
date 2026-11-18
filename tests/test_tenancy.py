@@ -2506,7 +2506,7 @@ def test_reconcile_dry_run_does_not_initialize_empty_database(monkeypatch, tmp_p
     sqlite3.connect(path).close()
     dsn = f"sqlite:///{path}"
     dbs = []
-    monkeypatch.setattr(database_mod, "init_database", lambda: dbs.append(database_mod._Database(dsn=dsn)))
+    monkeypatch.setattr(database_mod, "init_database", lambda **kw: dbs.append(database_mod._Database(dsn=dsn)))
     monkeypatch.setattr(database_mod, "Database", lambda: dbs[-1])
     off = types.SimpleNamespace(enabled=False)
     monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
@@ -2602,7 +2602,7 @@ def test_reconcile_full_run_on_just_upgraded_db_creates_missing_acl(monkeypatch,
     with engine.begin() as conn:
         conn.execute(sa.text("DROP TABLE IF EXISTS task_acl"))
     initialized = []
-    monkeypatch.setattr(database_mod, "init_database", lambda: initialized.append(True))
+    monkeypatch.setattr(database_mod, "init_database", lambda **kw: initialized.append(True))
     monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
     monkeypatch.setattr(acl_mod, "_acl_schema_ready", set())
     monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
@@ -2644,7 +2644,7 @@ def test_reconcile_refusal_preflights_all_stores_before_any_write(monkeypatch, t
         conn.execute(sa.text("INSERT INTO users_userprofile VALUES (1, 1)"))
     before = path.read_bytes()
     initialized = []
-    monkeypatch.setattr(database_mod, "init_database", lambda: initialized.append(True))
+    monkeypatch.setattr(database_mod, "init_database", lambda **kw: initialized.append(True))
     monkeypatch.setattr(database_mod, "Database", lambda: types.SimpleNamespace(engine=engine))
     monkeypatch.setattr(config_mod, "Config", lambda name=None: types.SimpleNamespace(
         database=types.SimpleNamespace(connection=f"sqlite:///{path}", psql_ssl_mode="disable"),

@@ -726,6 +726,43 @@ def machine_name_by_label(db: Any = None) -> Any:
     return _lookup
 
 
+def reconcile_tenant_admin_groups(user: Any, claimed_idp_groups: Iterable[str], *, tenants: Optional[Sequence[Any]] = None) -> None:
+    """Apply `Tenant.admin_idp_groups` to the tenant's admin Groups on SSO login.
+
+    For a Tenant with `idp_groups`, the Groups whose policy is an
+    `is_tenant_admin_group` pointing at that Tenant are granted only while the user's claims
+    match one of the tenant's `idp_groups` AND one of its `admin_idp_groups` (an admin IdP
+    group alone grants nothing) and the Tenant is active, and removed otherwise. Tenants without `idp_groups` are
+    managed locally and left alone.
+    """
+    # Errors propagate (as in reconcile_idp_groups_to_django_groups): a login that cannot
+    # revoke admin rights must not complete with them.
+    claimed = {str(g).strip() for g in (claimed_idp_groups or []) if str(g or "").strip()}
+    from django.conf import settings
+
+    user_groups = getattr(user, "groups", None)
+    if not settings.configured or user_groups is None:
+        return
+    from lib.tenancy.models import GroupSandboxPolicy, Tenant
+
+    if tenants is None:
+        tenants = list(Tenant.objects.all())
+    for tenant in tenants:
+        members = {str(g).strip() for g in (tenant.idp_groups or []) if str(g or "").strip()}
+        if not members:
+            continue
+        admins = {str(g).strip() for g in (tenant.admin_idp_groups or []) if str(g or "").strip()}
+        groups = [
+            p.group for p in GroupSandboxPolicy.objects.filter(tenant=tenant, is_tenant_admin_group=True).select_related("group")
+        ]
+        if not groups:
+            continue
+        if tenant.active and claimed & members and claimed & admins:
+            user_groups.add(*groups)
+        else:
+            user_groups.remove(*groups)
+
+
 def reconcile_idp_groups_to_django_groups(
     user: Any,
     claimed_idp_groups: Iterable[str],

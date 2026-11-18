@@ -3,8 +3,8 @@
 Idempotently removes inline tasks.tenant_id and tasks.visibility columns on deployments
 that previously applied 3a1b_tenant_visibility before multi-tenancy moved out of core.
 
-Before dropping them, every task that carries tenancy information (a tenant_id, or a
-visibility other than private) is copied verbatim into the `tasks_legacy_tenancy` side
+Before dropping them, every task that carries tenancy information (a tenant_id or a
+visibility) is copied verbatim into the `tasks_legacy_tenancy` side
 table. Core does not interpret those values: the old tenant ids belong to a Tenant table
 that no longer exists, so mapping them is left to whichever tenancy plugin is installed
 (`lib.tenancy` consumes and drops the table in `utils/tenancy_reconcile.py`).
@@ -42,7 +42,8 @@ def _stash_inline_tenancy(bind, insp, columns):
     if "tenant_id" in columns:
         carries.append("t.tenant_id IS NOT NULL")
     if "visibility" in columns:
-        carries.append("(t.visibility IS NOT NULL AND t.visibility <> 'private')")
+        # Private too: an explicit record keeps a stale report stamp from overriding it later.
+        carries.append("t.visibility IS NOT NULL")
     bind.execute(
         sa.text(
             f"INSERT INTO {LEGACY_TABLE} (task_id, tenant_id, visibility) "
