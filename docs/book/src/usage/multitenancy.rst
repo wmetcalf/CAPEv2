@@ -89,8 +89,31 @@ Upgrading from an install that ran the earlier inline tenancy code: those
 reports already carry an ``info.tenant_id`` stamp, but from the old ``Tenant``
 table ids, which can collide with the Django ``Group`` ids used now and expose a
 report to the wrong tenant. The backfills above skip already-stamped reports, so
-restamp them from ``task_acl`` instead. Stop the web and processing services,
-then run (MongoDB and/or Elasticsearch, whichever is enabled)::
+restamp them from ``task_acl`` instead.
+
+The upgrade keeps the old tenancy rather than dropping it:
+
+* The CAPE database migration (``alembic upgrade head`` in ``utils/db_migration``,
+  see :doc:`../installation/upgrade`) copies each task's inline ``tenant_id`` /
+  ``visibility`` into a ``tasks_legacy_tenancy`` side table before dropping the
+  columns. Core does not interpret those values.
+* ``python3 manage.py migrate`` in ``web/`` (``cape_tenancy`` migration 0002,
+  with ``[multitenancy] enabled``) turns each active legacy tenant into a new
+  Django Group ``tenant-<slug>`` (plus ``tenant-<slug>-admins`` for its tenant
+  admins) with a tenant-boundary ``GroupSandboxPolicy`` that allows every
+  machine, tag and route and carries the legacy IdP groups, so SSO login keeps
+  syncing membership. Its tenant id is that new Group's id, never the old one,
+  so it cannot merge with an existing Group. Inactive legacy tenants get no
+  Group. It runs only while ``cape_tenancy`` is still empty; an install already
+  using it is left alone.
+* ``utils/tenancy_reconcile.py`` (below) writes the stashed tasks into
+  ``task_acl`` under those new tenant ids and drops the side table. Private
+  tasks stay owner-only; tasks of inactive or unknown tenants become
+  owner-only. It exits 2 if the web migration has not run yet; pass
+  ``--drop-legacy-tenants`` to carry the tasks without their tenant instead.
+
+Run the web migration first, then stop the web and processing services and run
+(MongoDB and/or Elasticsearch, whichever is enabled)::
 
     poetry run python utils/tenancy_reconcile.py --dry-run
     poetry run python utils/tenancy_reconcile.py --adopt-public-from-reports
@@ -104,7 +127,8 @@ In addition to restamping MongoDB and Elasticsearch reports from ``task_acl``,
   ``--adopt-public-from-reports``; pass ``--demote-public`` instead to demote
   unrecorded public reports to ``private``).
 * Drops the legacy ``users_userprofile.is_tenant_admin`` column left behind by
-  the retired ``users.0004`` migration if present on the SQL database.
+  the retired ``users.0004`` migration if present on the SQL database, once
+  ``cape_tenancy`` migration 0002 has imported the tenant admins from it.
 
 A report with no ``task_acl`` row is restamped ``private`` to its task's
 submitter (``tasks.user_id``), as the web UI already resolves it, or to no one,
