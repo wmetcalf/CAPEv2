@@ -544,7 +544,7 @@ bootstrap_tenancy(Config("cuckoo"), settings_globals=globals())
 
 from lib.cuckoo.core.database import init_database
 
-init_database()
+init_database(exists_ok=True)  # utils/tenancy_reconcile.py loads these settings after its own init
 
 # Prevent Django's and Werkzeug's auto-reloader from scanning/watching files inside workers/ folder
 RUNSERVER_PLUS_EXCLUDE_PATTERNS = [*globals().get("RUNSERVER_PLUS_EXCLUDE_PATTERNS", []), "*/workers/*"]
