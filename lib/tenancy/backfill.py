@@ -390,14 +390,17 @@ def load_legacy_tenant_map() -> Optional[Dict[int, Optional[int]]]:
     """
     import os
 
+    from lib.cuckoo.common.constants import CUCKOO_ROOT
+
+    web = os.path.join(CUCKOO_ROOT, "web")
+    cwd = os.getcwd()
     try:
         import django
         from django.apps import apps
 
+        # web/web/settings.py names its SQLite database relative to web/ (as manage.py runs there).
+        os.chdir(web)
         if not apps.ready:
-            from lib.cuckoo.common.constants import CUCKOO_ROOT
-
-            web = os.path.join(CUCKOO_ROOT, "web")
             if web not in sys.path:
                 sys.path.insert(0, web)
             os.environ.setdefault("DJANGO_SETTINGS_MODULE", "web.settings")
@@ -414,6 +417,8 @@ def load_legacy_tenant_map() -> Optional[Dict[int, Optional[int]]]:
     except Exception as error:  # noqa: BLE001 - any failure means "not available", and the caller refuses
         print(f"could not read the legacy tenant map from the web database: {error}", file=sys.stderr)
         return None
+    finally:
+        os.chdir(cwd)
 
 
 def staged_legacy_tenancy(engine) -> Optional[Dict[str, Any]]:
