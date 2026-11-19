@@ -208,6 +208,31 @@ if HAVE_DJANGO:
         def __str__(self) -> str:
             return f"SandboxPolicy({self.group.name})"
 
+    class LegacyTenantMap(models.Model):
+        """Where a pre-plugin inline-tenancy tenant id went (written by migration 0002, read by reconcile).
+
+        `tenant` is NULL for a legacy tenant that was inactive: its tasks are carried tenantless.
+        `member_group` / `admin_group` are the Groups 0002 created for it; SSO login applies the
+        legacy admin rule to `admin_group` only (`reconcile_legacy_admin_groups`).
+        """
+
+        legacy_tenant_id = models.IntegerField(primary_key=True)
+        tenant = models.ForeignKey(
+            Tenant,
+            null=True,
+            blank=True,
+            on_delete=models.SET_NULL,
+            related_name="legacy_ids",
+        )
+        member_group = models.ForeignKey(Group, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+        admin_group = models.ForeignKey(Group, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+
+        class Meta:
+            app_label = "cape_tenancy"
+
+        def __str__(self) -> str:
+            return f"legacy tenant {self.legacy_tenant_id} -> {self.tenant_id}"
+
 
 __all__ = [
     "HAVE_DJANGO",

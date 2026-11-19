@@ -9,7 +9,11 @@ from sqlalchemy import String, cast, select
 from sqlalchemy.orm import Session
 
 from lib.tenancy.acl import TaskAcl
-from lib.tenancy.policy import PRIVATE, PUBLIC, VISIBILITIES
+from lib.tenancy.policy import PRIVATE, PUBLIC, TENANT, VISIBILITIES
+
+# Written by core alembic migration 6 when it drops the inline tasks.tenant_id / visibility columns.
+LEGACY_TENANCY_TABLE = "tasks_legacy_tenancy"
+LEGACY_IMPORT_MIGRATION = ("cape_tenancy", "0002_import_legacy_users_tenant")
 
 
 def backfill_legacy_uniform(
@@ -378,16 +382,178 @@ def _is_multitenancy_enabled() -> bool:
         return False
 
 
-def cleanup_legacy_inline_schema(engine, *, dry_run: bool = False) -> Dict[str, int]:
-    """Clean up legacy inline-tenancy SQL state (`tasks.visibility='public'` and `users_userprofile.is_tenant_admin`)."""
+def load_legacy_tenant_map() -> Optional[Dict[int, Optional[int]]]:
+    """Return `{legacy tenant id: tenant id or None}` from cape_tenancy, or None when unavailable.
+
+    None means the web side has not imported the legacy tenants yet (cape_tenancy not installed,
+    its migration 0002 not applied, or Django not configurable from here).
+    """
+    import os
+
+    from lib.cuckoo.common.constants import CUCKOO_ROOT
+
+    web = os.path.join(CUCKOO_ROOT, "web")
+    cwd = os.getcwd()
+    try:
+        import django
+        from django.apps import apps
+
+        # web/web/settings.py names its SQLite database relative to web/ (as manage.py runs there).
+        os.chdir(web)
+        if not apps.ready:
+            if web not in sys.path:
+                sys.path.insert(0, web)
+            os.environ.setdefault("DJANGO_SETTINGS_MODULE", "web.settings")
+            django.setup()
+        if not apps.is_installed("lib.tenancy"):
+            return None
+        from django.db import connection
+        from django.db.migrations.recorder import MigrationRecorder
+
+        if LEGACY_IMPORT_MIGRATION not in MigrationRecorder(connection).applied_migrations():
+            return None
+        model = apps.get_model("cape_tenancy", "LegacyTenantMap")
+        return {int(m.legacy_tenant_id): m.tenant_id for m in model.objects.all()}
+    except Exception as error:  # noqa: BLE001 - any failure means "not available", and the caller refuses
+        print(f"could not read the legacy tenant map from the web database: {error}", file=sys.stderr)
+        return None
+    finally:
+        os.chdir(cwd)
+
+
+def staged_legacy_tenancy(engine) -> Optional[Dict[str, Any]]:
+    """Summarize LEGACY_TENANCY_TABLE: None if absent, else its legacy tenant ids and the public task ids it will carry."""
+    import sqlalchemy as sa
+
+    with engine.connect() as conn:
+        if LEGACY_TENANCY_TABLE not in set(sa.inspect(conn).get_table_names()):
+            return None
+        tenant_ids = {
+            int(r[0])
+            for r in conn.execute(
+                sa.text(f"SELECT DISTINCT tenant_id FROM {LEGACY_TENANCY_TABLE} WHERE tenant_id IS NOT NULL")
+            )
+        }
+        # Only rows whose task still exists are carried (see _legacy_acl_rows).
+        public = {
+            int(r[0])
+            for r in conn.execute(
+                sa.text(
+                    f"SELECT l.task_id FROM {LEGACY_TENANCY_TABLE} l JOIN tasks t ON t.id = l.task_id "
+                    "WHERE l.visibility = 'public'"
+                )
+            )
+        }
+    return {"has_tenants": bool(tenant_ids), "tenant_ids": tenant_ids, "public_task_ids": public}
+
+
+def _legacy_acl_rows(conn, tables, tenant_map: Dict[int, Optional[int]], carry_public: bool) -> List[Dict[str, Any]]:
+    """task_acl rows for the stashed legacy tasks: legacy tenant ids remapped, fail-closed otherwise."""
+    import sqlalchemy as sa
+
+    sql = (
+        f"SELECT l.task_id, l.tenant_id, l.visibility, t.user_id FROM {LEGACY_TENANCY_TABLE} l "
+        "JOIN tasks t ON t.id = l.task_id"
+    )
+    if "task_acl" in tables:
+        sql += " WHERE NOT EXISTS (SELECT 1 FROM task_acl a WHERE a.task_id = l.task_id)"
+    rows = []
+    for task_id, legacy_tenant, visibility, user_id in conn.execute(sa.text(sql)):
+        vis = visibility if visibility in (PUBLIC, TENANT) else PRIVATE
+        if vis == PUBLIC and not carry_public:
+            continue
+        tenant = tenant_map.get(int(legacy_tenant)) if legacy_tenant is not None else None
+        if vis == TENANT and tenant is None:
+            vis = PRIVATE  # its tenant is gone (inactive or unknown): owner-only
+        if vis == PRIVATE:
+            tenant = None  # legacy private was owner-only; a tenant here would open it to tenant admins
+        rows.append(
+            {"task_id": int(task_id), "user_id": user_id or None, "tenant_id": tenant, "visibility": vis, "visibility_seq": 1}
+        )
+    return rows
+
+
+def _legacy_admins_pending(conn, tables, drop_legacy_tenants: bool) -> bool:
+    """True while cape_tenancy migration 0002 has yet to read users_userprofile.is_tenant_admin."""
+    import sqlalchemy as sa
+
+    # drop_legacy_tenants only changes how stashed tasks are carried: cape_tenancy 0002 still
+    # imports the tenants on the next `manage.py migrate`, so keep the column it reads (0002
+    # drops it itself afterwards).
+    if "users_tenant" not in tables or not _is_multitenancy_enabled():
+        return False  # no import will run
+    if conn.execute(sa.text("SELECT 1 FROM users_tenant LIMIT 1")).first() is None:
+        return False
+    return not _legacy_import_applied(conn, tables)
+
+
+def _legacy_import_applied(conn, tables) -> bool:
+    import sqlalchemy as sa
+
+    if "django_migrations" not in tables:
+        return False
+    app, name = LEGACY_IMPORT_MIGRATION
+    return (
+        conn.execute(sa.text("SELECT 1 FROM django_migrations WHERE app = :a AND name = :n"), {"a": app, "n": name}).first()
+        is not None
+    )
+
+
+def cleanup_legacy_inline_schema(
+    engine,
+    *,
+    dry_run: bool = False,
+    tenant_map: Optional[Dict[int, Optional[int]]] = None,
+    drop_legacy_tenants: bool = False,
+) -> Dict[str, int]:
+    """Clean up legacy inline-tenancy SQL state.
+
+    Carries `tasks.visibility='public'` (inline columns still present) or the rows alembic
+    migration 6 stashed in LEGACY_TENANCY_TABLE into `task_acl`, remapping legacy tenant ids
+    through `tenant_map` (see `load_legacy_tenant_map`), then drops the stash and
+    `users_userprofile.is_tenant_admin`.
+    """
     import sqlalchemy as sa
 
     from lib.tenancy.acl import ensure_acl_schema
 
-    stats = {"public_tasks_carried": 0, "dropped_is_tenant_admin": 0}
+    stats = {"public_tasks_carried": 0, "legacy_tasks_carried": 0, "dropped_is_tenant_admin": 0}
     with engine.begin() as conn:
         insp = sa.inspect(conn)
         tables = set(insp.get_table_names())
+        if LEGACY_TENANCY_TABLE in tables:
+            has_tenant_rows = (
+                conn.execute(sa.text(f"SELECT 1 FROM {LEGACY_TENANCY_TABLE} WHERE tenant_id IS NOT NULL LIMIT 1")).first()
+                is not None
+            )
+            carry_public = _is_multitenancy_enabled() or has_tenant_rows
+            rows = _legacy_acl_rows(conn, tables, tenant_map or {}, carry_public)
+            stats["legacy_tasks_carried"] = len(rows)
+            if not dry_run:
+                if rows:
+                    if "task_acl" not in tables:
+                        ensure_acl_schema(conn)
+                        tables.add("task_acl")
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO task_acl (task_id, user_id, tenant_id, visibility, visibility_seq) "
+                            "VALUES (:task_id, :user_id, :tenant_id, :visibility, :visibility_seq)"
+                        ),
+                        rows,
+                    )
+                if not carry_public:
+                    # Like the inline path: public is not carried while tenancy was never used, so
+                    # keep those rows for a later run with [multitenancy] enabled.
+                    conn.execute(
+                        sa.text(
+                            f"DELETE FROM {LEGACY_TENANCY_TABLE} WHERE visibility IS NULL OR visibility <> 'public' "
+                            "OR task_id NOT IN (SELECT id FROM tasks)"
+                            + (" OR task_id IN (SELECT task_id FROM task_acl)" if "task_acl" in tables else "")
+                        )
+                    )
+                left = conn.execute(sa.text(f"SELECT 1 FROM {LEGACY_TENANCY_TABLE} LIMIT 1")).first()
+                if carry_public or left is None:
+                    conn.execute(sa.text(f"DROP TABLE {LEGACY_TENANCY_TABLE}"))
         if "tasks" in tables:
             columns = {c["name"] for c in insp.get_columns("tasks")}
             if "visibility" in columns:
@@ -424,7 +590,8 @@ def cleanup_legacy_inline_schema(engine, *, dry_run: bool = False) -> Dict[str, 
                             stats["public_tasks_carried"] = int(res.rowcount or 0)
         if "users_userprofile" in tables:
             up_cols = {c["name"] for c in insp.get_columns("users_userprofile")}
-            if "is_tenant_admin" in up_cols:
+            # The web migration that imports legacy tenant admins reads this column: keep it until then.
+            if "is_tenant_admin" in up_cols and not _legacy_admins_pending(conn, tables, drop_legacy_tenants):
                 if not dry_run:
                     conn.execute(sa.text("ALTER TABLE users_userprofile DROP COLUMN is_tenant_admin"))
                 stats["dropped_is_tenant_admin"] = 1
@@ -535,6 +702,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="demote tenantless public reports that have no task_acl row to private",
     )
     parser.add_argument(
+        "--drop-legacy-tenants",
+        action="store_true",
+        help="carry stashed pre-plugin tasks without their tenant (tenant-shared ones become private) when the "
+        "web side cannot map the legacy tenant ids (cape_tenancy not installed or not migrated)",
+    )
+    parser.add_argument(
         "--force", action="store_true", help="run although this node looks like a worker (only on the main/central server)"
     )
     args = parser.parse_args(argv)
@@ -557,7 +730,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # A just-upgraded pre-stack install has no task_acl yet, and the read-only preflight
             # needs one. Creating the empty table is schema-only: no task data and no report store
             # is written, and with no rows every tenantless public report is (correctly) unrecorded.
-            init_database()
+            init_database(exists_ok=True)  # loading the web settings for the tenant map may have run it
             engine = Database().engine
             ensure_acl_schema_once(engine)
             try:
@@ -579,6 +752,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             preflight_engine.dispose()
         if result:
             return result
+        unrecorded_public.clear()  # entries the preflight forgave (stashed public tasks) must not resurface
 
     if args.dry_run:
         try:
@@ -588,7 +762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
     else:
         if engine is None:
-            init_database()
+            init_database(exists_ok=True)  # loading the web settings for the tenant map may have run it
             engine = Database().engine
         ensure_acl_schema_once(engine)
     try:
@@ -619,7 +793,39 @@ def _run_reconcile(args, engine, reporting, abort_on_unrecorded_public, unrecord
                 file=sys.stderr,
             )
             return 2
-        cleanup_legacy_inline_schema(engine, dry_run=args.dry_run)
+        staged = staged_legacy_tenancy(engine)
+        tenant_map: Optional[Dict[int, Optional[int]]] = {}
+        if staged is not None and staged["has_tenants"]:
+            tenant_map = load_legacy_tenant_map()
+            unmapped = sorted(staged["tenant_ids"] - set(tenant_map)) if tenant_map is not None else None
+            if tenant_map is not None and unmapped and not args.drop_legacy_tenants:
+                print(
+                    f"{LEGACY_TENANCY_TABLE} holds tasks of legacy tenant id(s) {unmapped[:20]} that the web "
+                    "database's cape_tenancy legacy tenant map does not cover (its import was skipped or the "
+                    "tenant row is gone); pass --drop-legacy-tenants to carry those tasks without their tenant",
+                    file=sys.stderr,
+                )
+                return 2
+            if tenant_map is None:
+                if not args.drop_legacy_tenants:
+                    print(
+                        f"{LEGACY_TENANCY_TABLE} holds tasks of pre-plugin tenants, but the web database has no "
+                        "cape_tenancy legacy tenant map: enable [multitenancy] and run `python3 manage.py migrate` "
+                        "in web/ first, or pass --drop-legacy-tenants to carry those tasks without their tenant",
+                        file=sys.stderr,
+                    )
+                    return 2
+                tenant_map = {}
+        cleanup_legacy_inline_schema(
+            engine, dry_run=args.dry_run, tenant_map=tenant_map, drop_legacy_tenants=args.drop_legacy_tenants
+        )
+        # A dry run carries nothing, so the stashed public tasks still lack a task_acl row: they are
+        # recorded (in the stash), not "unrecorded public reports" needing --adopt/--demote.
+        pending_public = (
+            staged["public_task_ids"]
+            if staged is not None and args.dry_run and (_is_multitenancy_enabled() or staged["has_tenants"])
+            else set()
+        )
         if reporting.mongodb.enabled:
             from pymongo import UpdateOne
 
@@ -675,9 +881,10 @@ def _run_reconcile(args, engine, reporting, abort_on_unrecorded_public, unrecord
                 skipped=skipped,
             )
             _report("elasticsearch", n, skipped)
-        if abort_on_unrecorded_public and unrecorded_public:
+        remaining_public = [t for t in unrecorded_public if t not in pending_public]
+        if abort_on_unrecorded_public and remaining_public:
             print(
-                f"found {len(unrecorded_public)} public report(s) with no task_acl row (tasks: {unrecorded_public[:20]}); "
+                f"found {len(remaining_public)} public report(s) with no task_acl row (tasks: {remaining_public[:20]}); "
                 "re-run with --adopt-public-from-reports (or --preserve-public) to record them in task_acl, "
                 "or --demote-public to restamp them private",
                 file=sys.stderr,
