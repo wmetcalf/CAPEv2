@@ -172,7 +172,7 @@ def test_cleanup_keeps_is_tenant_admin_until_web_import_ran(monkeypatch):
     assert "is_tenant_admin" not in {c["name"] for c in sa.inspect(engine).get_columns("users_userprofile")}
 
 
-@pytest.mark.parametrize("case", ["no_rows", "tenancy_off", "dropped"])
+@pytest.mark.parametrize("case", ["no_rows", "tenancy_off"])
 def test_cleanup_drops_is_tenant_admin_when_no_import_will_read_it(monkeypatch, case):
     import lib.tenancy.backfill as backfill
 
@@ -185,8 +185,22 @@ def test_cleanup_drops_is_tenant_admin_when_no_import_will_read_it(monkeypatch, 
             conn.execute(sa.text("INSERT INTO users_tenant VALUES (1)"))
         conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
     monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: case != "tenancy_off")
-    stats = backfill.cleanup_legacy_inline_schema(engine, drop_legacy_tenants=case == "dropped")
+    stats = backfill.cleanup_legacy_inline_schema(engine)
     assert stats["dropped_is_tenant_admin"] == 1
+
+
+def test_drop_legacy_tenants_still_keeps_is_tenant_admin_for_the_pending_import(monkeypatch):
+    import lib.tenancy.backfill as backfill
+
+    # --drop-legacy-tenants does not stop cape_tenancy 0002 from importing the tenants later.
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY)"))
+        conn.execute(sa.text("INSERT INTO users_tenant VALUES (1)"))
+        conn.execute(sa.text("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, is_tenant_admin BOOL)"))
+    monkeypatch.setattr(backfill, "_is_multitenancy_enabled", lambda: True)
+    stats = backfill.cleanup_legacy_inline_schema(engine, drop_legacy_tenants=True)
+    assert stats["dropped_is_tenant_admin"] == 0
 
 
 def test_cleanup_keeps_stashed_public_rows_it_does_not_carry(monkeypatch):
@@ -366,16 +380,12 @@ from lib.tenancy.hooks import _reconcile_login_groups
 # SSO revocation still works: a login without the IdP group drops the member group.
 _reconcile_login_groups(User.objects.get(pk=alice.pk), {"other"})
 assert res(alice)[0] is None, res(alice)
-# An admin IdP group alone grants nothing (legacy: admin only together with a member match)...
-_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme-admin"})
-assert res(alice)[:2] == (None, False), res(alice)
-# ...with the member group it grants tenant admin, and losing the member group revokes it.
+# The admin Group is not IdP-managed: admin claims grant nothing, and a login keeps local admins.
 _reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme", "sso-acme-admin"})
-assert res(alice)[:2] == (m[1], True), res(alice)
+assert res(alice)[:2] == (m[1], False), res(alice)
 _reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme"})
-assert res(carol)[:2] == (m[1], False), res(carol)
-_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme-admin"})
-assert res(alice)[:2] == (None, False), res(alice)
+assert res(carol)[:2] == (m[1], True), res(carol)
+assert GroupSandboxPolicy.objects.get(group__name="tenant-acme-admins").idp_groups == []
 
 # Re-running finds cape_tenancy populated and does nothing more.
 n_groups = Group.objects.count()
@@ -416,4 +426,42 @@ print("OK")
 """
     env = {k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"}
     res = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, cwd=ROOT)
+    assert res.returncode == 0 and "OK" in res.stdout, f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}"
+
+
+@pytest.mark.parametrize("stash", [False, True])
+def test_django_import_ids_skip_deleted_legacy_tenant_ids(stash):
+    pytest.importorskip("django")
+    script = r"""
+import sys
+import django
+from django.conf import settings
+settings.configure(
+    INSTALLED_APPS=["django.contrib.auth", "django.contrib.contenttypes", "lib.tenancy.apps.CapeTenancyConfig"],
+    DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+    DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
+)
+django.setup()
+from django.core.management import call_command
+from django.db import connection
+call_command("migrate", "auth", verbosity=0)
+stash = sys.argv[1] == "True"
+with connection.cursor() as c:
+    # users_tenant as Django created it (AUTOINCREMENT): tenant 3 was deleted, its tasks keep id 3.
+    c.execute("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY AUTOINCREMENT, slug VARCHAR(48), name VARCHAR(128), idp_groups TEXT, admin_idp_groups TEXT, active BOOL, created_at DATETIME)")
+    for slug in ("acme", "globex", "trial"):
+        c.execute("INSERT INTO users_tenant (slug, name, idp_groups, admin_idp_groups, active, created_at) VALUES (%s, %s, '[]', '[]', 1, '2026-01-01')", [slug, slug])
+    c.execute("DELETE FROM users_tenant WHERE slug = 'trial'")
+    if stash:
+        # The alembic stash shares this database and still names an older deleted tenant 7.
+        c.execute("CREATE TABLE tasks_legacy_tenancy (task_id INTEGER PRIMARY KEY, tenant_id INTEGER, visibility VARCHAR(16))")
+        c.execute("INSERT INTO tasks_legacy_tenancy VALUES (1, 7, 'tenant')")
+call_command("migrate", "cape_tenancy", verbosity=0)
+from lib.tenancy.models import LegacyTenantMap
+m = {r.legacy_tenant_id: r.tenant_id for r in LegacyTenantMap.objects.all()}
+assert min(m.values()) > (7 if stash else 3), m
+print("OK")
+"""
+    env = {k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"}
+    res = subprocess.run([sys.executable, "-c", script, str(stash)], capture_output=True, text=True, env=env, cwd=ROOT)
     assert res.returncode == 0 and "OK" in res.stdout, f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}"

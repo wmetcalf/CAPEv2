@@ -10,13 +10,18 @@ whatever Group has id 1. Instead, each active legacy tenant becomes:
 * when it had admins, an admin Group `tenant-<slug>-admins` pointing at the same `Tenant`, with
   `is_tenant_admin_group` set;
 * the member policy carries the legacy `idp_groups`, so SSO login keeps syncing membership (a
-  revoked IdP group removes the user) instead of freezing it in rows; the Tenant keeps
-  `admin_idp_groups`, which login applies to the admin Group only together with a member match
-  (`reconcile_tenant_admin_groups`), as the legacy code did.
+  revoked IdP group removes the user) instead of freezing it in rows.
 
-New Groups get ids above every existing Group id and every legacy tenant id, so until
-`utils/tenancy_reconcile.py` restamps them, no report still carrying a legacy tenant id can
-match a new tenant.
+The admin Group is not IdP-managed: the legacy rule granted admin only for a member match AND an
+`admin_idp_groups` match, which a policy's `idp_groups` (any one claim) cannot express, and
+mapping `admin_idp_groups` there would make that claim alone grant tenant access and admin.
+Legacy local admins are imported as members of it; `Tenant.admin_idp_groups` is kept for the
+operator, who can map an IdP group onto the admin policy deliberately.
+
+New Groups get ids above every existing Group id and every legacy tenant id ever issued (the
+`users_tenant` sequence and any id still stamped in the alembic stash, which covers deleted
+tenants), so until `utils/tenancy_reconcile.py` restamps them, no report still carrying a legacy
+tenant id can match a new tenant.
 
 Policies grant every machine, tag and route: the legacy tenancy had no resource limits.
 Inactive legacy tenants get no Group. `LegacyTenantMap` records where each legacy id went;
@@ -63,6 +68,35 @@ def _free_group_name(Group, alias, base):
         name = base[: 150 - len(suffix)] + suffix
         n += 1
     return name
+
+
+def _legacy_id_high_water(connection, tables):
+    """Highest legacy tenant id ever issued, including deleted tenants (0 if unknown)."""
+    from django.db import transaction
+
+    probes = []
+    if connection.vendor == "sqlite":
+        probes.append("SELECT seq FROM sqlite_sequence WHERE name = 'users_tenant'")
+    elif connection.vendor == "postgresql":
+        probes.append("SELECT last_value FROM pg_sequences WHERE sequencename = 'users_tenant_id_seq'")
+    elif connection.vendor == "mysql":
+        probes.append(
+            "SELECT AUTO_INCREMENT - 1 FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users_tenant'"
+        )
+    if "tasks_legacy_tenancy" in tables:  # alembic stash, when it shares this database
+        probes.append("SELECT MAX(tenant_id) FROM tasks_legacy_tenancy")
+    high = 0
+    for sql in probes:
+        try:
+            with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
+                cursor.execute(sql)
+                row = cursor.fetchone()
+        except Exception:
+            continue
+        if row and row[0] is not None:
+            high = max(high, int(row[0]))
+    return high
 
 
 def _new_group(Group, alias, base, next_id):
@@ -133,7 +167,7 @@ def import_legacy_tenancy(apps, schema_editor):
             members.setdefault(row["tenant_id"], []).append((row["user_id"], bool(row["is_tenant_admin"])))
 
     max_group = Group.objects.using(alias).aggregate(m=models.Max("id"))["m"] or 0
-    next_id = max(max_group, max(row["id"] for row in legacy_tenants)) + 1
+    next_id = max(max_group, max(row["id"] for row in legacy_tenants), _legacy_id_high_water(connection, tables)) + 1
     created = False
     for row in legacy_tenants:
         if not row["active"]:
@@ -160,7 +194,7 @@ def import_legacy_tenancy(apps, schema_editor):
         if admin_ids or tenant.admin_idp_groups:
             admin_group = _new_group(Group, alias, f"tenant-{slug}-admins", next_id)
             next_id += 1
-            # Not IdP-managed by itself: an admin IdP group grants admin only with a member match.
+            # Not IdP-managed: see the module docstring.
             _policy(Policy, alias, admin_group, tenant, admin=True, idp_groups=[])
 
         for user in User.objects.using(alias).filter(pk__in=[uid for uid, _ in tenant_members]):
