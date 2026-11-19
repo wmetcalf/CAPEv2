@@ -343,13 +343,13 @@ call_command("migrate", "auth", verbosity=0)
 from django.contrib.auth.models import Group, User
 # An existing Group 1 would have merged with legacy tenant 1 had the ids been kept.
 staff = Group.objects.create(id=1, name="staff")
-alice, carol, bob, dave, erin = (User.objects.create_user(username=n) for n in ("alice", "carol", "bob", "dave", "erin"))
+alice, carol, bob, dave, erin, frank = (User.objects.create_user(username=n) for n in ("alice", "carol", "bob", "dave", "erin", "frank"))
 staff.user_set.add(dave)
 with connection.cursor() as c:
     c.execute("CREATE TABLE users_tenant (id INTEGER PRIMARY KEY, slug VARCHAR(48), name VARCHAR(128), idp_groups TEXT, admin_idp_groups TEXT, active BOOL, created_at DATETIME)")
     c.execute("INSERT INTO users_tenant VALUES (1, 'acme', 'Acme', '[\"sso-acme\"]', '[\"sso-acme-admin\"]', 1, '2026-01-01'), (2, 'globex', 'Globex', '[]', '[]', 1, '2026-01-01'), (3, 'gone', 'Gone', '[]', '[]', 0, '2026-01-01')")
     c.execute("CREATE TABLE users_userprofile (id INTEGER PRIMARY KEY, user_id INTEGER, tenant_id INTEGER, is_tenant_admin BOOL)")
-    c.execute("INSERT INTO users_userprofile VALUES (1, %s, 1, 0), (2, %s, 1, 1), (3, %s, 2, 0), (4, %s, NULL, 0), (5, %s, 3, 1), (6, 999, 1, 0)" % (alice.pk, carol.pk, bob.pk, dave.pk, erin.pk))
+    c.execute("INSERT INTO users_userprofile VALUES (1, %s, 1, 0), (2, %s, 1, 1), (3, %s, 2, 0), (4, %s, NULL, 0), (5, %s, 3, 1), (6, 999, 1, 0), (7, %s, 2, 1)" % (alice.pk, carol.pk, bob.pk, dave.pk, erin.pk, frank.pk))
 call_command("migrate", "cape_tenancy", verbosity=0)
 
 from lib.tenancy.models import GroupSandboxPolicy, LegacyTenantMap, Tenant
@@ -395,6 +395,21 @@ assert res(alice)[:2] == (m[1], False), res(alice)  # admin claim revoked
 _reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme", "sso-acme-admin"})
 _reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme-admin"})
 assert res(carol)[:2] == (None, False), res(carol)  # member claim revoked drops admin too
+# A member Group kept past its claim (policy suspended) does not stand in for the member claim.
+alice_u = User.objects.get(pk=alice.pk)
+_reconcile_login_groups(alice_u, {"sso-acme"})
+GroupSandboxPolicy.objects.filter(group=acme).update(active=False)
+_reconcile_login_groups(alice_u, {"sso-acme-admin"})
+assert not alice_u.groups.filter(pk=admins.pk).exists()
+GroupSandboxPolicy.objects.filter(group=acme).update(active=True)
+# An inactive tenant grants no admin.
+Tenant.objects.filter(pk=m[1]).update(active=False)
+_reconcile_login_groups(alice_u, {"sso-acme", "sso-acme-admin"})
+assert not alice_u.groups.filter(pk=admins.pk).exists()
+Tenant.objects.filter(pk=m[1]).update(active=True)
+# A tenant without IdP groups is managed locally: SSO login leaves its admins alone.
+_reconcile_login_groups(User.objects.get(pk=frank.pk), {"unrelated"})
+assert res(frank)[:2] == (m[2], True), res(frank)
 # Only the imported admin Group is managed: a native admin Group of the tenant is left alone.
 native = Group.objects.create(name="acme-native-admins")
 GroupSandboxPolicy.objects.create(group=native, tenant=Tenant.objects.get(pk=m[1]), is_tenant_boundary=True, is_tenant_admin_group=True, idp_groups=["acme-secops"])

@@ -141,11 +141,21 @@ def _drop_legacy_admin_column(connection):
         if "users_userprofile" not in set(connection.introspection.table_names(cursor)):
             return
         cols = {c.name for c in connection.introspection.get_table_description(cursor, "users_userprofile")}
-        if "is_tenant_admin" in cols:
+    if "is_tenant_admin" not in cols:
+        return
+    from django.db import transaction
+
+    try:
+        with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
             cursor.execute(
                 f"ALTER TABLE {connection.ops.quote_name('users_userprofile')} "
                 f"DROP COLUMN {connection.ops.quote_name('is_tenant_admin')}"
             )
+    except Exception as exc:  # e.g. SQLite older than 3.35 has no DROP COLUMN
+        print(
+            f"\ncape_tenancy: could not drop users_userprofile.is_tenant_admin ({exc}); drop it by hand "
+            "or new users cannot be created"
+        )
 
 
 def _import(apps, schema_editor):
