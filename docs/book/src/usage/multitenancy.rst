@@ -104,13 +104,12 @@ The upgrade keeps the old tenancy rather than dropping it:
   machine, tag and route and carries the legacy IdP groups, so SSO login keeps
   syncing membership. Its tenant id is that new Group's id, never the old one
   (nor any id a deleted legacy tenant used), so it cannot merge with an
-  existing Group. The admins Group holds the legacy local tenant admins and is
-  not IdP-managed: the legacy rule (admin only with a member *and* an
-  ``admin_idp_groups`` match) has no policy equivalent, so map an IdP group
-  onto its policy yourself if you want SSO-driven admins (that claim alone then
-  grants tenant admin). A user whose IdP groups match several tenants now joins
-  all of them (legacy tenancy gave such a user no tenant). Inactive legacy tenants get no
-  Group. It runs only while ``cape_tenancy`` is still empty; an install already
+  existing Group. The admins Group holds the legacy local tenant admins; for a
+  tenant with IdP groups, SSO login keeps applying the legacy rule to that one
+  Group (admin only while the user is in the member Group *and* claims an
+  ``admin_idp_groups`` entry). A user whose IdP groups match several tenants
+  now joins all of them (legacy tenancy gave such a user no tenant). Inactive
+  legacy tenants get no Group. It runs only while ``cape_tenancy`` is still empty; an install already
   using it is left alone.
 * ``utils/tenancy_reconcile.py`` (below) writes the stashed tasks into
   ``task_acl`` under those new tenant ids and drops the side table. Private

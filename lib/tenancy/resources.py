@@ -726,6 +726,44 @@ def machine_name_by_label(db: Any = None) -> Any:
     return _lookup
 
 
+def reconcile_legacy_admin_groups(user: Any, claimed_idp_groups: Iterable[str]) -> None:
+    """Apply the legacy SSO admin rule to the admin Groups imported by cape_tenancy 0002.
+
+    Legacy inline tenancy recomputed an SSO user's tenant admin flag at every login: admin only
+    while the claims matched the tenant's `idp_groups` AND its `admin_idp_groups`. For each
+    imported tenant with `idp_groups`, its imported admin Group (and nothing else) is kept or
+    added only while the tenant is active, the user is in its imported member Group (as just
+    synced from the member policy) and claims an `admin_idp_groups` entry; otherwise it is
+    removed. Native tenants and other admin Groups are untouched.
+    """
+    # Errors propagate (as in reconcile_idp_groups_to_django_groups): fail closed.
+    from django.conf import settings
+
+    user_groups = getattr(user, "groups", None)
+    if not settings.configured or user_groups is None:
+        return
+    from lib.tenancy.models import LegacyTenantMap
+
+    claimed = {str(g).strip() for g in (claimed_idp_groups or []) if str(g or "").strip()}
+    rows = list(
+        LegacyTenantMap.objects.filter(tenant__isnull=False, admin_group__isnull=False).select_related(
+            "tenant", "admin_group"
+        )
+    )
+    if not rows:
+        return
+    have = set(user_groups.values_list("pk", flat=True))
+    for row in rows:
+        tenant = row.tenant
+        if not any(str(g or "").strip() for g in (tenant.idp_groups or [])):
+            continue  # membership is managed locally: leave its admins alone
+        admins = {str(g).strip() for g in (tenant.admin_idp_groups or []) if str(g or "").strip()}
+        if tenant.active and row.member_group_id in have and claimed & admins:
+            user_groups.add(row.admin_group)
+        else:
+            user_groups.remove(row.admin_group)
+
+
 def reconcile_idp_groups_to_django_groups(
     user: Any,
     claimed_idp_groups: Iterable[str],

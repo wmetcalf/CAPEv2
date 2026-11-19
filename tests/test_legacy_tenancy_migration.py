@@ -380,12 +380,23 @@ from lib.tenancy.hooks import _reconcile_login_groups
 # SSO revocation still works: a login without the IdP group drops the member group.
 _reconcile_login_groups(User.objects.get(pk=alice.pk), {"other"})
 assert res(alice)[0] is None, res(alice)
-# The admin Group is not IdP-managed: admin claims grant nothing, and a login keeps local admins.
+# The imported admin Group follows the legacy rule: member match AND admin match.
+admins = Group.objects.get(name="tenant-acme-admins")
+assert GroupSandboxPolicy.objects.get(group=admins).idp_groups == []
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme-admin"})
+assert res(alice)[:2] == (None, False), res(alice)  # admin claim alone grants nothing
 _reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme", "sso-acme-admin"})
-assert res(alice)[:2] == (m[1], False), res(alice)
-_reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme"})
-assert res(carol)[:2] == (m[1], True), res(carol)
-assert GroupSandboxPolicy.objects.get(group__name="tenant-acme-admins").idp_groups == []
+assert res(alice)[:2] == (m[1], True), res(alice)
+_reconcile_login_groups(User.objects.get(pk=alice.pk), {"sso-acme"})
+assert res(alice)[:2] == (m[1], False), res(alice)  # admin claim revoked
+_reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme", "sso-acme-admin"})
+_reconcile_login_groups(User.objects.get(pk=carol.pk), {"sso-acme-admin"})
+assert res(carol)[:2] == (None, False), res(carol)  # member claim revoked drops admin too
+# Only the imported admin Group is managed: a native admin Group of the tenant is left alone.
+native = Group.objects.create(name="acme-native-admins")
+GroupSandboxPolicy.objects.create(group=native, tenant=Tenant.objects.get(pk=m[1]), is_tenant_boundary=True, is_tenant_admin_group=True, idp_groups=["acme-secops"])
+_reconcile_login_groups(User.objects.get(pk=bob.pk), {"acme-secops"})
+assert "acme-native-admins" in set(User.objects.get(pk=bob.pk).groups.values_list("name", flat=True))
 
 # Re-running finds cape_tenancy populated and does nothing more.
 n_groups = Group.objects.count()

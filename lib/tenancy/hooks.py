@@ -1441,9 +1441,10 @@ def wrap_submission_and_web_utils(
 
 
 def _reconcile_login_groups(user: Any, idp_groups: set) -> None:
-    from lib.tenancy.resources import reconcile_idp_groups_to_django_groups
+    from lib.tenancy.resources import reconcile_idp_groups_to_django_groups, reconcile_legacy_admin_groups
 
     reconcile_idp_groups_to_django_groups(user, idp_groups)
+    reconcile_legacy_admin_groups(user, idp_groups)
 
 
 def default_sql_task_query_filter(query: Any, viewer: Optional[ViewerContext] = None) -> Any:

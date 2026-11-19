@@ -12,11 +12,11 @@ whatever Group has id 1. Instead, each active legacy tenant becomes:
 * the member policy carries the legacy `idp_groups`, so SSO login keeps syncing membership (a
   revoked IdP group removes the user) instead of freezing it in rows.
 
-The admin Group is not IdP-managed: the legacy rule granted admin only for a member match AND an
-`admin_idp_groups` match, which a policy's `idp_groups` (any one claim) cannot express, and
-mapping `admin_idp_groups` there would make that claim alone grant tenant access and admin.
-Legacy local admins are imported as members of it; `Tenant.admin_idp_groups` is kept for the
-operator, who can map an IdP group onto the admin policy deliberately.
+The admin Group's policy has no `idp_groups`: the legacy rule granted admin only for a member
+match AND an `admin_idp_groups` match, which a policy's `idp_groups` (any one claim) cannot
+express. Legacy local admins are imported into it, and for a tenant with `idp_groups` SSO login
+then applies the legacy rule to that one Group (`resources.reconcile_legacy_admin_groups`): kept
+or added only while the user is in the member Group and claims an `admin_idp_groups` entry.
 
 New Groups get ids above every existing Group id and every legacy tenant id ever issued (the
 `users_tenant` sequence and any id still stamped in the alembic stash, which covers deleted
@@ -78,7 +78,8 @@ def _legacy_id_high_water(connection, tables):
     if connection.vendor == "sqlite":
         probes.append("SELECT seq FROM sqlite_sequence WHERE name = 'users_tenant'")
     elif connection.vendor == "postgresql":
-        probes.append("SELECT last_value FROM pg_sequences WHERE sequencename = 'users_tenant_id_seq'")
+        # The sequence actually owned by users_tenant.id (search_path-resolved, serial or identity).
+        probes.append("SELECT pg_sequence_last_value(pg_get_serial_sequence('users_tenant', 'id')::regclass)")
     elif connection.vendor == "mysql":
         probes.append(
             "SELECT AUTO_INCREMENT - 1 FROM information_schema.TABLES "
@@ -92,7 +93,9 @@ def _legacy_id_high_water(connection, tables):
             with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
                 cursor.execute(sql)
                 row = cursor.fetchone()
-        except Exception:
+        except Exception as exc:
+            print(f"\ncape_tenancy: could not read a legacy tenant id high-water mark ({exc}); "
+                  "utils/tenancy_reconcile.py refuses any tenant id left unmapped")
             continue
         if row and row[0] is not None:
             high = max(high, int(row[0]))
@@ -201,7 +204,9 @@ def import_legacy_tenancy(apps, schema_editor):
             user.groups.add(group)
             if admin_group is not None and user.pk in admin_ids:
                 user.groups.add(admin_group)
-        LegacyTenantMap.objects.using(alias).create(legacy_tenant_id=row["id"], tenant=tenant)
+        LegacyTenantMap.objects.using(alias).create(
+            legacy_tenant_id=row["id"], tenant=tenant, member_group=group, admin_group=admin_group
+        )
 
     if created:
         # Group and Tenant ids were set explicitly: move both sequences past them.
@@ -230,6 +235,26 @@ class Migration(migrations.Migration):
                         on_delete=django.db.models.deletion.SET_NULL,
                         related_name="legacy_ids",
                         to="cape_tenancy.tenant",
+                    ),
+                ),
+                (
+                    "member_group",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="+",
+                        to="auth.group",
+                    ),
+                ),
+                (
+                    "admin_group",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="+",
+                        to="auth.group",
                     ),
                 ),
             ],
