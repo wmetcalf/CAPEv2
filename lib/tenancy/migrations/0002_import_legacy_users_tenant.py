@@ -9,6 +9,7 @@ whatever Group has id 1. Instead, each active legacy tenant becomes:
   with the same id as that Group (the Group reserves the id, so nothing else resolves to it);
 * when it had admins, an admin Group `tenant-<slug>-admins` pointing at the same `Tenant`, with
   `is_tenant_admin_group` set;
+* `users_userprofile.is_tenant_admin` is dropped once read (nothing writes it any more);
 * the member policy carries the legacy `idp_groups`, so SSO login keeps syncing membership (a
   revoked IdP group removes the user) instead of freezing it in rows.
 
@@ -81,6 +82,8 @@ def _legacy_id_high_water(connection, tables):
         # The sequence actually owned by users_tenant.id (search_path-resolved, serial or identity).
         probes.append("SELECT pg_sequence_last_value(pg_get_serial_sequence('users_tenant', 'id')::regclass)")
     elif connection.vendor == "mysql":
+        # MySQL 8 caches information_schema AUTO_INCREMENT (information_schema_stats_expiry).
+        probes.append("SET SESSION information_schema_stats_expiry = 0")
         probes.append(
             "SELECT AUTO_INCREMENT - 1 FROM information_schema.TABLES "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users_tenant'"
@@ -92,8 +95,10 @@ def _legacy_id_high_water(connection, tables):
         try:
             with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
                 cursor.execute(sql)
-                row = cursor.fetchone()
+                row = cursor.fetchone() if cursor.description else None
         except Exception as exc:
+            if sql.startswith("SET "):
+                continue  # MariaDB / MySQL 5.x have no stats cache to bypass
             print(f"\ncape_tenancy: could not read a legacy tenant id high-water mark ({exc}); "
                   "utils/tenancy_reconcile.py refuses any tenant id left unmapped")
             continue
@@ -124,6 +129,26 @@ def _policy(Policy, alias, group, tenant, *, admin, idp_groups):
 
 
 def import_legacy_tenancy(apps, schema_editor):
+    _import(apps, schema_editor)
+    _drop_legacy_admin_column(schema_editor.connection)
+
+
+def _drop_legacy_admin_column(connection):
+    """Drop users_userprofile.is_tenant_admin once read: the retired users.0004 left it NOT NULL
+    with no default, and the current UserProfile model never writes it, so every new profile
+    would fail to insert. This is the database that holds it (core may be a separate one)."""
+    with connection.cursor() as cursor:
+        if "users_userprofile" not in set(connection.introspection.table_names(cursor)):
+            return
+        cols = {c.name for c in connection.introspection.get_table_description(cursor, "users_userprofile")}
+        if "is_tenant_admin" in cols:
+            cursor.execute(
+                f"ALTER TABLE {connection.ops.quote_name('users_userprofile')} "
+                f"DROP COLUMN {connection.ops.quote_name('is_tenant_admin')}"
+            )
+
+
+def _import(apps, schema_editor):
     connection = schema_editor.connection
     alias = connection.alias
     tables = set(connection.introspection.table_names())

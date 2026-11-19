@@ -374,6 +374,9 @@ assert res(dave)[0] == 1  # untouched: still only in staff
 assert res(erin)[0] is None  # inactive tenant: nothing restored
 assert resolve_user_entitlements(User.objects.get(pk=alice.pk)).can_use_machine("anything") is True
 assert GroupSandboxPolicy.objects.get(group=acme).idp_groups == ["sso-acme"]
+with connection.cursor() as c:
+    cols = {d.name for d in connection.introspection.get_table_description(c, "users_userprofile")}
+assert "is_tenant_admin" not in cols, cols  # read, then dropped: new profiles must not hit NOT NULL
 
 from lib.tenancy.hooks import _reconcile_login_groups
 

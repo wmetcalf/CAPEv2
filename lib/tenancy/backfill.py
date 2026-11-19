@@ -478,7 +478,8 @@ def _legacy_admins_pending(conn, tables, drop_legacy_tenants: bool) -> bool:
     import sqlalchemy as sa
 
     # drop_legacy_tenants only changes how stashed tasks are carried: cape_tenancy 0002 still
-    # imports the tenants on the next `manage.py migrate`, so keep the column it reads.
+    # imports the tenants on the next `manage.py migrate`, so keep the column it reads (0002
+    # drops it itself afterwards).
     if "users_tenant" not in tables or not _is_multitenancy_enabled():
         return False  # no import will run
     if conn.execute(sa.text("SELECT 1 FROM users_tenant LIMIT 1")).first() is None:
